@@ -1,0 +1,2504 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CrossEdge Trader</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f9fafb;
+      --line: #d9dee7;
+      --text: #172033;
+      --muted: #667085;
+      --good: #057a55;
+      --bad: #b42318;
+      --accent: #2457d6;
+      --accent-dark: #1d46ad;
+      --warn: #a15c07;
+      --input-bg: #ffffff;
+      --chart-bg: #fbfcfe;
+      --message-bg: #fff7ed;
+      --message-line: #fed7aa;
+    }
+
+    body.dark {
+      color-scheme: dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-soft: #1f2937;
+      --line: #334155;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --good: #34d399;
+      --bad: #f87171;
+      --accent: #60a5fa;
+      --accent-dark: #3b82f6;
+      --warn: #fbbf24;
+      --input-bg: #0f172a;
+      --chart-bg: #0b1220;
+      --message-bg: #2a1f0d;
+      --message-line: #854d0e;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0;
+    }
+
+    main {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 14px;
+    }
+
+    .controls, .grid, .settings-grid {
+      display: grid;
+      gap: 8px;
+    }
+
+    .controls {
+      grid-template-columns: repeat(4, minmax(0, auto));
+      justify-content: end;
+    }
+
+    .grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-bottom: 10px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 280px);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .left-stack {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .panel, .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      min-width: 0;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 18px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .panel h2 {
+      margin: 0 0 8px;
+      font-size: 15px;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 7px;
+      padding: 7px 10px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }
+
+    button.primary:hover { background: var(--accent-dark); }
+    button:hover { border-color: var(--muted); }
+
+    label {
+      display: grid;
+      gap: 3px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 6px 8px;
+      font: inherit;
+      color: var(--text);
+      background: var(--input-bg);
+    }
+
+    textarea {
+      min-height: 54px;
+      resize: vertical;
+    }
+
+    .settings-grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 8px;
+    }
+
+    .backtest-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      align-items: end;
+      margin-bottom: 8px;
+    }
+
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
+      align-items: center;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+    }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .summary-box {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      padding: 8px;
+      min-width: 0;
+    }
+
+    .summary-box span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+
+    .summary-box strong {
+      display: block;
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .chart-select {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--panel-soft);
+      color: var(--muted);
+    }
+
+    .chart-select select {
+      width: auto;
+      min-width: 92px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 12px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .running .dot { background: var(--good); }
+    .stopped .dot { background: var(--bad); }
+
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    .muted { color: var(--muted); }
+    .best-row {
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+    }
+
+    canvas {
+      width: 100%;
+      height: 460px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--chart-bg);
+      cursor: crosshair;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      table-layout: auto;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 6px 7px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      max-width: 260px;
+      overflow-wrap: anywhere;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .table-wrap {
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .table-wrap table {
+      min-width: 760px;
+    }
+
+    #settingsForm button[type="submit"] {
+      width: 100%;
+    }
+
+    .small {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .message {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--message-bg);
+      color: var(--warn);
+      border: 1px solid var(--message-line);
+      display: none;
+    }
+
+    .theme-toggle {
+      white-space: nowrap;
+    }
+
+    .section-gap {
+      margin-top: 10px;
+    }
+
+    .settings-toolbar {
+      display: flex;
+      gap: 6px;
+      margin: 8px 0 10px;
+    }
+
+    .settings-toolbar button {
+      flex: 1;
+      padding: 6px 8px;
+      font-size: 12px;
+    }
+
+    .settings-group {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      overflow: hidden;
+    }
+
+    .settings-group + .settings-group {
+      margin-top: 8px;
+    }
+
+    .settings-group summary {
+      cursor: pointer;
+      padding: 9px 10px;
+      font-weight: 750;
+      color: var(--text);
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .settings-group summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .settings-group summary::after {
+      content: "▾";
+      color: var(--muted);
+      font-size: 12px;
+      transition: transform 0.15s ease;
+    }
+
+    .settings-group:not([open]) summary::after {
+      transform: rotate(-90deg);
+    }
+
+    .settings-group-body {
+      display: grid;
+      gap: 8px;
+      padding: 0 10px 10px;
+    }
+
+    .settings-save-bar {
+      position: sticky;
+      bottom: 0;
+      background: var(--panel);
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+      margin-top: 8px;
+      z-index: 1;
+    }
+
+    .table-gap {
+      margin-top: 8px;
+    }
+
+    .left-stack .backtest-grid,
+    .left-stack #backtestMetrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    @media (max-width: 860px) {
+      header {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .controls {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .grid, .layout, .settings-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .summary-strip {
+        grid-template-columns: 1fr;
+      }
+
+      .backtest-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>CrossEdge Trader</h1>
+      <div class="small">Paper and live crypto trading dashboard.</div>
+    </div>
+    <div class="controls">
+      <button class="primary" id="startBtn">Start</button>
+      <button id="stopBtn">Stop</button>
+      <button id="resetBtn">Reset</button>
+      <button class="theme-toggle" id="themeToggle" type="button">Dark</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="grid">
+      <div class="metric">
+        <span>Equity</span>
+        <strong id="equity">GBP 0.00</strong>
+      </div>
+      <div class="metric">
+        <span>Total P/L</span>
+        <strong id="totalPnl">GBP 0.00</strong>
+      </div>
+      <div class="metric">
+        <span>Cash</span>
+        <strong id="cash">GBP 0.00</strong>
+      </div>
+      <div class="metric">
+        <span>Position</span>
+        <strong id="position">0</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="status-row">
+        <span class="pill stopped" id="runPill"><span class="dot"></span><span id="runText">Stopped</span></span>
+        <span class="pill" id="pairPill">BTC-GBP</span>
+        <label class="chart-select">Chart
+          <select id="chartSymbolSelect"></select>
+        </label>
+        <label class="chart-select">Mode
+          <select id="chartModeSelect">
+            <option value="line">Line</option>
+            <option value="candles">Candles</option>
+          </select>
+        </label>
+        <span class="pill">Last price: <strong id="lastPrice">-</strong></span>
+        <span class="pill">Signal: <strong id="signalText">Waiting</strong></span>
+      </div>
+      <div class="status-row">
+        <span class="pill" id="chartTimeframePill">Candles: -</span>
+        <span class="pill" id="chartCandleStatePill">Latest candle: -</span>
+        <span class="pill" id="closedCandlePill">Signal confirmation: -</span>
+      </div>
+      <canvas id="chart" width="1200" height="460"></canvas>
+      <div class="small">Chart: entry, stop, target, partial TP, trailing stop, support/resistance, and recent buy/sell markers.</div>
+      <div id="errorBox" class="message"></div>
+    </section>
+
+    <section class="layout section-gap">
+      <div class="left-stack">
+        <div class="panel">
+          <h2>Live Trading Safety</h2>
+          <div class="status-row">
+            <span class="pill" id="liveEnabledPill">Live setting: disabled</span>
+            <span class="pill" id="liveArmedPill">Environment: locked</span>
+            <span class="pill" id="liveReadyPill">Ready: no</span>
+            <span class="pill">Daily live spend: <strong id="liveDailySpend">GBP 0.00</strong></span>
+            <span class="pill" id="liveGuardPill">Guard: spread/volume</span>
+            <span class="pill" id="openOrdersPill">Open orders: 0</span>
+            <span class="pill" id="websocketPill">WS: disabled</span>
+            <button type="button" id="syncLiveBalanceBtn">Sync Coinbase Balance</button>
+            <button type="button" id="oandaAuthCheckBtn">Check OANDA Demo</button>
+            <button type="button" id="syncOandaBalanceBtn">Sync OANDA Paper Balance</button>
+          </div>
+          <div class="small" id="liveMessage">Live trading is locked unless environment variables are configured.</div>
+        </div>
+
+        <section class="panel">
+          <h2>Open Orders</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Retries</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="openOrdersBody">
+                <tr><td colspan="7" class="muted">No managed open orders.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="panel">
+          <h2>Scanner</h2>
+          <div class="status-row">
+            <button type="button" id="fetchGbpPairsBtn">Fetch Coinbase Quote Pairs</button>
+            <button type="button" id="applyGbpPairsBtn" disabled>Apply Quote Pairs</button>
+            <input id="quoteCompareInput" value="GBP,USD,USDC,EUR" aria-label="Quote currencies to compare">
+            <button type="button" id="compareQuotesBtn">Compare Quotes</button>
+            <span class="small" id="gbpPairsStatus">Uses the current watchlist.</span>
+          </div>
+          <div class="summary-strip">
+            <div class="summary-box">
+              <span>Best Current Setup</span>
+              <strong id="bestSetupSummary">No BUY setup.</strong>
+            </div>
+            <div class="summary-box">
+              <span>Blocked Today</span>
+              <strong id="blockedSummary">0 blocks.</strong>
+            </div>
+            <div class="summary-box">
+              <span>Open Trade Risk</span>
+              <strong id="openTradeRisk">No open position.</strong>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Price</th>
+                  <th>Support</th>
+                  <th>Resistance</th>
+                  <th>Range</th>
+                  <th>R/R</th>
+                  <th>Regime</th>
+                  <th>Edge</th>
+                  <th>Score</th>
+                  <th>Signal</th>
+                </tr>
+              </thead>
+              <tbody id="scanBody">
+                <tr><td colspan="10" class="muted">No scan data yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap table-gap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Quote</th>
+                  <th>Pairs</th>
+                  <th>Tested</th>
+                  <th>Avg Spread</th>
+                  <th>Avg Volume</th>
+                  <th>Best Symbol</th>
+                  <th>Best P/L</th>
+                  <th>Errors</th>
+                </tr>
+              </thead>
+              <tbody id="quoteCompareBody">
+                <tr><td colspan="8" class="muted">No quote comparison run yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <section class="panel">
+          <h2>Backtester</h2>
+          <form id="backtestForm" class="backtest-grid">
+            <label>Timeframe
+              <select name="granularity">
+                <option value="900">15 minutes</option>
+                <option value="3600" selected>1 hour</option>
+                <option value="21600">6 hours</option>
+                <option value="86400">1 day</option>
+              </select>
+            </label>
+            <label>Candles
+              <input name="candle_count" type="number" min="40" max="300" step="1" value="300">
+            </label>
+            <button class="primary" type="submit" id="backtestBtn">Run Backtest</button>
+            <button type="button" id="optimizerBtn">Optimize Settings</button>
+            <button type="button" id="walkForwardBtn">Walk-Forward Test</button>
+            <button type="button" id="applyOptimizerBtn" disabled>Apply Best Settings</button>
+            <div class="small" id="backtestStatus">Uses the current watchlist and strategy settings.</div>
+          </form>
+          <div class="grid" id="backtestMetrics" style="display:none;">
+            <div class="metric">
+              <span>Best Symbol</span>
+              <strong id="btBestSymbol">-</strong>
+            </div>
+            <div class="metric">
+              <span>Best Final Equity</span>
+              <strong id="btBestEquity">-</strong>
+            </div>
+            <div class="metric">
+              <span>Best P/L</span>
+              <strong id="btBestPnl">-</strong>
+            </div>
+            <div class="metric">
+              <span>Max Drawdown</span>
+              <strong id="btBestDrawdown">-</strong>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Final Equity</th>
+                  <th>P/L</th>
+                  <th>Drawdown</th>
+                  <th>Trades</th>
+                  <th>Win Rate</th>
+                  <th>Open?</th>
+                </tr>
+              </thead>
+              <tbody id="backtestBody">
+                <tr><td colspan="7" class="muted">No backtest run yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap table-gap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Best Symbol Trade Time</th>
+                  <th>Side</th>
+                  <th>Price</th>
+                  <th>Qty</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="backtestTradesBody">
+                <tr><td colspan="5" class="muted">No backtest trades yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="backtestErrorBox" class="message"></div>
+          <div class="table-wrap table-gap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Rank</th>
+                  <th>Symbol</th>
+                  <th>Settings</th>
+                  <th>Train P/L</th>
+                  <th>Test P/L</th>
+                  <th>Test Drawdown</th>
+                  <th>Test Trades</th>
+                  <th>Test Score</th>
+                </tr>
+              </thead>
+              <tbody id="walkForwardBody">
+                <tr><td colspan="8" class="muted">No walk-forward test run yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap table-gap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Rank</th>
+                  <th>Symbol</th>
+                  <th>Score</th>
+                  <th>Settings</th>
+                  <th>P/L</th>
+                  <th>Drawdown</th>
+                  <th>Trades</th>
+                  <th>Win Rate</th>
+                </tr>
+              </thead>
+              <tbody id="optimizerBody">
+                <tr><td colspan="8" class="muted">No optimizer run yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Trades</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Side</th>
+                  <th>Price</th>
+                  <th>Qty</th>
+                  <th>Cash After</th>
+                  <th>Order</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="tradesBody">
+                <tr><td colspan="7" class="muted">No trades yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Performance by Symbol</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Closed P/L</th>
+                  <th>Buys</th>
+                  <th>Sells</th>
+                  <th>Win Rate</th>
+                  <th>Fees</th>
+                </tr>
+              </thead>
+              <tbody id="performanceBody">
+                <tr><td colspan="6" class="muted">No symbol performance yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Setup Learning</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Settings</th>
+                  <th>Closed</th>
+                  <th>Expectancy</th>
+                  <th>Win Rate</th>
+                  <th>Total P/L</th>
+                  <th>Main Regime</th>
+                </tr>
+              </thead>
+              <tbody id="setupPerformanceBody">
+                <tr><td colspan="7" class="muted">No closed setup data yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap table-gap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Status</th>
+                  <th>Regime</th>
+                  <th>Entry</th>
+                  <th>Exit</th>
+                  <th>P/L</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="setupRecordsBody">
+                <tr><td colspan="8" class="muted">No setup records yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!--<section class="panel">
+          <h2>Decision Journal</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Event</th>
+                  <th>Price</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="journalBody">
+                <tr><td colspan="5" class="muted">No journal entries yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>//-->
+      </div>
+
+      <div class="panel">
+        <h2>Bot Settings</h2>
+        <div class="status-row">
+          <button type="button" id="freqtradePresetBtn">Apply Freqtrade Preset</button>
+          <button type="button" id="forexPresetBtn">Apply Forex Demo Preset</button>
+          <button type="button" id="oandaPresetBtn">Apply OANDA Demo Preset</button>
+          <span class="small" id="settingsPresetStatus">Review changes before saving.</span>
+        </div>
+        <form id="settingsForm" class="settings-grid">
+          <label>Asset Class
+            <select name="asset_class">
+              <option value="crypto" selected>Crypto</option>
+              <option value="forex">Forex paper</option>
+            </select>
+          </label>
+          <label>Exchange
+            <select name="exchange">
+              <option value="coinbase">Coinbase</option>
+              <option value="kraken">Kraken</option>
+              <option value="forex_demo">Forex demo</option>
+              <option value="oanda_demo">OANDA demo</option>
+            </select>
+          </label>
+          <label>Watchlist
+            <textarea name="watchlist">BTC,ETH,SOL,XRP,DOGE,LINK,AVAX</textarea>
+          </label>
+          <label>Quote / Account Currency
+            <input name="quote_currency" value="GBP" list="quoteCurrencyOptions">
+            <datalist id="quoteCurrencyOptions">
+              <option value="GBP">
+              <option value="USD">
+              <option value="USDC">
+              <option value="EUR">
+              <option value="BTC">
+              <option value="ETH">
+            </datalist>
+          </label>
+          <label>Default Chart Mode
+            <select name="chart_mode">
+              <option value="line" selected>Line</option>
+              <option value="candles">Candles</option>
+            </select>
+          </label>
+          <label>Strategy
+            <select name="strategy">
+              <option value="sma_cross">SMA crossover</option>
+              <option value="ewo_offset">EWO SMA offset</option>
+            </select>
+          </label>
+          <label>Starting Cash
+            <input name="starting_cash" type="number" step="0.01" value="38">
+          </label>
+          <label>Fee
+            <input name="trade_fee" type="number" step="0.0001" value="0.004">
+          </label>
+          <label>Poll Seconds
+            <input name="poll_seconds" type="number" step="1" value="15">
+          </label>
+          <label>Live Candle Timeframe
+            <select name="live_granularity">
+              <option value="60">1 minute</option>
+              <option value="300">5 minutes</option>
+              <option value="900">15 minutes</option>
+              <option value="3600" selected>1 hour</option>
+              <option value="21600">6 hours</option>
+              <option value="86400">1 day</option>
+            </select>
+          </label>
+          <label>Only Act On Closed Candles
+            <select name="closed_candle_only">
+              <option value="true" selected>Yes</option>
+              <option value="false">No</option>
+            </select>
+          </label>
+          <label>Live Candle Count
+            <input name="live_candle_count" type="number" min="40" max="300" step="1" value="300">
+          </label>
+          <label>Short SMA
+            <input name="short_window" type="number" step="1" value="5">
+          </label>
+          <label>Long SMA
+            <input name="long_window" type="number" step="1" value="20">
+          </label>
+          <label>EWO Buy EMA
+            <input name="base_nb_candles_buy" type="number" step="1" value="14">
+          </label>
+          <label>EWO Sell EMA
+            <input name="base_nb_candles_sell" type="number" step="1" value="24">
+          </label>
+          <label>Low Offset
+            <input name="low_offset" type="number" step="0.001" value="0.975">
+          </label>
+          <label>Low Offset 2
+            <input name="low_offset_2" type="number" step="0.001" value="0.955">
+          </label>
+          <label>High Offset
+            <input name="high_offset" type="number" step="0.001" value="0.991">
+          </label>
+          <label>High Offset 2
+            <input name="high_offset_2" type="number" step="0.001" value="0.997">
+          </label>
+          <label>EWO High
+            <input name="ewo_high" type="number" step="0.001" value="2.327">
+          </label>
+          <label>EWO High 2
+            <input name="ewo_high_2" type="number" step="0.001" value="-2.327">
+          </label>
+          <label>EWO Low
+            <input name="ewo_low" type="number" step="0.001" value="-20.988">
+          </label>
+          <label>RSI Buy
+            <input name="rsi_buy" type="number" step="1" value="69">
+          </label>
+          <label>Max Position Fraction
+            <input name="max_position_pct" type="number" step="0.01" value="0.25">
+          </label>
+          <label>Position Sizing
+            <select name="position_sizing_mode">
+              <option value="balance_fraction" selected>Balance fraction</option>
+              <option value="risk_based">Risk based</option>
+            </select>
+          </label>
+          <label>Risk Per Trade %
+            <input name="risk_per_trade_pct" type="number" step="0.1" value="1">
+          </label>
+          <label>Min Order Value
+            <input name="min_order_value" type="number" step="0.01" value="1">
+          </label>
+          <label>Stop Loss %
+            <input name="stop_loss_pct" type="number" step="0.1" value="2">
+          </label>
+          <label>Take Profit %
+            <input name="take_profit_pct" type="number" step="0.1" value="3">
+          </label>
+          <label>Daily Loss Limit %
+            <input name="daily_loss_limit_pct" type="number" step="0.1" value="5">
+          </label>
+          <label>Cooldown Seconds
+            <input name="cooldown_seconds" type="number" step="1" value="120">
+          </label>
+          <label>S/R Filter
+            <select name="use_sr_filter">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Dynamic S/R Exits
+            <select name="use_dynamic_sr_exits">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>S/R Lookback Candles
+            <input name="sr_lookback_candles" type="number" step="1" value="50">
+          </label>
+          <label>S/R Zone Tolerance %
+            <input name="sr_zone_tolerance_pct" type="number" step="0.1" value="0.6">
+          </label>
+          <label>S/R Min Touches
+            <input name="sr_min_touches" type="number" step="1" value="2">
+          </label>
+          <label>Near Support %
+            <input name="near_support_pct" type="number" step="0.1" value="2">
+          </label>
+          <label>Min Resistance Gap %
+            <input name="min_resistance_distance_pct" type="number" step="0.1" value="1">
+          </label>
+          <label>Min S/R Range %
+            <input name="min_sr_range_pct" type="number" step="0.1" value="8">
+          </label>
+          <label>Min Reward/Risk
+            <input name="min_reward_risk" type="number" step="0.1" value="2">
+          </label>
+          <label>Support Stop Buffer %
+            <input name="support_stop_buffer_pct" type="number" step="0.1" value="2">
+          </label>
+          <label>Resistance Target Buffer %
+            <input name="resistance_target_buffer_pct" type="number" step="0.1" value="0.5">
+          </label>
+          <label>Partial Take Profit
+            <select name="partial_take_profit_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Partial Sell %
+            <input name="partial_take_profit_pct" type="number" step="1" value="50">
+          </label>
+          <label>Partial At Target %
+            <input name="partial_take_profit_at_target_pct" type="number" step="1" value="50">
+          </label>
+          <label>Trailing Stop
+            <select name="trailing_stop_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Trailing Stop %
+            <input name="trailing_stop_pct" type="number" step="0.1" value="2">
+          </label>
+          <label>Trailing Activation %
+            <input name="trailing_activation_pct" type="number" step="0.1" value="3">
+          </label>
+          <label>Live Trading
+            <select name="live_trading_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>OANDA Demo Orders
+            <select name="oanda_demo_trading_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Max OANDA Open Trades
+            <input name="max_oanda_open_trades" type="number" min="1" max="20" step="1" value="3">
+          </label>
+          <label>Live Order Type
+            <select name="live_order_type">
+              <option value="market" selected>Market</option>
+              <option value="limit">Limit</option>
+              <option value="native_stop_scaffold">Limit + native stop</option>
+            </select>
+          </label>
+          <label>Live Limit Offset %
+            <input name="live_limit_offset_pct" type="number" step="0.01" value="0.05">
+          </label>
+          <label>Native Stop
+            <select name="native_stop_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Max Live Order GBP
+            <input name="max_live_order_gbp" type="number" step="0.01" value="5">
+          </label>
+          <label>Max Daily Live GBP
+            <input name="max_daily_live_loss_gbp" type="number" step="0.01" value="2">
+          </label>
+          <label>Max Live Spread %
+            <input name="max_live_spread_pct" type="number" step="0.01" value="0.35">
+          </label>
+          <label>Min Live Quote Volume
+            <input name="min_live_quote_volume" type="number" step="1" value="1000">
+          </label>
+          <label>Backtest Slippage %
+            <input name="backtest_slippage_pct" type="number" step="0.01" value="0.1">
+          </label>
+          <label>Order Expiry Seconds
+            <input name="order_expiry_seconds" type="number" step="1" value="180">
+          </label>
+          <label>Order Retry Limit
+            <input name="order_retry_limit" type="number" step="1" value="1">
+          </label>
+          <label>Cancel/Replace Orders
+            <select name="order_replace_enabled">
+              <option value="true" selected>Enabled</option>
+              <option value="false">Disabled</option>
+            </select>
+          </label>
+          <label>Websocket Feed
+            <select name="websocket_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Auto Disable Weak Pairs
+            <select name="auto_disable_weak_pairs">
+              <option value="true" selected>Enabled</option>
+              <option value="false">Disabled</option>
+            </select>
+          </label>
+          <label>Weak Pair Min Setups
+            <input name="weak_pair_min_trades" type="number" step="1" value="6">
+          </label>
+          <label>Weak Expectancy Limit %
+            <input name="weak_pair_expectancy_limit_pct" type="number" step="0.1" value="-0.3">
+          </label>
+          <label>Weak Win Rate Limit %
+            <input name="weak_pair_win_rate_limit_pct" type="number" step="1" value="35">
+          </label>
+          <label>Regime Filter
+            <select name="regime_filter_enabled">
+              <option value="false" selected>Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </label>
+          <label>Allow Trending
+            <select name="allow_trending_regime">
+              <option value="true" selected>Yes</option>
+              <option value="false">No</option>
+            </select>
+          </label>
+          <label>Allow Ranging
+            <select name="allow_ranging_regime">
+              <option value="true" selected>Yes</option>
+              <option value="false">No</option>
+            </select>
+          </label>
+          <label>Allow Volatile
+            <select name="allow_volatile_regime">
+              <option value="false" selected>No</option>
+              <option value="true">Yes</option>
+            </select>
+          </label>
+          <label>Allow Dead Market
+            <select name="allow_dead_regime">
+              <option value="false" selected>No</option>
+              <option value="true">Yes</option>
+            </select>
+          </label>
+          <div></div>
+          <button class="primary" type="submit">Save Settings</button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const els = {
+      equity: document.querySelector('#equity'),
+      totalPnl: document.querySelector('#totalPnl'),
+      cash: document.querySelector('#cash'),
+      position: document.querySelector('#position'),
+      runPill: document.querySelector('#runPill'),
+      runText: document.querySelector('#runText'),
+      pairPill: document.querySelector('#pairPill'),
+      chartSymbolSelect: document.querySelector('#chartSymbolSelect'),
+      chartModeSelect: document.querySelector('#chartModeSelect'),
+      chartTimeframePill: document.querySelector('#chartTimeframePill'),
+      chartCandleStatePill: document.querySelector('#chartCandleStatePill'),
+      closedCandlePill: document.querySelector('#closedCandlePill'),
+      lastPrice: document.querySelector('#lastPrice'),
+      signalText: document.querySelector('#signalText'),
+      errorBox: document.querySelector('#errorBox'),
+      liveEnabledPill: document.querySelector('#liveEnabledPill'),
+      liveArmedPill: document.querySelector('#liveArmedPill'),
+      liveReadyPill: document.querySelector('#liveReadyPill'),
+      liveGuardPill: document.querySelector('#liveGuardPill'),
+      liveDailySpend: document.querySelector('#liveDailySpend'),
+      openOrdersPill: document.querySelector('#openOrdersPill'),
+      websocketPill: document.querySelector('#websocketPill'),
+      syncLiveBalanceBtn: document.querySelector('#syncLiveBalanceBtn'),
+      oandaAuthCheckBtn: document.querySelector('#oandaAuthCheckBtn'),
+      syncOandaBalanceBtn: document.querySelector('#syncOandaBalanceBtn'),
+      liveMessage: document.querySelector('#liveMessage'),
+      fetchGbpPairsBtn: document.querySelector('#fetchGbpPairsBtn'),
+      applyGbpPairsBtn: document.querySelector('#applyGbpPairsBtn'),
+      quoteCompareInput: document.querySelector('#quoteCompareInput'),
+      compareQuotesBtn: document.querySelector('#compareQuotesBtn'),
+      quoteCompareBody: document.querySelector('#quoteCompareBody'),
+      gbpPairsStatus: document.querySelector('#gbpPairsStatus'),
+      bestSetupSummary: document.querySelector('#bestSetupSummary'),
+      blockedSummary: document.querySelector('#blockedSummary'),
+      openTradeRisk: document.querySelector('#openTradeRisk'),
+      scanBody: document.querySelector('#scanBody'),
+      backtestForm: document.querySelector('#backtestForm'),
+      backtestBtn: document.querySelector('#backtestBtn'),
+      optimizerBtn: document.querySelector('#optimizerBtn'),
+      walkForwardBtn: document.querySelector('#walkForwardBtn'),
+      applyOptimizerBtn: document.querySelector('#applyOptimizerBtn'),
+      backtestStatus: document.querySelector('#backtestStatus'),
+      backtestMetrics: document.querySelector('#backtestMetrics'),
+      backtestBody: document.querySelector('#backtestBody'),
+      backtestTradesBody: document.querySelector('#backtestTradesBody'),
+      walkForwardBody: document.querySelector('#walkForwardBody'),
+      optimizerBody: document.querySelector('#optimizerBody'),
+      backtestErrorBox: document.querySelector('#backtestErrorBox'),
+      btBestSymbol: document.querySelector('#btBestSymbol'),
+      btBestEquity: document.querySelector('#btBestEquity'),
+      btBestPnl: document.querySelector('#btBestPnl'),
+      btBestDrawdown: document.querySelector('#btBestDrawdown'),
+      tradesBody: document.querySelector('#tradesBody'),
+      openOrdersBody: document.querySelector('#openOrdersBody'),
+      performanceBody: document.querySelector('#performanceBody'),
+      setupPerformanceBody: document.querySelector('#setupPerformanceBody'),
+      setupRecordsBody: document.querySelector('#setupRecordsBody'),
+      journalBody: document.querySelector('#journalBody'),
+      freqtradePresetBtn: document.querySelector('#freqtradePresetBtn'),
+      forexPresetBtn: document.querySelector('#forexPresetBtn'),
+      oandaPresetBtn: document.querySelector('#oandaPresetBtn'),
+      settingsPresetStatus: document.querySelector('#settingsPresetStatus'),
+      form: document.querySelector('#settingsForm'),
+      chart: document.querySelector('#chart'),
+      themeToggle: document.querySelector('#themeToggle')
+    };
+
+    let displayCurrency = 'GBP';
+    let displayAssetClass = 'crypto';
+    const quoteMoney = (value, quote) => `${quote || ''} ${Number(value || 0).toFixed(2)}`.trim();
+    const money = (value) => quoteMoney(value, displayCurrency);
+    const priceText = (value, symbol = '') => {
+      if (displayAssetClass === 'forex') {
+        const dp = String(symbol || '').toUpperCase().endsWith('JPY') ? 3 : 5;
+        return Number(value || 0).toFixed(dp);
+      }
+      return money(value);
+    };
+    const num = (value, dp = 8) => Number(value || 0).toFixed(dp).replace(/\.?0+$/, '');
+    let latestOptimizerBest = null;
+    let settingsFormDirty = false;
+    let lastPrices = [];
+    let lastSupport = null;
+    let lastResistance = null;
+    let lastChartLevels = {};
+    let lastChartTrades = [];
+    let lastCandles = [];
+    let lastChartSymbol = '';
+    let chartHoverIndex = null;
+    let selectedChartSymbol = localStorage.getItem('cryptobot-chart-symbol') || '';
+    let chartMode = localStorage.getItem('cryptobot-chart-mode') || 'line';
+    let lastStatusData = null;
+    let fetchedGbpWatchlist = '';
+    let fetchedQuoteCurrency = '';
+
+    const freqtradePreset = {
+      asset_class: 'crypto',
+      strategy: 'ewo_offset',
+      live_granularity: 300,
+      live_candle_count: 300,
+      base_nb_candles_buy: 14,
+      base_nb_candles_sell: 24,
+      low_offset: 0.975,
+      low_offset_2: 0.955,
+      high_offset: 0.991,
+      high_offset_2: 0.997,
+      ewo_high: 2.327,
+      ewo_high_2: -2.327,
+      ewo_low: -20.988,
+      rsi_buy: 69,
+      stop_loss_pct: 35,
+      take_profit_pct: 3.2,
+      partial_take_profit_enabled: true,
+      partial_take_profit_pct: 50,
+      partial_take_profit_at_target_pct: 50,
+      trailing_stop_enabled: true,
+      trailing_stop_pct: 1,
+      trailing_activation_pct: 3,
+      live_order_type: 'limit',
+      live_limit_offset_pct: 0.05,
+      native_stop_enabled: false,
+      backtest_slippage_pct: 0.1,
+      sr_zone_tolerance_pct: 0.6,
+      sr_min_touches: 2,
+      order_expiry_seconds: 180,
+      order_retry_limit: 1,
+      order_replace_enabled: true,
+      websocket_enabled: false,
+      auto_disable_weak_pairs: true,
+      weak_pair_min_trades: 6,
+      weak_pair_expectancy_limit_pct: -0.3,
+      weak_pair_win_rate_limit_pct: 35,
+      regime_filter_enabled: false,
+      allow_trending_regime: true,
+      allow_ranging_regime: true,
+      allow_volatile_regime: false,
+      allow_dead_regime: false,
+      use_dynamic_sr_exits: false,
+      use_sr_filter: false,
+      sr_lookback_candles: 50,
+      min_sr_range_pct: 8,
+      min_reward_risk: 2,
+      position_sizing_mode: 'risk_based',
+      risk_per_trade_pct: 1,
+      max_position_pct: 0.25
+    };
+
+    const forexDemoPreset = {
+      asset_class: 'forex',
+      exchange: 'forex_demo',
+      watchlist: 'EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD',
+      quote_currency: 'USD',
+      strategy: 'sma_cross',
+      live_granularity: 3600,
+      live_candle_count: 300,
+      short_window: 8,
+      long_window: 30,
+      trade_fee: 0,
+      max_position_pct: 0.2,
+      position_sizing_mode: 'risk_based',
+      risk_per_trade_pct: 1,
+      stop_loss_pct: 0.4,
+      take_profit_pct: 0.8,
+      use_sr_filter: true,
+      use_dynamic_sr_exits: true,
+      sr_lookback_candles: 50,
+      sr_zone_tolerance_pct: 0.15,
+      sr_min_touches: 2,
+      near_support_pct: 0.3,
+      min_resistance_distance_pct: 0.25,
+      min_sr_range_pct: 0.5,
+      min_reward_risk: 1.2,
+      support_stop_buffer_pct: 0.1,
+      resistance_target_buffer_pct: 0.05,
+      closed_candle_only: true,
+      live_trading_enabled: false,
+      oanda_demo_trading_enabled: false,
+      max_oanda_open_trades: 3,
+      websocket_enabled: false,
+      chart_mode: 'candles'
+    };
+
+    const oandaDemoPreset = {
+      ...forexDemoPreset,
+      exchange: 'oanda_demo',
+      watchlist: 'EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURGBP,EURJPY,GBPJPY',
+      quote_currency: 'USD'
+    };
+
+    function cssVar(name) {
+      return getComputedStyle(document.body).getPropertyValue(name).trim();
+    }
+
+    function resizeChartCanvas(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const nextWidth = Math.max(320, Math.round(rect.width || canvas.width));
+      const nextHeight = Math.max(320, Math.round(rect.height || canvas.height));
+      if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+        canvas.width = nextWidth;
+        canvas.height = nextHeight;
+      }
+    }
+
+    function redrawChart() {
+      drawChart(lastPrices, lastSupport, lastResistance, lastChartLevels, lastChartTrades, lastCandles);
+    }
+
+    function updateChartSymbolOptions(data) {
+      const symbols = data.chart_symbols || [];
+      const fallback = data.active_symbol || data.settings.symbol;
+      if (!selectedChartSymbol || !symbols.includes(selectedChartSymbol)) {
+        selectedChartSymbol = fallback;
+      }
+      els.chartSymbolSelect.innerHTML = symbols.map((symbol) => (
+        `<option value="${symbol}" ${symbol === selectedChartSymbol ? 'selected' : ''}>${symbol}</option>`
+      )).join('');
+      els.chartSymbolSelect.disabled = symbols.length <= 1;
+    }
+
+    function chartDataForSymbol(data) {
+      const settings = data.settings;
+      const symbol = selectedChartSymbol || data.chart_symbol || data.active_symbol || settings.symbol;
+      const row = (data.chart_rows || {})[symbol] || {};
+      const pricesBySymbol = (data.price_history || {})[symbol];
+      const candlesBySymbol = (data.candle_history || {})[symbol];
+      const prices = pricesBySymbol || (symbol === data.chart_symbol ? data.prices || [] : []);
+      const candles = candlesBySymbol || (symbol === data.chart_symbol ? data.candles || [] : []);
+      const chartLevels = symbol === data.active_symbol ? (data.chart_levels || {}) : {};
+      const chartTrades = (data.trades || []).filter((trade) => trade.symbol === symbol).reverse();
+      return {
+        symbol,
+        prices,
+        candles,
+        support: row.support,
+        resistance: row.resistance,
+        chartLevels,
+        chartTrades
+      };
+    }
+
+    function renderSelectedChart(data) {
+      const chartData = chartDataForSymbol(data);
+      lastChartSymbol = chartData.symbol;
+      els.pairPill.textContent = data.settings.asset_class === 'forex'
+        ? `${chartData.symbol} forex paper`
+        : `${chartData.symbol}-${data.settings.quote_currency} on ${data.settings.exchange}`;
+      drawChart(
+        chartData.prices || [],
+        chartData.support,
+        chartData.resistance,
+        chartData.chartLevels || {},
+        chartData.chartTrades || [],
+        chartData.candles || []
+      );
+    }
+
+    function applyTheme(theme) {
+      const dark = theme === 'dark';
+      document.body.classList.toggle('dark', dark);
+      els.themeToggle.textContent = dark ? 'Light' : 'Dark';
+      els.themeToggle.setAttribute('aria-pressed', String(dark));
+      localStorage.setItem('cryptobot-theme', dark ? 'dark' : 'light');
+      redrawChart();
+    }
+
+    function applySettingsPreset(preset) {
+      Object.entries(preset).forEach(([key, value]) => {
+        const field = els.form.elements[key];
+        if (!field) return;
+        field.value = String(value);
+      });
+      settingsFormDirty = true;
+    }
+
+    async function post(url, body = {}) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      return response.json();
+    }
+
+    async function refresh() {
+      const response = await fetch('/api/status');
+      const data = await response.json();
+      render(data);
+    }
+
+    async function getJson(url) {
+      const response = await fetch(url);
+      return response.json();
+    }
+
+    function render(data) {
+      lastStatusData = data;
+      const settings = data.settings;
+      displayCurrency = settings.quote_currency || 'GBP';
+      displayAssetClass = settings.asset_class || 'crypto';
+      chartMode = settings.chart_mode || chartMode;
+      els.chartModeSelect.value = chartMode;
+      const activeSymbol = data.active_symbol || settings.symbol;
+      els.equity.textContent = money(data.equity);
+      els.cash.textContent = money(data.cash);
+      if ((data.positions || []).length) {
+        els.position.textContent = `${data.positions.length} positions: ${data.positions.map((row) => row.symbol).join(', ')}`;
+      } else {
+        els.position.textContent = `${num(data.coin, 10)} ${activeSymbol || '-'}`;
+      }
+      updateChartSymbolOptions(data);
+      els.lastPrice.textContent = data.last_price ? priceText(data.last_price, activeSymbol) : '-';
+      els.signalText.textContent = data.last_signal || 'Waiting';
+
+      const pnlClass = Number(data.total_pnl) >= 0 ? 'good' : 'bad';
+      els.totalPnl.className = pnlClass;
+      els.totalPnl.textContent = `${money(data.total_pnl)} (${Number(data.total_pnl_pct || 0).toFixed(2)}%)`;
+
+      els.runPill.className = `pill ${data.running ? 'running' : 'stopped'}`;
+      els.runText.textContent = data.running ? 'Running' : 'Stopped';
+
+      els.errorBox.style.display = data.last_error ? 'block' : 'none';
+      els.errorBox.textContent = data.last_error || '';
+
+      if (!settingsFormDirty) {
+        Object.entries(settings).forEach(([key, value]) => {
+          const field = els.form.elements[key];
+          if (field) field.value = value;
+        });
+      }
+
+      renderChartMetadata(data.chart_meta || {});
+      renderStatusSummaries(data);
+      renderScanner(data.scan_rows || [], data.best_setup || null);
+      renderLiveStatus(data.live_status || {});
+      renderOpenOrders(data.open_orders || []);
+      renderTrades(data.trades || []);
+      renderPerformance(data.symbol_performance || []);
+      renderSetupLearning(data.setup_performance || [], data.setup_records || []);
+      //renderJournal(data.journal || []);
+      renderSelectedChart(data);
+    }
+
+    function renderChartMetadata(meta) {
+      els.chartTimeframePill.textContent = `Candles: ${meta.timeframe || '-'}${chartMode === 'candles' ? ' view' : ''}`;
+      els.chartCandleStatePill.textContent = `Latest candle: ${meta.latest_candle_incomplete ? 'live/forming' : 'closed'}`;
+      els.chartCandleStatePill.className = `pill ${meta.latest_candle_incomplete ? 'warn' : 'good'}`;
+      els.closedCandlePill.textContent = `Signal confirmation: ${meta.closed_candle_only ? 'closed candles only' : 'live candle allowed'}`;
+      els.closedCandlePill.className = `pill ${meta.closed_candle_only ? 'good' : 'warn'}`;
+    }
+
+    function renderStatusSummaries(data) {
+      const setup = data.best_setup;
+      if (setup) {
+        const rr = setup.reward_risk !== null && setup.reward_risk !== undefined ? `R/R ${Number(setup.reward_risk).toFixed(2)}` : 'R/R -';
+        const support = setup.support_distance_pct !== null && setup.support_distance_pct !== undefined
+          ? `${Number(setup.support_distance_pct).toFixed(2)}% from support`
+          : 'support -';
+        els.bestSetupSummary.textContent = `${setup.symbol} | score ${Number(setup.score || 0).toFixed(4)} | ${rr} | ${support}`;
+        els.bestSetupSummary.className = 'good';
+      } else {
+        els.bestSetupSummary.textContent = 'No BUY setup.';
+        els.bestSetupSummary.className = 'muted';
+      }
+
+      const blocked = data.blocked_summary || { total: 0, counts: {} };
+      const parts = Object.entries(blocked.counts || {}).map(([key, value]) => `${key} ${value}`);
+      els.blockedSummary.textContent = blocked.total ? `${blocked.total}: ${parts.join(', ')}` : '0 blocks.';
+      els.blockedSummary.className = blocked.total ? 'warn' : 'muted';
+
+      const risk = data.open_trade_risk;
+      if (risk) {
+        const currentClass = Number(risk.current_cash || 0) >= 0 ? 'good' : 'bad';
+        const rText = risk.current_r === null || risk.current_r === undefined ? '-' : `${Number(risk.current_r).toFixed(2)}R`;
+        const quote = (data.settings || {}).quote_currency || 'GBP';
+        els.openTradeRisk.textContent = `${risk.symbol} | risk ${quoteMoney(risk.risk_cash, quote)} | target ${quoteMoney(risk.target_cash, quote)} | now ${quoteMoney(risk.current_cash, quote)} (${rText})`;
+        els.openTradeRisk.className = currentClass;
+      } else {
+        els.openTradeRisk.textContent = 'No open position.';
+        els.openTradeRisk.className = 'muted';
+      }
+    }
+
+    function renderLiveStatus(status) {
+      els.liveEnabledPill.textContent = `Live setting: ${status.enabled ? 'enabled' : 'disabled'}`;
+      els.liveArmedPill.textContent = `Environment: ${status.armed ? 'armed' : 'locked'}`;
+      els.liveReadyPill.textContent = `Ready: ${status.ready ? 'yes' : 'no'}`;
+      els.liveGuardPill.textContent = `Order: ${status.live_order_type || 'market'}${status.native_stop_enabled ? ' + native stop' : ''} | spread <= ${Number(status.max_live_spread_pct || 0).toFixed(2)}%, volume >= ${money(status.min_live_quote_volume || 0)}`;
+      els.liveDailySpend.textContent = money(status.daily_spend || 0);
+      els.openOrdersPill.textContent = `Open orders: ${status.open_orders || 0}`;
+      els.websocketPill.textContent = `WS: ${status.websocket_status || 'disabled'}`;
+      els.liveMessage.textContent = status.message || 'Live trading status unavailable.';
+      els.liveEnabledPill.className = `pill ${status.enabled ? 'warn' : ''}`;
+      els.liveArmedPill.className = `pill ${status.armed ? 'warn' : ''}`;
+      els.liveReadyPill.className = `pill ${status.ready ? 'warn' : ''}`;
+    }
+
+    function renderOpenOrders(rows) {
+      const activeRows = rows.filter((row) => !['FILLED', 'CANCELLED', 'FAILED', 'EXPIRED'].includes(row.status));
+      if (!activeRows.length) {
+        els.openOrdersBody.innerHTML = '<tr><td colspan="7" class="muted">No managed open orders.</td></tr>';
+        return;
+      }
+
+      els.openOrdersBody.innerHTML = activeRows.map((row) => `
+        <tr>
+          <td>${row.order_id}</td>
+          <td><strong>${row.symbol}</strong></td>
+          <td>${row.side}</td>
+          <td>${row.role}</td>
+          <td>${row.status}</td>
+          <td>${row.retry_count || 0}</td>
+          <td>${row.reason || '-'}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderScanner(rows, bestSetup = null) {
+      if (!rows.length) {
+        els.scanBody.innerHTML = '<tr><td colspan="10" class="muted">No scan data yet.</td></tr>';
+        return;
+      }
+
+      const sortedRows = [...rows].sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+      els.scanBody.innerHTML = sortedRows.map((row) => {
+        const signalClass = row.signal === 'BUY' ? 'good' : row.signal === 'HOLD' ? 'muted' : row.signal.startsWith('BLOCK') ? 'bad' : 'warn';
+        const edgeClass = Number(row.edge_score || 0) >= 0 ? 'good' : 'bad';
+        const isBest = bestSetup && bestSetup.symbol === row.symbol && row.signal === 'BUY';
+        return `
+          <tr class="${isBest ? 'best-row' : ''}">
+            <td><strong>${row.symbol}</strong></td>
+            <td>${row.price ? priceText(row.price, row.symbol) : '-'}</td>
+            <td>${row.support ? `${priceText(row.support, row.symbol)} (${Number(row.support_distance_pct || 0).toFixed(2)}%, ${row.support_touches || 0}x)` : '-'}</td>
+            <td>${row.resistance ? `${priceText(row.resistance, row.symbol)} (${Number(row.resistance_distance_pct || 0).toFixed(2)}%, ${row.resistance_touches || 0}x)` : '-'}</td>
+            <td>${row.sr_range_pct !== null && row.sr_range_pct !== undefined ? `${Number(row.sr_range_pct || 0).toFixed(2)}%` : '-'}</td>
+            <td>${row.reward_risk !== null && row.reward_risk !== undefined ? Number(row.reward_risk || 0).toFixed(2) : '-'}</td>
+            <td title="${row.regime_reason || ''}">${row.regime || '-'}</td>
+            <td class="${edgeClass}">${Number(row.edge_score || 0).toFixed(2)}%</td>
+            <td>${Number(row.score || 0).toFixed(4)}%</td>
+            <td class="${signalClass}">${row.signal}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderQuoteComparison(rows) {
+      if (!rows.length) {
+        els.quoteCompareBody.innerHTML = '<tr><td colspan="8" class="muted">No quote comparison run yet.</td></tr>';
+        return;
+      }
+
+      els.quoteCompareBody.innerHTML = rows.map((row) => {
+        const pnl = row.best_pnl_pct;
+        const pnlClass = pnl === null || pnl === undefined ? 'muted' : Number(pnl) >= 0 ? 'good' : 'bad';
+        return `
+          <tr>
+            <td><strong>${row.quote_currency}</strong></td>
+            <td>${row.online_pairs}</td>
+            <td>${(row.tested_symbols || []).join(', ') || '-'}</td>
+            <td>${row.avg_spread_pct === null || row.avg_spread_pct === undefined ? '-' : `${Number(row.avg_spread_pct).toFixed(4)}%`}</td>
+            <td>${row.avg_quote_volume === null || row.avg_quote_volume === undefined ? '-' : quoteMoney(row.avg_quote_volume, row.quote_currency)}</td>
+            <td>${row.best_symbol || '-'}</td>
+            <td class="${pnlClass}">${pnl === null || pnl === undefined ? '-' : `${quoteMoney(row.best_pnl, row.quote_currency)} (${Number(pnl).toFixed(2)}%)`}</td>
+            <td>${(row.errors || []).join(' | ') || '-'}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderTrades(trades) {
+      if (!trades.length) {
+        els.tradesBody.innerHTML = '<tr><td colspan="7" class="muted">No trades yet.</td></tr>';
+        return;
+      }
+
+      els.tradesBody.innerHTML = trades.map((trade) => `
+        <tr>
+          <td>${new Date(trade.time).toLocaleString()}</td>
+          <td class="${trade.side === 'BUY' ? 'good' : 'bad'}"><strong>${trade.side}</strong></td>
+          <td>${priceText(trade.price, trade.symbol)}</td>
+          <td>${num(trade.quantity, 10)}</td>
+          <td>${money(trade.cash_after)}</td>
+          <td>${trade.exchange_order_id ? `${trade.exchange_order_id}<br><span class="muted">${trade.exchange_order_status || ''}</span>` : '-'}</td>
+          <td>${trade.reason}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderBacktest(data) {
+      const results = data.results || [];
+      const best = data.best;
+      els.backtestErrorBox.style.display = data.errors && data.errors.length ? 'block' : 'none';
+      els.backtestErrorBox.textContent = data.errors && data.errors.length
+        ? `Skipped: ${data.errors.join(' | ')}`
+        : '';
+
+      if (!results.length || !best) {
+        els.backtestMetrics.style.display = 'none';
+        els.backtestBody.innerHTML = '<tr><td colspan="7" class="muted">No backtest results returned.</td></tr>';
+        els.backtestTradesBody.innerHTML = '<tr><td colspan="5" class="muted">No backtest trades yet.</td></tr>';
+        return;
+      }
+
+      els.backtestMetrics.style.display = 'grid';
+      els.btBestSymbol.textContent = best.symbol;
+      els.btBestEquity.textContent = money(best.final_equity);
+      els.btBestPnl.className = Number(best.total_pnl) >= 0 ? 'good' : 'bad';
+      els.btBestPnl.textContent = `${money(best.total_pnl)} (${Number(best.total_pnl_pct || 0).toFixed(2)}%)`;
+      els.btBestDrawdown.className = 'bad';
+      els.btBestDrawdown.textContent = `${Number(best.max_drawdown_pct || 0).toFixed(2)}%`;
+
+      els.backtestBody.innerHTML = results.map((row) => {
+        const pnlClass = Number(row.total_pnl) >= 0 ? 'good' : 'bad';
+        return `
+          <tr>
+            <td><strong>${row.symbol}</strong></td>
+            <td>${money(row.final_equity)}</td>
+            <td class="${pnlClass}">${money(row.total_pnl)} (${Number(row.total_pnl_pct || 0).toFixed(2)}%)</td>
+            <td class="bad">${Number(row.max_drawdown_pct || 0).toFixed(2)}%</td>
+            <td>${row.trades_count}</td>
+            <td>${Number(row.win_rate || 0).toFixed(2)}%</td>
+            <td>${row.open_position ? 'Yes' : 'No'}</td>
+          </tr>
+        `;
+      }).join('');
+
+      const trades = best.trades || [];
+      if (!trades.length) {
+        els.backtestTradesBody.innerHTML = '<tr><td colspan="5" class="muted">Best symbol made no trades.</td></tr>';
+        return;
+      }
+
+      els.backtestTradesBody.innerHTML = trades.map((trade) => `
+        <tr>
+          <td>${new Date(trade.time * 1000).toLocaleString()}</td>
+          <td class="${trade.side === 'BUY' ? 'good' : 'bad'}"><strong>${trade.side}</strong></td>
+          <td>${money(trade.price)}</td>
+          <td>${num(trade.quantity, 10)}</td>
+          <td>${trade.reason}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderPerformance(rows) {
+      if (!rows.length) {
+        els.performanceBody.innerHTML = '<tr><td colspan="6" class="muted">No symbol performance yet.</td></tr>';
+        return;
+      }
+
+      els.performanceBody.innerHTML = rows.map((row) => {
+        const pnlClass = Number(row.closed_pnl) >= 0 ? 'good' : 'bad';
+        return `
+          <tr>
+            <td><strong>${row.symbol}</strong></td>
+            <td class="${pnlClass}">${money(row.closed_pnl)}</td>
+            <td>${row.buys}</td>
+            <td>${row.sells}</td>
+            <td>${Number(row.win_rate || 0).toFixed(2)}%</td>
+            <td>${money(row.fees)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderSetupLearning(performanceRows, setupRows) {
+      if (!performanceRows.length) {
+        els.setupPerformanceBody.innerHTML = '<tr><td colspan="7" class="muted">No closed setup data yet.</td></tr>';
+      } else {
+        els.setupPerformanceBody.innerHTML = performanceRows.map((row) => {
+          const pnlClass = Number(row.total_pnl) >= 0 ? 'good' : 'bad';
+          const expectancyClass = Number(row.expectancy_pct) >= 0 ? 'good' : 'bad';
+          return `
+            <tr>
+              <td><strong>${row.symbol}</strong></td>
+              <td>${row.settings_key || '-'}</td>
+              <td>${row.closed_setups}</td>
+              <td class="${expectancyClass}">${Number(row.expectancy_pct || 0).toFixed(2)}%</td>
+              <td>${Number(row.win_rate || 0).toFixed(2)}%</td>
+              <td class="${pnlClass}">${money(row.total_pnl)} (${Number(row.total_pnl_pct || 0).toFixed(2)}%)</td>
+              <td>${row.top_regime || '-'}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      if (!setupRows.length) {
+        els.setupRecordsBody.innerHTML = '<tr><td colspan="8" class="muted">No setup records yet.</td></tr>';
+        return;
+      }
+
+      els.setupRecordsBody.innerHTML = setupRows.map((row) => {
+        const pnl = row.pnl_pct === null || row.pnl_pct === undefined ? null : Number(row.pnl_pct);
+        const pnlClass = pnl === null ? 'muted' : pnl >= 0 ? 'good' : 'bad';
+        return `
+          <tr>
+            <td>${new Date(row.time).toLocaleString()}</td>
+            <td><strong>${row.symbol}</strong></td>
+            <td>${row.status}</td>
+            <td>${row.regime || '-'}</td>
+            <td>${priceText(row.entry_price, row.symbol)}</td>
+            <td>${row.exit_price ? priceText(row.exit_price, row.symbol) : '-'}</td>
+            <td class="${pnlClass}">${pnl === null ? '-' : `${money(row.realized_pnl)} (${pnl.toFixed(2)}%)`}</td>
+            <td>${row.exit_reason || row.entry_reason || '-'}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderJournal(rows) {
+      if (!rows.length) {
+        els.journalBody.innerHTML = '<tr><td colspan="5" class="muted">No journal entries yet.</td></tr>';
+        return;
+      }
+
+      els.journalBody.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${new Date(row.time).toLocaleString()}</td>
+          <td><strong>${row.symbol || '-'}</strong></td>
+          <td>${row.event}</td>
+          <td>${row.price ? priceText(row.price, row.symbol) : '-'}</td>
+          <td>${row.message}</td>
+        </tr>
+      `).join('');
+    }
+
+    function optimizerSettingsText(row) {
+      if (row.strategy === 'ewo_offset') {
+        return `EWO buy/sell ${row.base_nb_candles_buy}/${row.base_nb_candles_sell}, low ${row.low_offset}/${row.low_offset_2}, high ${row.high_offset}/${row.high_offset_2}, RSI ${row.rsi_buy}`;
+      }
+      return `SMA ${row.short_window}/${row.long_window}, SL ${row.stop_loss_pct}%, TP ${row.take_profit_pct}%, Pos ${Number(row.max_position_pct * 100).toFixed(0)}%`;
+    }
+
+    function renderOptimizer(data) {
+      const results = data.results || [];
+      els.backtestErrorBox.style.display = data.errors && data.errors.length ? 'block' : 'none';
+      els.backtestErrorBox.textContent = data.errors && data.errors.length
+        ? `Skipped: ${data.errors.join(' | ')}`
+        : '';
+
+      if (!results.length) {
+        els.optimizerBody.innerHTML = '<tr><td colspan="8" class="muted">No optimizer results returned.</td></tr>';
+        latestOptimizerBest = null;
+        els.applyOptimizerBtn.disabled = true;
+        return;
+      }
+
+      latestOptimizerBest = data.best || results[0];
+      els.applyOptimizerBtn.disabled = !latestOptimizerBest;
+
+      els.optimizerBody.innerHTML = results.map((row, index) => {
+        const pnlClass = Number(row.total_pnl) >= 0 ? 'good' : 'bad';
+        const settings = optimizerSettingsText(row);
+        return `
+          <tr>
+            <td>${index + 1}</td>
+            <td><strong>${row.symbol}</strong></td>
+            <td>${Number(row.score || 0).toFixed(4)}</td>
+            <td>${settings}</td>
+            <td class="${pnlClass}">${money(row.total_pnl)} (${Number(row.total_pnl_pct || 0).toFixed(2)}%)</td>
+            <td class="bad">${Number(row.max_drawdown_pct || 0).toFixed(2)}%</td>
+            <td>${row.trades_count}</td>
+            <td>${Number(row.win_rate || 0).toFixed(2)}%</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderWalkForward(data) {
+      const results = data.results || [];
+      els.backtestErrorBox.style.display = data.errors && data.errors.length ? 'block' : 'none';
+      els.backtestErrorBox.textContent = data.errors && data.errors.length
+        ? `Skipped: ${data.errors.join(' | ')}`
+        : '';
+
+      if (!results.length) {
+        els.walkForwardBody.innerHTML = '<tr><td colspan="8" class="muted">No walk-forward results returned.</td></tr>';
+        return;
+      }
+
+      latestOptimizerBest = data.best || results[0];
+      els.applyOptimizerBtn.disabled = !latestOptimizerBest;
+
+      els.walkForwardBody.innerHTML = results.map((row, index) => {
+        const testPnlClass = Number(row.test_total_pnl) >= 0 ? 'good' : 'bad';
+        const trainPnlClass = Number(row.train_pnl_pct) >= 0 ? 'good' : 'bad';
+        const settings = optimizerSettingsText(row);
+        return `
+          <tr>
+            <td>${index + 1}</td>
+            <td><strong>${row.symbol}</strong></td>
+            <td>${settings}</td>
+            <td class="${trainPnlClass}">${Number(row.train_pnl_pct || 0).toFixed(2)}%</td>
+            <td class="${testPnlClass}">${money(row.test_total_pnl)} (${Number(row.test_total_pnl_pct || 0).toFixed(2)}%)</td>
+            <td class="bad">${Number(row.test_drawdown_pct || 0).toFixed(2)}%</td>
+            <td>${row.test_trades}</td>
+            <td>${Number(row.test_score || 0).toFixed(4)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function drawChart(prices, support = null, resistance = null, chartLevels = {}, chartTrades = [], candles = []) {
+      const sourceCandles = (candles || [])
+        .map((candle) => ({
+          time: Number(candle.time || 0),
+          open: Number(candle.open || candle.close || 0),
+          high: Number(candle.high || candle.close || 0),
+          low: Number(candle.low || candle.close || 0),
+          close: Number(candle.close || 0),
+          volume: Number(candle.volume || 0)
+        }))
+        .filter((candle) => candle.close > 0);
+      const candleMode = chartMode === 'candles' && sourceCandles.length >= 2;
+      const chartPrices = candleMode ? sourceCandles.map((candle) => candle.close) : (prices || []);
+      lastPrices = chartPrices;
+      lastSupport = support;
+      lastResistance = resistance;
+      lastChartLevels = chartLevels || {};
+      lastChartTrades = chartTrades || [];
+      lastCandles = candles || [];
+      const canvas = els.chart;
+      resizeChartCanvas(canvas);
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+
+      ctx.fillStyle = cssVar('--chart-bg') || '#fbfcfe';
+      ctx.fillRect(0, 0, width, height);
+
+      if (chartPrices.length < 2) {
+        ctx.fillStyle = cssVar('--muted') || '#667085';
+        ctx.font = '14px system-ui';
+        ctx.fillText('Waiting for price data...', 22, 36);
+        return;
+      }
+
+      const lows = candleMode ? sourceCandles.map((candle) => candle.low) : chartPrices;
+      const highs = candleMode ? sourceCandles.map((candle) => candle.high) : chartPrices;
+      const min = Math.min(...lows);
+      const max = Math.max(...highs);
+      const planLines = [
+        { value: support, label: 'Support', color: cssVar('--good') || '#057a55', dash: [6, 5] },
+        { value: resistance, label: 'Resistance', color: cssVar('--bad') || '#b42318', dash: [6, 5] },
+        { value: chartLevels.entry, label: 'Entry', color: cssVar('--accent') || '#2457d6', dash: [] },
+        { value: chartLevels.stop, label: 'Stop', color: cssVar('--bad') || '#b42318', dash: [3, 4] },
+        { value: chartLevels.target, label: 'Target', color: cssVar('--good') || '#057a55', dash: [3, 4] },
+        { value: chartLevels.partial, label: 'Partial TP', color: cssVar('--warn') || '#a15c07', dash: [4, 4] },
+        { value: chartLevels.trailing, label: 'Trailing', color: '#8b5cf6', dash: [2, 5] }
+      ].filter((line) => Number(line.value || 0) > 0);
+      const lineValues = planLines.map((line) => Number(line.value));
+      const chartMin = Math.min(min, ...lineValues);
+      const chartMax = Math.max(max, ...lineValues);
+      const range = Math.max(chartMax - chartMin, 0.00000001);
+      const pad = 22;
+      const xForIndex = (index) => pad + (index / Math.max(1, chartPrices.length - 1)) * (width - pad * 2);
+      const yForPrice = (price) => height - pad - ((price - chartMin) / range) * (height - pad * 2);
+
+      ctx.strokeStyle = cssVar('--line') || '#d9dee7';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 4; i += 1) {
+        const y = pad + ((height - pad * 2) / 3) * i;
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(width - pad, y);
+        ctx.stroke();
+      }
+
+      if (candleMode) {
+        const bodyWidth = Math.max(3, Math.min(12, ((width - pad * 2) / sourceCandles.length) * 0.62));
+        sourceCandles.forEach((candle, index) => {
+          const x = xForIndex(index);
+          const yOpen = yForPrice(candle.open);
+          const yHigh = yForPrice(candle.high);
+          const yLow = yForPrice(candle.low);
+          const yClose = yForPrice(candle.close);
+          const isUp = candle.close >= candle.open;
+          const color = isUp ? (cssVar('--good') || '#057a55') : (cssVar('--bad') || '#b42318');
+          ctx.strokeStyle = color;
+          ctx.fillStyle = color;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x, yHigh);
+          ctx.lineTo(x, yLow);
+          ctx.stroke();
+          const bodyTop = Math.min(yOpen, yClose);
+          const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
+          ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+        });
+      } else {
+        ctx.strokeStyle = cssVar('--accent') || '#2457d6';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        chartPrices.forEach((price, index) => {
+          const x = xForIndex(index);
+          const y = yForPrice(price);
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      const latestPrice = Number(chartPrices[chartPrices.length - 1]);
+      const latestX = xForIndex(chartPrices.length - 1);
+      const latestY = yForPrice(latestPrice);
+      ctx.fillStyle = cssVar('--accent') || '#2457d6';
+      ctx.beginPath();
+      ctx.arc(latestX, latestY, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = '12px system-ui';
+      const latestLabel = `Now ${priceText(latestPrice, lastChartSymbol)}`;
+      const latestLabelWidth = ctx.measureText(latestLabel).width + 14;
+      const latestLabelX = Math.max(pad, width - latestLabelWidth - pad);
+      const latestLabelY = Math.max(pad + 4, Math.min(height - pad - 18, latestY - 24));
+      ctx.fillStyle = cssVar('--panel') || '#ffffff';
+      ctx.strokeStyle = cssVar('--accent') || '#2457d6';
+      ctx.lineWidth = 1;
+      ctx.fillRect(latestLabelX, latestLabelY, latestLabelWidth, 22);
+      ctx.strokeRect(latestLabelX, latestLabelY, latestLabelWidth, 22);
+      ctx.fillStyle = cssVar('--text') || '#172033';
+      ctx.fillText(latestLabel, latestLabelX + 7, latestLabelY + 15);
+
+      planLines.forEach((level, index) => {
+        const value = Number(level.value);
+        const y = yForPrice(value);
+        ctx.strokeStyle = level.color;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash(level.dash);
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(width - pad, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = level.color;
+        ctx.font = '12px system-ui';
+        const labelX = width - 190;
+        const labelY = 18 + (index * 16);
+        ctx.fillText(`${level.label} ${priceText(value, lastChartSymbol)}`, labelX, labelY);
+      });
+
+      chartTrades.slice(-12).forEach((trade) => {
+        const price = Number(trade.price || 0);
+        if (!price) return;
+        let closestIndex = 0;
+        let closestDistance = Infinity;
+        chartPrices.forEach((item, index) => {
+          const distance = Math.abs(Number(item) - price);
+          if (distance < closestDistance) {
+            closestDistance = distance;
+            closestIndex = index;
+          }
+        });
+        const x = xForIndex(closestIndex);
+        const y = yForPrice(price);
+        const isBuy = trade.side === 'BUY';
+        ctx.fillStyle = isBuy ? (cssVar('--good') || '#057a55') : (cssVar('--bad') || '#b42318');
+        ctx.beginPath();
+        if (isBuy) {
+          ctx.moveTo(x, y - 7);
+          ctx.lineTo(x - 6, y + 5);
+          ctx.lineTo(x + 6, y + 5);
+        } else {
+          ctx.moveTo(x, y + 7);
+          ctx.lineTo(x - 6, y - 5);
+          ctx.lineTo(x + 6, y - 5);
+        }
+        ctx.closePath();
+        ctx.fill();
+      });
+
+      if (chartHoverIndex !== null) {
+        const hoverIndex = Math.max(0, Math.min(chartPrices.length - 1, chartHoverIndex));
+        const hoverPrice = Number(chartPrices[hoverIndex]);
+        const x = xForIndex(hoverIndex);
+        const y = yForPrice(hoverPrice);
+        ctx.strokeStyle = cssVar('--muted') || '#667085';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x, pad);
+        ctx.lineTo(x, height - pad);
+        ctx.moveTo(pad, y);
+        ctx.lineTo(width - pad, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = cssVar('--accent') || '#2457d6';
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        const hoverLabel = `${candleMode ? 'Close' : '#'}${candleMode ? '' : hoverIndex + 1} ${priceText(hoverPrice, lastChartSymbol)}`;
+        ctx.font = '12px system-ui';
+        const boxWidth = ctx.measureText(hoverLabel).width + 16;
+        const boxHeight = 24;
+        const boxX = Math.min(width - boxWidth - pad, x + 10);
+        const boxY = Math.max(pad, Math.min(height - pad - boxHeight, y - 32));
+        ctx.fillStyle = cssVar('--panel') || '#ffffff';
+        ctx.strokeStyle = cssVar('--line') || '#d9dee7';
+        ctx.lineWidth = 1;
+        ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+        ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+        ctx.fillStyle = cssVar('--text') || '#172033';
+        ctx.fillText(hoverLabel, boxX + 8, boxY + 16);
+      }
+
+      ctx.fillStyle = cssVar('--muted') || '#667085';
+      ctx.font = '12px system-ui';
+      ctx.fillText(`High ${priceText(max, lastChartSymbol)}`, pad, 16);
+      ctx.fillText(`Low ${priceText(min, lastChartSymbol)}`, pad, height - 6);
+    }
+
+    applyTheme(localStorage.getItem('cryptobot-theme') || 'light');
+    els.chartModeSelect.value = chartMode;
+
+    els.themeToggle.addEventListener('click', () => {
+      applyTheme(document.body.classList.contains('dark') ? 'light' : 'dark');
+    });
+
+    els.chartSymbolSelect.addEventListener('change', () => {
+      selectedChartSymbol = els.chartSymbolSelect.value;
+      localStorage.setItem('cryptobot-chart-symbol', selectedChartSymbol);
+      if (lastStatusData) {
+        chartHoverIndex = null;
+        renderSelectedChart(lastStatusData);
+      }
+    });
+
+    els.chartModeSelect.addEventListener('change', async () => {
+      chartMode = els.chartModeSelect.value;
+      localStorage.setItem('cryptobot-chart-mode', chartMode);
+      if (els.form.elements.chart_mode) {
+        els.form.elements.chart_mode.value = chartMode;
+      }
+      if (lastStatusData) {
+        chartHoverIndex = null;
+        renderSelectedChart(lastStatusData);
+      }
+      const result = await post('/api/settings', { chart_mode: chartMode });
+      if (!result.ok) {
+        els.errorBox.style.display = 'block';
+        els.errorBox.textContent = result.error || 'Could not save chart mode.';
+      }
+    });
+
+    els.chart.addEventListener('mousemove', (event) => {
+      if (lastPrices.length < 2) return;
+      const rect = els.chart.getBoundingClientRect();
+      const pad = 22;
+      const x = event.clientX - rect.left;
+      const ratio = Math.max(0, Math.min(1, (x - pad) / Math.max(1, rect.width - pad * 2)));
+      chartHoverIndex = Math.round(ratio * (lastPrices.length - 1));
+      redrawChart();
+    });
+
+    els.chart.addEventListener('mouseleave', () => {
+      chartHoverIndex = null;
+      redrawChart();
+    });
+
+    window.addEventListener('resize', redrawChart);
+
+    document.querySelector('#startBtn').addEventListener('click', async () => {
+      const result = await post('/api/start');
+      if (!result.ok) {
+        els.liveMessage.textContent = result.error || 'Could not start bot.';
+        els.errorBox.style.display = 'block';
+        els.errorBox.textContent = result.error || 'Could not start bot.';
+        return;
+      }
+      refresh();
+    });
+
+    document.querySelector('#stopBtn').addEventListener('click', async () => {
+      await post('/api/stop');
+      refresh();
+    });
+
+    document.querySelector('#resetBtn').addEventListener('click', async () => {
+      if (!confirm('Reset paper balance, position, and trade history?')) return;
+      await post('/api/reset');
+      refresh();
+    });
+
+    els.syncLiveBalanceBtn.addEventListener('click', async () => {
+      els.syncLiveBalanceBtn.disabled = true;
+      els.liveMessage.textContent = 'Syncing Coinbase balance...';
+
+      try {
+        const result = await post('/api/sync-live-balance');
+        if (!result.ok) throw new Error(result.error || 'Balance sync failed');
+        await refresh();
+        els.liveMessage.textContent = `Synced ${result.quote_currency} ${Number(result.available_cash || 0).toFixed(2)} from Coinbase.`;
+      } catch (error) {
+        els.liveMessage.textContent = error.message;
+      } finally {
+        els.syncLiveBalanceBtn.disabled = false;
+      }
+    });
+
+    els.oandaAuthCheckBtn.addEventListener('click', async () => {
+      els.oandaAuthCheckBtn.disabled = true;
+      els.liveMessage.textContent = 'Checking OANDA demo credentials...';
+
+      try {
+        const result = await post('/api/oanda-auth-check');
+        if (!result.ok) throw new Error(result.error || 'OANDA auth check failed');
+        const orderState = result.demo_trading_armed ? 'demo orders armed' : 'demo orders locked';
+        els.liveMessage.textContent = `OANDA demo OK: ${result.account_id || 'account'} ${result.currency || ''} ${Number(result.balance || 0).toFixed(2)} | ${orderState}`.trim();
+      } catch (error) {
+        els.liveMessage.textContent = error.message;
+      } finally {
+        els.oandaAuthCheckBtn.disabled = false;
+      }
+    });
+
+    els.syncOandaBalanceBtn.addEventListener('click', async () => {
+      els.syncOandaBalanceBtn.disabled = true;
+      els.liveMessage.textContent = 'Syncing OANDA demo balance to paper account...';
+
+      try {
+        const result = await post('/api/sync-oanda-balance');
+        if (!result.ok) throw new Error(result.error || 'OANDA balance sync failed');
+        await refresh();
+        els.liveMessage.textContent = `Synced paper balance from OANDA: ${result.quote_currency} ${Number(result.available_cash || 0).toFixed(2)}.`;
+      } catch (error) {
+        els.liveMessage.textContent = error.message;
+      } finally {
+        els.syncOandaBalanceBtn.disabled = false;
+      }
+    });
+
+    els.fetchGbpPairsBtn.addEventListener('click', async () => {
+      const quote = (els.form.elements.quote_currency.value || 'GBP').trim().toUpperCase();
+      els.fetchGbpPairsBtn.disabled = true;
+      els.applyGbpPairsBtn.disabled = true;
+      els.gbpPairsStatus.textContent = `Fetching Coinbase ${quote} pairs...`;
+
+      try {
+        const result = await getJson(`/api/coinbase-products?quote=${encodeURIComponent(quote)}`);
+        if (!result.ok) throw new Error(result.error || `Could not fetch ${quote} pairs`);
+        fetchedGbpWatchlist = result.watchlist || '';
+        fetchedQuoteCurrency = result.quote_currency || quote;
+        els.applyGbpPairsBtn.disabled = !fetchedGbpWatchlist;
+        els.gbpPairsStatus.textContent = `Found ${result.count || 0} online ${fetchedQuoteCurrency} pairs.`;
+      } catch (error) {
+        fetchedGbpWatchlist = '';
+        fetchedQuoteCurrency = '';
+        els.gbpPairsStatus.textContent = error.message;
+      } finally {
+        els.fetchGbpPairsBtn.disabled = false;
+      }
+    });
+
+    els.applyGbpPairsBtn.addEventListener('click', () => {
+      if (!fetchedGbpWatchlist) return;
+      els.form.elements.watchlist.value = fetchedGbpWatchlist;
+      els.form.elements.quote_currency.value = fetchedQuoteCurrency || els.form.elements.quote_currency.value;
+      settingsFormDirty = true;
+      els.gbpPairsStatus.textContent = `${els.form.elements.quote_currency.value} pairs applied. Click Save Settings.`;
+    });
+
+    els.compareQuotesBtn.addEventListener('click', async () => {
+      const settingsPayload = Object.fromEntries(new FormData(els.form).entries());
+      const backtestPayload = Object.fromEntries(new FormData(els.backtestForm).entries());
+      els.compareQuotesBtn.disabled = true;
+      els.gbpPairsStatus.textContent = 'Comparing quote currencies...';
+
+      try {
+        const result = await post('/api/quote-comparison', {
+          ...settingsPayload,
+          ...backtestPayload,
+          quote_currencies: els.quoteCompareInput.value
+        });
+        if (!result.ok) throw new Error(result.error || 'Quote comparison failed');
+        renderQuoteComparison(result.rows || []);
+        els.gbpPairsStatus.textContent = `Compared ${result.rows.length} quote currencies.`;
+      } catch (error) {
+        els.gbpPairsStatus.textContent = error.message;
+      } finally {
+        els.compareQuotesBtn.disabled = false;
+      }
+    });
+
+    els.freqtradePresetBtn.addEventListener('click', () => {
+      applySettingsPreset(freqtradePreset);
+      if (els.backtestForm.elements.granularity) {
+        els.backtestForm.elements.granularity.value = '300';
+      }
+      if (els.backtestForm.elements.candle_count) {
+        els.backtestForm.elements.candle_count.value = '300';
+      }
+      els.settingsPresetStatus.textContent = 'Freqtrade preset applied. Click Save Settings.';
+    });
+
+    els.forexPresetBtn.addEventListener('click', () => {
+      applySettingsPreset(forexDemoPreset);
+      if (els.backtestForm.elements.granularity) {
+        els.backtestForm.elements.granularity.value = '3600';
+      }
+      if (els.backtestForm.elements.candle_count) {
+        els.backtestForm.elements.candle_count.value = '300';
+      }
+      chartMode = 'candles';
+      els.chartModeSelect.value = chartMode;
+      localStorage.setItem('cryptobot-chart-mode', chartMode);
+      els.settingsPresetStatus.textContent = 'Forex demo preset applied. Click Save Settings.';
+    });
+
+    els.oandaPresetBtn.addEventListener('click', () => {
+      applySettingsPreset(oandaDemoPreset);
+      if (els.backtestForm.elements.granularity) {
+        els.backtestForm.elements.granularity.value = '3600';
+      }
+      if (els.backtestForm.elements.candle_count) {
+        els.backtestForm.elements.candle_count.value = '300';
+      }
+      chartMode = 'candles';
+      els.chartModeSelect.value = chartMode;
+      localStorage.setItem('cryptobot-chart-mode', chartMode);
+      els.settingsPresetStatus.textContent = 'OANDA demo preset applied. Add .env keys, then click Save Settings.';
+    });
+
+    els.form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const payload = Object.fromEntries(new FormData(els.form).entries());
+      const result = await post('/api/settings', payload);
+      if (!result.ok) {
+        els.errorBox.style.display = 'block';
+        els.errorBox.textContent = result.error || 'Could not save settings.';
+        return;
+      }
+      settingsFormDirty = false;
+      refresh();
+    });
+
+    els.form.addEventListener('input', () => {
+      settingsFormDirty = true;
+    });
+
+    els.form.addEventListener('change', () => {
+      settingsFormDirty = true;
+    });
+
+    els.backtestForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const settingsPayload = Object.fromEntries(new FormData(els.form).entries());
+      const backtestPayload = Object.fromEntries(new FormData(els.backtestForm).entries());
+      els.backtestBtn.disabled = true;
+      els.backtestStatus.textContent = 'Running backtest...';
+
+      try {
+        const result = await post('/api/backtest', { ...settingsPayload, ...backtestPayload });
+        if (!result.ok) throw new Error(result.error || 'Backtest failed');
+        renderBacktest(result);
+        els.backtestStatus.textContent = `Backtested ${result.results.length} symbols.`;
+      } catch (error) {
+        els.backtestErrorBox.style.display = 'block';
+        els.backtestErrorBox.textContent = error.message;
+        els.backtestStatus.textContent = 'Backtest failed.';
+      } finally {
+        els.backtestBtn.disabled = false;
+      }
+    });
+
+    els.optimizerBtn.addEventListener('click', async () => {
+      const settingsPayload = Object.fromEntries(new FormData(els.form).entries());
+      const backtestPayload = Object.fromEntries(new FormData(els.backtestForm).entries());
+      els.optimizerBtn.disabled = true;
+      els.backtestBtn.disabled = true;
+      els.backtestStatus.textContent = 'Optimizing settings...';
+
+      try {
+        const result = await post('/api/optimize', { ...settingsPayload, ...backtestPayload });
+        if (!result.ok) throw new Error(result.error || 'Optimizer failed');
+        renderOptimizer(result);
+        els.backtestStatus.textContent = `Optimizer tested ${result.combinations_tested} combinations.`;
+      } catch (error) {
+        els.backtestErrorBox.style.display = 'block';
+        els.backtestErrorBox.textContent = error.message;
+        els.backtestStatus.textContent = 'Optimizer failed.';
+      } finally {
+        els.optimizerBtn.disabled = false;
+        els.backtestBtn.disabled = false;
+      }
+    });
+
+    els.walkForwardBtn.addEventListener('click', async () => {
+      const settingsPayload = Object.fromEntries(new FormData(els.form).entries());
+      const backtestPayload = Object.fromEntries(new FormData(els.backtestForm).entries());
+      els.walkForwardBtn.disabled = true;
+      els.backtestBtn.disabled = true;
+      els.optimizerBtn.disabled = true;
+      els.backtestStatus.textContent = 'Running walk-forward validation...';
+
+      try {
+        const result = await post('/api/walk-forward', { ...settingsPayload, ...backtestPayload });
+        if (!result.ok) throw new Error(result.error || 'Walk-forward test failed');
+        renderWalkForward(result);
+        els.backtestStatus.textContent = `Walk-forward tested ${result.combinations_tested} training combinations.`;
+      } catch (error) {
+        els.backtestErrorBox.style.display = 'block';
+        els.backtestErrorBox.textContent = error.message;
+        els.backtestStatus.textContent = 'Walk-forward test failed.';
+      } finally {
+        els.walkForwardBtn.disabled = false;
+        els.backtestBtn.disabled = false;
+        els.optimizerBtn.disabled = false;
+      }
+    });
+
+    els.applyOptimizerBtn.addEventListener('click', async () => {
+      if (!latestOptimizerBest) return;
+
+      const fields = els.form.elements;
+      settingsFormDirty = true;
+      fields.watchlist.value = latestOptimizerBest.symbol;
+      if (latestOptimizerBest.strategy) fields.strategy.value = latestOptimizerBest.strategy;
+      fields.short_window.value = latestOptimizerBest.short_window;
+      fields.long_window.value = latestOptimizerBest.long_window;
+      fields.stop_loss_pct.value = latestOptimizerBest.stop_loss_pct;
+      fields.take_profit_pct.value = latestOptimizerBest.take_profit_pct;
+      fields.max_position_pct.value = latestOptimizerBest.max_position_pct;
+      [
+        'base_nb_candles_buy',
+        'base_nb_candles_sell',
+        'low_offset',
+        'low_offset_2',
+        'high_offset',
+        'high_offset_2',
+        'ewo_high',
+        'ewo_high_2',
+        'ewo_low',
+        'rsi_buy'
+      ].forEach((name) => {
+        if (latestOptimizerBest[name] !== undefined && fields[name]) {
+          fields[name].value = latestOptimizerBest[name];
+        }
+      });
+
+      const payload = Object.fromEntries(new FormData(els.form).entries());
+      els.applyOptimizerBtn.disabled = true;
+      els.backtestStatus.textContent = `Applying optimized settings for ${latestOptimizerBest.symbol}...`;
+
+      try {
+        await post('/api/settings', payload);
+        settingsFormDirty = false;
+        await refresh();
+        els.backtestStatus.textContent = `Applied optimized settings for ${latestOptimizerBest.symbol}.`;
+      } catch (error) {
+        els.backtestErrorBox.style.display = 'block';
+        els.backtestErrorBox.textContent = error.message;
+        els.backtestStatus.textContent = 'Could not apply optimized settings.';
+      } finally {
+        els.applyOptimizerBtn.disabled = false;
+      }
+    });
+
+    refresh();
+    setInterval(refresh, 3000);
+
+    function makeSettingsGroup(title, labels, open = false) {
+      const details = document.createElement('details');
+      details.className = 'settings-group';
+      if (open) details.open = true;
+
+      const summary = document.createElement('summary');
+      summary.textContent = title;
+
+      const body = document.createElement('div');
+      body.className = 'settings-group-body';
+
+      labels.forEach((label) => {
+        if (label) body.appendChild(label);
+      });
+
+      if (!body.children.length) {
+        const empty = document.createElement('div');
+        empty.className = 'small';
+        empty.textContent = 'No fields found for this section.';
+        body.appendChild(empty);
+      }
+
+      details.appendChild(summary);
+      details.appendChild(body);
+      return details;
+    }
+
+    function groupSettingsForm() {
+      if (!els.form || els.form.dataset.grouped === 'true') return;
+      els.form.dataset.grouped = 'true';
+
+      const submitButton = els.form.querySelector('button[type="submit"]');
+
+      const groups = [
+        ['1. Market & Mode', ['asset_class', 'exchange', 'watchlist', 'quote_currency', 'chart_mode', 'live_granularity', 'live_candle_count', 'closed_candle_only', 'poll_seconds'], true],
+        ['2. Strategy', ['strategy', 'short_window', 'long_window'], true],
+        ['3. Risk & Position Sizing', ['starting_cash', 'trade_fee', 'max_position_pct', 'position_sizing_mode', 'risk_per_trade_pct', 'min_order_value', 'daily_loss_limit_pct', 'cooldown_seconds'], true],
+        ['4. OANDA / Forex', ['oanda_demo_trading_enabled', 'max_oanda_open_trades'], true],
+        ['5. Support / Resistance', ['use_sr_filter', 'use_dynamic_sr_exits', 'sr_lookback_candles', 'sr_zone_tolerance_pct', 'sr_min_touches', 'near_support_pct', 'min_resistance_distance_pct', 'min_sr_range_pct', 'min_reward_risk', 'support_stop_buffer_pct', 'resistance_target_buffer_pct'], false],
+        ['6. Exits', ['stop_loss_pct', 'take_profit_pct', 'partial_take_profit_enabled', 'partial_take_profit_pct', 'partial_take_profit_at_target_pct', 'trailing_stop_enabled', 'trailing_stop_pct', 'trailing_activation_pct'], false],
+        ['7. EWO / Freqtrade Advanced', ['base_nb_candles_buy', 'base_nb_candles_sell', 'low_offset', 'low_offset_2', 'high_offset', 'high_offset_2', 'ewo_high', 'ewo_high_2', 'ewo_low', 'rsi_buy'], false],
+        ['8. Live / Coinbase Execution', ['live_trading_enabled', 'live_order_type', 'live_limit_offset_pct', 'native_stop_enabled', 'max_live_order_gbp', 'max_daily_live_loss_gbp', 'max_live_spread_pct', 'min_live_quote_volume'], false],
+        ['9. Orders, Data & Backtesting', ['backtest_slippage_pct', 'order_expiry_seconds', 'order_retry_limit', 'order_replace_enabled', 'websocket_enabled'], false],
+        ['10. Learning & Regime Filters', ['auto_disable_weak_pairs', 'weak_pair_min_trades', 'weak_pair_expectancy_limit_pct', 'weak_pair_win_rate_limit_pct', 'regime_filter_enabled', 'allow_trending_regime', 'allow_ranging_regime', 'allow_volatile_regime', 'allow_dead_regime'], false]
+      ];
+
+      // Important: collect the existing label nodes BEFORE clearing the form.
+      // Clearing first removes all inputs, which was why the groups expanded with no fields.
+      const labelsByGroup = groups.map(([title, names, open]) => {
+        const labels = names
+          .map((name) => {
+            const field = els.form.elements[name];
+            return field ? field.closest('label') : null;
+          })
+          .filter(Boolean);
+        return [title, labels, open];
+      });
+
+      const usedLabels = new Set(labelsByGroup.flatMap(([, labels]) => labels));
+      const leftoverLabels = Array.from(els.form.querySelectorAll('label')).filter((label) => !usedLabels.has(label));
+      if (leftoverLabels.length) {
+        labelsByGroup.push(['11. Other Settings', leftoverLabels, false]);
+      }
+
+      const toolbar = document.createElement('div');
+      toolbar.className = 'settings-toolbar';
+      toolbar.innerHTML = `
+        <button type="button" id="settingsExpandAllBtn">Expand all</button>
+        <button type="button" id="settingsCollapseAllBtn">Collapse advanced</button>
+      `;
+
+      els.form.innerHTML = '';
+      els.form.appendChild(toolbar);
+
+      labelsByGroup.forEach(([title, labels, open]) => {
+        els.form.appendChild(makeSettingsGroup(title, labels, open));
+      });
+
+      const saveBar = document.createElement('div');
+      saveBar.className = 'settings-save-bar';
+      if (submitButton) saveBar.appendChild(submitButton);
+      els.form.appendChild(saveBar);
+
+      document.querySelector('#settingsExpandAllBtn')?.addEventListener('click', () => {
+        els.form.querySelectorAll('.settings-group').forEach((group) => { group.open = true; });
+      });
+
+      document.querySelector('#settingsCollapseAllBtn')?.addEventListener('click', () => {
+        els.form.querySelectorAll('.settings-group').forEach((group, index) => { group.open = index < 4; });
+      });
+    }
+
+    groupSettingsForm();
+
+  </script>
+</body>
+</html>
