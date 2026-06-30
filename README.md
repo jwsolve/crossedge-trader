@@ -41,7 +41,7 @@ python bot_server.py
 Open:
 
 ```text
-http://localhost:8090
+http://localhost:8080
 ```
 
 ## Requirements
