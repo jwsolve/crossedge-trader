@@ -9,7 +9,7 @@ Trading is disabled by default. API keys are only needed if you want Coinbase li
 ## Quick Start
 
 ```bash
-git clone https://github.com/yourusername/crossedge-trader.git
+git clone https://github.com/jwsolve/crossedge-trader.git
 cd crossedge-trader
 python -m venv venv
 ```
