@@ -103,7 +103,7 @@
   "highest_price": null,
   "active_stop_order_id": null,
   "partial_take_profit_done": false,
-  "last_price": 184.945,
+  "last_price": 184.938,
   "last_error": null,
   "last_signal": "HOLD no qualifying entry",
   "last_action_time": 1783075498.1380365,
@@ -411,7 +411,7 @@
     184.932,
     184.99,
     184.956,
-    184.945
+    184.938
   ],
   "price_history": {
     "AAVE": [
@@ -6599,7 +6599,7 @@
       184.932,
       184.99,
       184.956,
-      184.945
+      184.938
     ],
     "GBPJPY": [
       216.593,
@@ -52879,8 +52879,8 @@
         "open": 184.962,
         "high": 184.982,
         "low": 184.926,
-        "close": 184.945,
-        "volume": 179.0
+        "close": 184.938,
+        "volume": 286.0
       }
     ],
     "GBPJPY": [
