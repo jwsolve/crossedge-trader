@@ -736,7 +736,7 @@ class PaperBot:
 
         if settings.get("asset_class") != "forex" or settings.get("exchange") != "oanda_demo":
             raise RuntimeError("OANDA balance sync requires Asset Class = Forex and Exchange = OANDA demo.")
-        if current_coin > 0 or current_positions:
+        if current_coin > 0 or self.state.positions:
             raise RuntimeError(
                 "Refusing to sync OANDA paper balance while the bot has open paper/OANDA positions. "
                 "Sell or reset first."
