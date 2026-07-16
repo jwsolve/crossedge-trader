@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  auxo:
+    build: .
+    container_name: auxo-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./bot_state.json:/app/bot_state.json
+      - ./bot_audit.jsonl:/app/bot_audit.jsonl
+      - ./auxo.log:/app/auxo.log
+      - ./web:/app/web:ro
+    environment:
+      # Required for live trading – set these in .env or here
+      - COINBASE_API_KEY_NAME=${COINBASE_API_KEY_NAME:-}
+      - COINBASE_API_PRIVATE_KEY=${COINBASE_API_PRIVATE_KEY:-}
+      - LIVE_TRADING_CONFIRM=${LIVE_TRADING_CONFIRM:-}
+      # OANDA
+      - OANDA_API_TOKEN=${OANDA_API_TOKEN:-}
+      - OANDA_ACCOUNT_ID=${OANDA_ACCOUNT_ID:-}
+      - OANDA_ENV=${OANDA_ENV:-practice}
+      - OANDA_DEMO_TRADING_ENABLED=${OANDA_DEMO_TRADING_ENABLED:-false}
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,17 +1,7 @@
-#!/usr/bin/env python3
+# #!/usr/bin/env python3
 """
-CryptoBot local crypto trading dashboard.
-
-This bot is paper-only by default, with guarded live trading support:
-- no API keys required
-- no authenticated exchange access unless explicitly configured
-- no real orders unless live mode is armed
-
-Run:
-    python3 bot_server.py
-
-Then open:
-    http://localhost:8080
+Auxo trading bot – multi‑asset paper/live trading with Opening Range strategy.
+Supports both long (BUY) and short (SELL) positions.
 """
 
 from __future__ import annotations
@@ -27,12 +17,24 @@ import urllib.parse
 import urllib.request
 import uuid
 import ssl
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+# ─── Logging Setup ───
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('auxo.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('auxo')
 
 try:
     from cryptography.hazmat.primitives import hashes, serialization
@@ -41,6 +43,7 @@ try:
 except ImportError:
     hashes = serialization = ec = utils = None
     CRYPTOGRAPHY_AVAILABLE = False
+    logger.warning("cryptography package not installed – live trading disabled")
 
 try:
     import websocket
@@ -48,6 +51,14 @@ try:
 except ImportError:
     websocket = None
     WEBSOCKET_AVAILABLE = False
+    logger.warning("websocket-client package not installed – WebSocket feed disabled")
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    logger.warning("requests package not installed – news guard disabled")
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -90,6 +101,8 @@ def load_dotenv(path: Path = ENV_FILE) -> dict[str, str]:
 
 
 DOTENV_LOADED_KEYS = set(load_dotenv().keys())
+if DOTENV_LOADED_KEYS:
+    logger.info(f"Loaded {len(DOTENV_LOADED_KEYS)} environment variables from .env")
 
 
 DEFAULT_SETTINGS = {
@@ -99,7 +112,7 @@ DEFAULT_SETTINGS = {
     "watchlist": "BTC,ETH,SOL,XRP,DOGE,LINK,AVAX",
     "quote_currency": "GBP",
     "chart_mode": "line",
-    "strategy": "sma_cross",
+    "strategy": "opening_range",
     "starting_cash": 38.0,
     "trade_fee": 0.004,
     "poll_seconds": 15,
@@ -167,6 +180,37 @@ DEFAULT_SETTINGS = {
     "closed_candle_only": True,
     "oanda_demo_trading_enabled": False,
     "max_oanda_open_trades": 3,
+    # News guard settings
+    "news_guard_enabled": False,
+    "news_guard_before_minutes": 30,
+    "news_guard_after_minutes": 30,
+    "news_guard_block_high": True,
+    "news_guard_block_medium": False,
+    "news_guard_block_low": False,
+    # Opening Range Strategy settings
+    "opening_range_minutes": 15,
+    "opening_range_atr_period": 14,
+    "opening_range_manipulation_threshold": 0.20,
+    "opening_range_stop_loss_atr_multiplier": 1.5,
+    "opening_range_take_profit_atr_multiplier": 2.5,
+    "oanda_account_type": "standard",
+    # Max drawdown
+    "max_drawdown_pct": 20.0,
+    # Short selling
+    "allow_short_selling": False,
+    # Telegram alerts
+    "telegram_enabled": False,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "telegram_alert_on_buy": True,
+    "telegram_alert_on_sell": True,
+    "telegram_alert_on_error": True,
+    "telegram_alert_on_daily_summary": True,
+    "telegram_alert_on_drawdown": True,
+    "telegram_drawdown_alert_pct": 10.0,
+    # ─── EMA Golden Cross settings ───
+    "ema_short": 50,
+    "ema_long": 200,
 }
 
 FOREX_BASE_RATES = {
@@ -276,7 +320,7 @@ class BotState:
     running: bool = False
     settings: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
     cash: float = DEFAULT_SETTINGS["starting_cash"]
-    coin: float = 0.0
+    coin: float = 0.0  # Positive = long, Negative = short
     active_symbol: str | None = None
     entry_price: float | None = None
     highest_price: float | None = None
@@ -304,6 +348,18 @@ class BotState:
     websocket_status: str = "disabled"
     websocket_last_message: str = ""
     websocket_last_seen: str = ""
+    # News guard state
+    news_events: list[dict[str, Any]] = field(default_factory=list)
+    news_last_update: str = ""
+    news_guard_status: str = "idle"
+    # Opening Range state
+    opening_range_analysis: dict[str, Any] = field(default_factory=dict)
+    # Peak equity for drawdown tracking
+    peak_equity: float = DEFAULT_SETTINGS["starting_cash"]
+    stop_price: float | None = None
+    target_price: float | None = None
+    exit_mode: str = "fixed"
+    is_short: bool = False
 
 
 class PaperBot:
@@ -315,11 +371,18 @@ class PaperBot:
         self.stop_event = threading.Event()
         self.websocket_stop_event = threading.Event()
         self.feed_prices: dict[str, float] = {}
+        self.news_guard_thread: threading.Thread | None = None
+        self.news_guard_stop_event = threading.Event()
+        self.restart_delay = 60  # seconds to wait before restarting on error
+        self.shutdown_requested = False
+        logger.info("Auxo bot initialised")
 
     def load_state(self) -> BotState:
         if not STATE_FILE.exists():
             state = BotState()
             state.day_start_date = today_key()
+            state.peak_equity = float(state.settings["starting_cash"])
+            logger.info("No state file found – starting fresh")
             return state
 
         try:
@@ -338,9 +401,7 @@ class PaperBot:
                 last_error=raw.get("last_error"),
                 last_signal=raw.get("last_signal", "Waiting for enough price data"),
                 last_action_time=float(raw.get("last_action_time", 0.0)),
-                day_start_equity=float(
-                    raw.get("day_start_equity", DEFAULT_SETTINGS["starting_cash"])
-                ),
+                day_start_equity=float(raw.get("day_start_equity", DEFAULT_SETTINGS["starting_cash"])),
                 day_start_date=raw.get("day_start_date", today_key()),
                 live_day_start_date=raw.get("live_day_start_date", today_key()),
                 live_daily_spend=float(raw.get("live_daily_spend", 0.0)),
@@ -373,9 +434,13 @@ class PaperBot:
                         "entry_cost": float(item.get("entry_cost", 0.0)),
                         "opened_at": item.get("opened_at", now_iso()),
                         "trade_id": item.get("trade_id"),
+                        "stop_price": item.get("stop_price"),
+                        "target_price": item.get("target_price"),
+                        "exit_mode": item.get("exit_mode"),
+                        "is_short": bool(item.get("is_short", False)),
                     }
                     for symbol, item in raw.get("positions", {}).items()
-                    if isinstance(item, dict) and float(item.get("quantity", 0.0)) > 0
+                    if isinstance(item, dict) and abs(float(item.get("quantity", 0.0))) > 0
                 },
                 scan_rows=raw.get("scan_rows", []),
                 trades=[
@@ -469,22 +534,40 @@ class PaperBot:
                 websocket_status=raw.get("websocket_status", "disabled"),
                 websocket_last_message=raw.get("websocket_last_message", ""),
                 websocket_last_seen=raw.get("websocket_last_seen", ""),
+                news_events=raw.get("news_events", []),
+                news_last_update=raw.get("news_last_update", ""),
+                news_guard_status=raw.get("news_guard_status", "idle"),
+                opening_range_analysis=raw.get("opening_range_analysis", {}),
+                peak_equity=float(raw.get("peak_equity", float(raw.get("cash", DEFAULT_SETTINGS["starting_cash"])))),
+                stop_price=raw.get("stop_price"),
+                target_price=raw.get("target_price"),
+                exit_mode=raw.get("exit_mode", "fixed"),
+                is_short=bool(raw.get("is_short", False)),
             )
+            # After loading state, ensure oanda_account_type has a value
+            if "oanda_account_type" not in state.settings or not state.settings["oanda_account_type"]:
+                state.settings["oanda_account_type"] = "standard"
+
             if not state.price_history and state.prices:
                 state.price_history[state.settings["symbol"]] = state.prices
             if state.positions and not state.active_symbol:
                 state.active_symbol = next(iter(state.positions))
+            logger.info(f"State loaded: cash={state.cash}, active_symbol={state.active_symbol}, coin={state.coin}")
             return state
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as e:
+            logger.error(f"Failed to load state: {e} – starting fresh")
             state = BotState()
             state.day_start_date = today_key()
+            state.peak_equity = float(state.settings["starting_cash"])
             state.last_error = "State file could not be read; started fresh."
             return state
 
     def save_state(self) -> None:
         data = asdict(self.state)
-        data["running"] = False
+        # Don't override running - preserve the current state
+        # data["running"] = False
         STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.debug("State saved")
 
     def start(self) -> None:
         try:
@@ -495,11 +578,13 @@ class PaperBot:
                 self.state.last_error = f"Start blocked: {exc}"
                 self.state.last_signal = "Start blocked by live balance sync"
                 self.save_state()
+            logger.error(f"Start blocked: {exc}")
             raise
 
         with self.lock:
             if self.thread and self.thread.is_alive():
                 self.state.running = True
+                logger.info("Bot already running")
                 return
 
             self.stop_event.clear()
@@ -507,13 +592,480 @@ class PaperBot:
             self.thread = threading.Thread(target=self.run_loop, daemon=True)
             self.thread.start()
             self.start_websocket_feed_if_needed()
+            self.start_news_guard_thread()
+            self.sync_oanda_positions()
+            logger.info("Bot started")
 
     def stop(self) -> None:
         with self.lock:
             self.state.running = False
             self.stop_event.set()
             self.websocket_stop_event.set()
+            self.news_guard_stop_event.set()
+            self.shutdown_requested = True
             self.save_state()
+            logger.info("Bot stopped")
+
+    # ─── OANDA Position Sync ─────────────────────────────────────────
+
+    def sync_oanda_positions(self) -> None:
+        """Sync open positions from OANDA into the bot's state."""
+        # Don't check should_oanda_demo_trade() - we want to sync positions even if trading is disabled
+        if self.state.settings.get("asset_class") != "forex" or self.state.settings.get("exchange") != "oanda_demo":
+            return
+
+        try:
+            account_id = urllib.parse.quote(oanda_account_id())
+            data = oanda_request(f"/v3/accounts/{account_id}/openPositions")
+            positions = data.get("positions", [])
+
+            with self.lock:
+                # Clear existing positions that aren't on OANDA
+                synced_symbols = set()
+
+                for position in positions:
+                    instrument = position.get("instrument", "")
+                    symbol = instrument.replace("_", "")
+                    synced_symbols.add(symbol)
+
+                    units = int(position.get("short", {}).get("units", 0))
+                    if units > 0:
+                        # It's a short position
+                        price = float(position.get("short", {}).get("averagePrice", 0.0))
+                        if price <= 0:
+                            price = self.state.last_price or 0.0
+                        self.state.positions[symbol] = {
+                            "quantity": -units,
+                            "entry_price": price,
+                            "highest_price": price,
+                            "opened_at": now_iso(),
+                            "trade_id": position.get("tradeID"),
+                            "is_short": True,
+                        }
+                        self.state.active_symbol = symbol
+                        self.state.entry_price = price
+                        self.state.coin = -units
+                        self.state.is_short = True
+                        self.journal(symbol, "INFO", f"Synced OANDA SHORT position: {symbol} {units} @ {price}", price)
+                    else:
+                        # Check if it's a long position
+                        units = int(position.get("long", {}).get("units", 0))
+                        if units > 0:
+                            price = float(position.get("long", {}).get("averagePrice", 0.0))
+                            if price <= 0:
+                                price = self.state.last_price or 0.0
+                            self.state.positions[symbol] = {
+                                "quantity": units,
+                                "entry_price": price,
+                                "highest_price": price,
+                                "opened_at": now_iso(),
+                                "trade_id": position.get("tradeID"),
+                                "is_short": False,
+                            }
+                            self.state.active_symbol = symbol
+                            self.state.entry_price = price
+                            self.state.coin = units
+                            self.state.is_short = False
+                            self.journal(symbol, "INFO", f"Synced OANDA BUY position: {symbol} {units} @ {price}", price)
+
+                # Remove positions that are no longer open on OANDA
+                for symbol in list(self.state.positions.keys()):
+                    if symbol not in synced_symbols:
+                        self.journal(symbol, "INFO", f"Removing closed position: {symbol}", self.state.last_price)
+                        del self.state.positions[symbol]
+
+                if positions:
+                    logger.info(f"Synced {len(positions)} positions from OANDA")
+                    self.save_state()
+                else:
+                    # No positions - clear state
+                    if self.state.positions:
+                        self.state.positions = {}
+                        self.state.active_symbol = None
+                        self.state.entry_price = None
+                        self.state.coin = 0.0
+                        self.state.is_short = False
+                        self.save_state()
+                    logger.info("No open positions on OANDA")
+
+        except Exception as exc:
+            logger.warning(f"Failed to sync OANDA positions: {exc}")
+            self.state.last_error = f"Position sync failed: {exc}"
+
+    def build_ema_golden_cross_scan_rows(
+        self,
+        watchlist: list[str],
+        candles_by_symbol: dict[str, list[Candle]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build scan rows using EMA Golden Cross strategy."""
+        rows: list[dict[str, Any]] = []
+        candles_by_symbol = candles_by_symbol or {}
+        settings = self.state.settings
+        settings_key = setup_settings_key(settings)
+        weak_pairs = weak_pair_map(self.state.setup_records, settings)
+
+        ema_short = int(settings.get("ema_short", 50))
+        ema_long = int(settings.get("ema_long", 200))
+
+        for symbol in watchlist:
+            history = self.state.price_history.get(symbol, [])
+            candles = candles_by_symbol.get(symbol) or closes_to_candles(history)
+            price = candles[-1].close if candles else None
+
+            if not price or len(history) < ema_long:
+                rows.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "signal": "WAIT data",
+                    "score": 0,
+                    "regime": "unknown",
+                    "support": None,
+                    "resistance": None,
+                    "ema_short": None,
+                    "ema_long": None,
+                    "ema_short_prev": None,
+                    "ema_long_prev": None,
+                })
+                continue
+
+            # Calculate EMAs
+            ema_short_value = ema(history, ema_short)
+            ema_long_value = ema(history, ema_long)
+            ema_short_prev = ema(history[:-1], ema_short)
+            ema_long_prev = ema(history[:-1], ema_long)
+
+            if None in (ema_short_value, ema_long_value, ema_short_prev, ema_long_prev):
+                rows.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "signal": "WAIT data",
+                    "score": 0,
+                    "regime": "unknown",
+                    "support": None,
+                    "resistance": None,
+                    "ema_short": ema_short_value,
+                    "ema_long": ema_long_value,
+                    "ema_short_prev": ema_short_prev,
+                    "ema_long_prev": ema_long_prev,
+                })
+                continue
+
+            # Determine signal
+            signal = "HOLD"
+            base_score = ((ema_short_value - ema_long_value) / ema_long_value) * 100
+
+            # Golden Cross: short EMA crosses above long EMA
+            if ema_short_prev <= ema_long_prev and ema_short_value > ema_long_value:
+                signal = "BUY"
+            # Death Cross: short EMA crosses below long EMA
+            elif ema_short_prev >= ema_long_prev and ema_short_value < ema_long_value:
+                signal = "SELL"
+            elif ema_short_value > ema_long_value:
+                signal = "WATCH uptrend"
+            elif ema_short_value < ema_long_value:
+                signal = "WATCH downtrend"
+
+            # Check regimes and filters
+            regime = market_regime(candles, settings)
+            levels = support_resistance(candles, settings)
+
+            if signal == "BUY":
+                allowed, reason = sr_buy_allowed(price, levels, settings)
+                if not allowed:
+                    signal = f"WATCH {reason}"
+            if signal == "BUY":
+                allowed, reason = regime_allowed(regime["regime"], settings)
+                if not allowed:
+                    signal = f"WATCH {reason}"
+            if signal == "BUY" and symbol in weak_pairs:
+                signal = f"BLOCK {weak_pairs[symbol]}"
+
+            edge_score = setup_edge_score(self.state.setup_records, symbol, settings_key)
+            score = base_score + edge_score
+
+            rows.append({
+                "symbol": symbol,
+                "price": price,
+                "signal": signal,
+                "score": round(score, 4),
+                "regime": regime["regime"],
+                "regime_trend_pct": regime["trend_pct"],
+                "regime_volatility_pct": regime["volatility_pct"],
+                "regime_range_pct": regime["range_pct"],
+                "regime_reason": regime["reason"],
+                "support": levels["support"],
+                "resistance": levels["resistance"],
+                "support_distance_pct": levels["support_distance_pct"],
+                "resistance_distance_pct": levels["resistance_distance_pct"],
+                "support_touches": levels["support_touches"],
+                "resistance_touches": levels["resistance_touches"],
+                "sr_confirmed": levels["confirmed"],
+                "sr_range_pct": levels["sr_range_pct"],
+                "reward_risk": levels["reward_risk"],
+                "ema_short": ema_short_value,
+                "ema_long": ema_long_value,
+                "ema_short_prev": ema_short_prev,
+                "ema_long_prev": ema_long_prev,
+                "base_score": round(base_score, 4),
+                "edge_score": edge_score,
+            })
+
+        return rows
+
+    # ─── Opening Range Strategy ─────────────────────────────────────
+
+    def calculate_atr(self, candles: list[Candle], period: int) -> float:
+        """Calculate Average True Range."""
+        if len(candles) < period + 1:
+            return 0.0
+
+        true_ranges = []
+        for i in range(1, len(candles)):
+            high = candles[i].high
+            low = candles[i].low
+            prev_close = candles[i-1].close
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            true_ranges.append(tr)
+
+        if not true_ranges:
+            return 0.0
+
+        recent_tr = true_ranges[-period:]
+        return sum(recent_tr) / len(recent_tr)
+
+    def fetch_daily_opening_candle(self, symbol: str, candles: list[Candle]) -> dict[str, Any]:
+        """Analyse the first candle of the day to determine bias."""
+        if len(candles) < 2:
+            return {"bias": None, "range": None, "atr": None, "manipulation": False, "blowoff": False}
+
+        today = datetime.now(timezone.utc).date()
+
+        first_candle = None
+        for candle in candles:
+            candle_date = datetime.fromtimestamp(candle.time, tz=timezone.utc).date()
+            if candle_date == today:
+                first_candle = candle
+                break
+
+        if not first_candle:
+            if candles:
+                first_candle = candles[-1]
+            else:
+                return {"bias": None, "range": None, "atr": None, "manipulation": False, "blowoff": False}
+
+        is_green = first_candle.close > first_candle.open
+        candle_range = first_candle.high - first_candle.low
+
+        atr = self.calculate_atr(candles, int(self.state.settings.get("opening_range_atr_period", 14)))
+        if atr == 0:
+            atr = candle_range
+
+        manipulation_threshold = float(self.state.settings.get("opening_range_manipulation_threshold", 0.20))
+        range_ratio = candle_range / atr if atr > 0 else 0
+        manipulation = range_ratio < manipulation_threshold
+        blowoff = range_ratio >= manipulation_threshold
+
+        return {
+            "bias": "bullish" if is_green else "bearish",
+            "open": first_candle.open,
+            "high": first_candle.high,
+            "low": first_candle.low,
+            "close": first_candle.close,
+            "range": candle_range,
+            "atr": atr,
+            "range_ratio": round(range_ratio, 4),
+            "manipulation": manipulation,
+            "blowoff": blowoff,
+            "is_green": is_green,
+            "trigger_level": first_candle.high if is_green else first_candle.low,
+            "stop_level": first_candle.low if is_green else first_candle.high,
+            "opening_time": datetime.fromtimestamp(first_candle.time, tz=timezone.utc).isoformat(),
+        }
+
+    def opening_range_signal(self, symbol: str, candles: list[Candle]) -> dict[str, Any]:
+        """Generate BUY/SELL/HOLD signal based on the opening range strategy.
+        Handles both bullish (BUY) and bearish (SELL) manipulation candles.
+        """
+        analysis = self.fetch_daily_opening_candle(symbol, candles)
+        self.state.opening_range_analysis = analysis
+
+        if analysis.get("bias") is None:
+            return {"signal": "HOLD", "reason": "No opening candle found", "analysis": analysis}
+
+        current_price = candles[-1].close if candles else 0
+        trigger = analysis["trigger_level"]
+        atr = analysis["atr"]
+
+        stop_loss_mult = float(self.state.settings.get("opening_range_stop_loss_atr_multiplier", 1.5))
+        take_profit_mult = float(self.state.settings.get("opening_range_take_profit_atr_multiplier", 2.5))
+
+        # ─── Check if we have an open position for this symbol ───
+        has_position = (
+            (symbol in self.state.positions and abs(self.state.positions[symbol].get("quantity", 0)) > 0) or
+            (self.state.active_symbol == symbol and abs(self.state.coin) > 0)
+        )
+
+        # ─── If we have a position, check for exit ───
+        if has_position:
+            position = self.state.positions.get(symbol, {})
+            entry_price = float(position.get("entry_price") or self.state.entry_price or 0.0)
+            is_short = position.get("is_short", False) or self.state.is_short
+            quantity = float(position.get("quantity", 0)) or self.state.coin
+
+            if entry_price > 0:
+                if not is_short:
+                    # ─── LONG POSITION – Check for SELL exit ───
+                    stop_price = entry_price - (atr * stop_loss_mult)
+                    target_price = entry_price + (atr * take_profit_mult)
+
+                    # Update highest price for trailing stop
+                    self.state.highest_price = max(self.state.highest_price or current_price, current_price)
+
+                    # Check trailing stop
+                    trailing_stop = trailing_stop_price(
+                        entry_price=self.state.entry_price,
+                        highest_price=self.state.highest_price,
+                        settings=self.state.settings,
+                    )
+                    if trailing_stop and current_price <= trailing_stop:
+                        return {
+                            "signal": "SELL",
+                            "reason": f"Trailing stop hit at {trailing_stop:.6f}",
+                            "entry": entry_price,
+                            "stop": stop_price,
+                            "target": target_price,
+                            "analysis": analysis,
+                        }
+
+                    if current_price <= stop_price:
+                        return {
+                            "signal": "SELL",
+                            "reason": f"Stop loss hit at {stop_price:.6f}",
+                            "entry": entry_price,
+                            "stop": stop_price,
+                            "target": target_price,
+                            "analysis": analysis,
+                        }
+                    if current_price >= target_price:
+                        return {
+                            "signal": "SELL",
+                            "reason": f"Take profit hit at {target_price:.6f}",
+                            "entry": entry_price,
+                            "stop": stop_price,
+                            "target": target_price,
+                            "analysis": analysis,
+                        }
+
+                    return {
+                        "signal": "HOLD",
+                        "reason": f"Holding LONG position {symbol} @ {current_price:.6f}",
+                        "entry": entry_price,
+                        "stop": stop_price,
+                        "target": target_price,
+                        "analysis": analysis,
+                    }
+                else:
+                    # ─── SHORT POSITION – Check for BUY exit ───
+                    stop_price = entry_price + (atr * stop_loss_mult)
+                    target_price = entry_price - (atr * take_profit_mult)
+
+                    if current_price >= stop_price:
+                        return {
+                            "signal": "BUY",
+                            "reason": f"Short stop loss hit at {stop_price:.6f}",
+                            "entry": entry_price,
+                            "stop": stop_price,
+                            "target": target_price,
+                            "analysis": analysis,
+                            "is_short_exit": True,
+                        }
+                    if current_price <= target_price:
+                        return {
+                            "signal": "BUY",
+                            "reason": f"Short take profit hit at {target_price:.6f}",
+                            "entry": entry_price,
+                            "stop": stop_price,
+                            "target": target_price,
+                            "analysis": analysis,
+                            "is_short_exit": True,
+                        }
+
+                    return {
+                        "signal": "HOLD",
+                        "reason": f"Holding SHORT position {symbol} @ {current_price:.6f}",
+                        "entry": entry_price,
+                        "stop": stop_price,
+                        "target": target_price,
+                        "analysis": analysis,
+                    }
+
+        # ─── No position – check for entry ───
+
+        # ─── BULLISH MANIPULATION → BUY ───
+        if analysis["manipulation"] and analysis["bias"] == "bullish":
+            if current_price > trigger:
+                entry_price = trigger
+                return {
+                    "signal": "BUY",
+                    "reason": f"Bullish manipulation: {analysis['range_ratio']:.2%} of ATR",
+                    "entry": entry_price,
+                    "stop": entry_price - (atr * stop_loss_mult),
+                    "target": entry_price + (atr * take_profit_mult),
+                    "analysis": analysis,
+                    "is_short": False,
+                }
+            else:
+                return {
+                    "signal": "WAIT",
+                    "reason": f"Waiting for break above {trigger:.6f} (bullish)",
+                    "analysis": analysis,
+                }
+
+        # ─── BEARISH MANIPULATION → SELL (Short) ───
+        if analysis["manipulation"] and analysis["bias"] == "bearish":
+            if not self.state.settings.get("allow_short_selling", False):
+                return {
+                    "signal": "HOLD",
+                    "reason": "Short selling disabled",
+                    "analysis": analysis,
+                }
+            if current_price < trigger:
+                entry_price = trigger
+                return {
+                    "signal": "SELL",
+                    "reason": f"Bearish manipulation: {analysis['range_ratio']:.2%} of ATR",
+                    "entry": entry_price,
+                    "stop": entry_price + (atr * stop_loss_mult),
+                    "target": entry_price - (atr * take_profit_mult),
+                    "analysis": analysis,
+                    "is_short": True,
+                }
+            else:
+                return {
+                    "signal": "WAIT",
+                    "reason": f"Waiting for break below {trigger:.6f} (bearish)",
+                    "analysis": analysis,
+                }
+
+        # ─── BLOW-OFF CANDLE ───
+        if analysis["blowoff"]:
+            return {
+                "signal": "WAIT",
+                "reason": f"Blow-off candle: {analysis['range_ratio']:.2%} of ATR, waiting for pullback",
+                "analysis": analysis,
+            }
+
+        return {
+            "signal": "HOLD",
+            "reason": "No setup detected",
+            "analysis": analysis,
+        }
+
+    # ─── WebSocket ──────────────────────────────────────────────────
 
     def start_websocket_feed_if_needed(self) -> None:
         if self.state.settings.get("asset_class") != "crypto" or self.state.settings.get("exchange") != "coinbase":
@@ -530,6 +1082,7 @@ class PaperBot:
         self.websocket_stop_event.clear()
         self.websocket_thread = threading.Thread(target=self.websocket_loop, daemon=True)
         self.websocket_thread.start()
+        logger.info("WebSocket feed started")
 
     def websocket_loop(self) -> None:
         while not self.websocket_stop_event.is_set():
@@ -573,10 +1126,12 @@ class PaperBot:
                         }))
                     except Exception as exc:
                         self.audit("WEBSOCKET_USER_CONNECT_FAILED", error=str(exc))
+                        logger.warning(f"User WebSocket connection failed: {exc}")
 
                 with self.lock:
                     self.state.websocket_status = "connected"
                     self.state.websocket_last_seen = now_iso()
+                logger.info("WebSocket connected")
 
                 while not self.websocket_stop_event.is_set():
                     raw = ws.recv()
@@ -593,6 +1148,7 @@ class PaperBot:
                     self.state.websocket_status = f"error: {exc}"
                     self.state.websocket_last_message = str(exc)
                 self.audit("WEBSOCKET_ERROR", error=str(exc))
+                logger.warning(f"WebSocket error: {exc}")
                 self.websocket_stop_event.wait(10)
             finally:
                 try:
@@ -619,6 +1175,137 @@ class PaperBot:
                         self.feed_prices[product_id] = float(price)
                 if user_stream:
                     self.audit("WEBSOCKET_USER_EVENT", event=event)
+
+    # ─── News Guard ─────────────────────────────────────────────────
+
+    def start_news_guard_thread(self) -> None:
+        if not REQUESTS_AVAILABLE:
+            self.state.news_guard_status = "requests package not installed"
+            return
+        if self.news_guard_thread and self.news_guard_thread.is_alive():
+            return
+
+        self.news_guard_stop_event.clear()
+        self.news_guard_thread = threading.Thread(target=self.news_guard_loop, daemon=True)
+        self.news_guard_thread.start()
+        self.state.news_guard_status = "running"
+        logger.info("News guard thread started")
+
+    def news_guard_loop(self) -> None:
+        while not self.news_guard_stop_event.is_set():
+            try:
+                self.update_news_events()
+            except Exception as exc:
+                with self.lock:
+                    self.state.news_guard_status = f"error: {exc}"
+                    self.state.last_error = f"News guard: {exc}"
+                logger.warning(f"News guard error: {exc}")
+            self.news_guard_stop_event.wait(900)
+
+    def update_news_events(self) -> None:
+        if not REQUESTS_AVAILABLE:
+            return
+
+        try:
+            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"News feed fetched: {len(data)} events")
+        except Exception as exc:
+            with self.lock:
+                self.state.news_guard_status = f"error: {exc}"
+                self.state.last_error = f"News guard: {exc}"
+            logger.warning(f"News feed fetch error: {exc}")
+            return
+
+        events = []
+        for item in data:
+            impact = str(item.get("impact", "Low")).lower()
+            if impact not in ("high", "medium", "low"):
+                impact = "low"
+
+            dt_str = item.get("date", "")
+            if not dt_str:
+                continue
+
+            try:
+                dt = datetime.fromisoformat(dt_str)
+                dt = dt.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                continue
+
+            country = str(item.get("country", ""))
+
+            events.append({
+                "time": dt.timestamp(),
+                "datetime": dt.isoformat(),
+                "country": country,
+                "currency": country,
+                "indicator": str(item.get("title", "Unknown")),
+                "impact": impact,
+                "forecast": item.get("forecast"),
+                "previous": item.get("previous"),
+                "actual": item.get("actual"),
+            })
+
+        with self.lock:
+            self.state.news_events = events
+            self.state.news_last_update = now_iso()
+            self.state.news_guard_status = f"updated {len(events)} events"
+
+    def is_news_blocked(self, symbol: str, settings: dict[str, Any]) -> tuple[bool, str]:
+        if not settings.get("news_guard_enabled", False):
+            return False, "news guard disabled"
+
+        currency = symbol_to_currency(symbol, settings.get("asset_class", "crypto"))
+
+        before_min = int(settings.get("news_guard_before_minutes", 30))
+        after_min = int(settings.get("news_guard_after_minutes", 30))
+        block_high = bool(settings.get("news_guard_block_high", True))
+        block_medium = bool(settings.get("news_guard_block_medium", False))
+        block_low = bool(settings.get("news_guard_block_low", False))
+
+        now = time.time()
+        for event in self.state.news_events:
+            event_time = float(event.get("time", 0))
+            if event_time == 0:
+                continue
+
+            if currency and event.get("currency") != currency:
+                continue
+
+            impact = event.get("impact", "low")
+            if impact == "high" and not block_high:
+                continue
+            if impact == "medium" and not block_medium:
+                continue
+            if impact == "low" and not block_low:
+                continue
+
+            if now >= event_time - (before_min * 60) and now <= event_time + (after_min * 60):
+                return True, f"news: {event['indicator']} ({impact})"
+
+        return False, ""
+
+    def news_guard_status(self) -> dict[str, Any]:
+        enabled = bool(self.state.settings.get("news_guard_enabled", False))
+        if not enabled:
+            return {"enabled": False, "status": "disabled"}
+
+        events = self.state.news_events
+        now = time.time()
+        upcoming = [e for e in events if e.get("time", 0) > now and e.get("time", 0) < now + 14400]
+
+        return {
+            "enabled": True,
+            "status": self.state.news_guard_status,
+            "events_cached": len(events),
+            "upcoming_4h": len(upcoming),
+            "last_update": self.state.news_last_update,
+        }
+
+    # ─── Journal & Audit ───────────────────────────────────────────
 
     def journal(
         self,
@@ -650,8 +1337,115 @@ class PaperBot:
         try:
             with AUDIT_LOG_FILE.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, separators=(",", ":"), default=str) + "\n")
-        except OSError:
-            self.state.last_error = "Audit log write failed"
+        except OSError as e:
+            self.state.last_error = f"Audit log write failed: {e}"
+            logger.error(f"Audit log write failed: {e}")
+
+    # ─── Telegram Alerts ────────────────────────────────────────────
+
+    def send_telegram_alert(self, message: str, parse_mode: str = "HTML") -> bool:
+        """Send a message via Telegram bot."""
+        settings = self.state.settings
+
+        # ─── Case-insensitive check ───
+        def get_val(keys: list[str], default=None):
+            for key in keys:
+                if key in settings and settings[key]:
+                    return settings[key]
+            return default
+
+        enabled = get_val(["telegram_enabled", "TELEGRAM_ENABLED"], False)
+        if not enabled:
+            return False
+
+        bot_token = get_val(["telegram_bot_token", "TELEGRAM_BOT_TOKEN"], "")
+        chat_id = get_val(["telegram_chat_id", "TELEGRAM_CHAT_ID"], "")
+
+        if not bot_token or not chat_id:
+            logger.warning("Telegram enabled but missing bot_token or chat_id")
+            return False
+
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            }
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                logger.debug(f"Telegram alert sent: {message[:50]}...")
+                return True
+            else:
+                logger.warning(f"Telegram alert failed: {response.text}")
+                return False
+        except Exception as exc:
+            logger.warning(f"Telegram alert error: {exc}")
+            return False
+
+    def format_alert_trade(self, trade: Trade, pnl: float | None = None) -> str:
+        """Format a trade alert message."""
+        settings = self.state.settings
+        currency = settings.get("quote_currency", "USD")
+        emoji = "🟢" if trade.side == "BUY" else ("🔴" if trade.side == "SELL" else "🟣")
+        pnl_text = ""
+        if pnl is not None:
+            pnl_emoji = "✅" if pnl >= 0 else "❌"
+            pnl_text = f"\n💰 P/L: {pnl_emoji} {currency} {pnl:.2f}"
+        return f"""
+{emoji} <b>{trade.side}</b> {trade.symbol}
+📊 Price: {trade.price:.6f}
+📦 Qty: {trade.quantity:.6f}
+💵 Cash: {currency} {trade.cash_after:.2f}
+📝 Reason: {trade.reason}{pnl_text}
+🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    def format_alert_error(self, error: str) -> str:
+        """Format an error alert message."""
+        return f"""
+⚠️ <b>AUXO ALERT</b>
+
+<b>Error:</b> {error}
+🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    def format_alert_drawdown(self, drawdown_pct: float, equity: float, peak_equity: float) -> str:
+        """Format a drawdown alert message."""
+        settings = self.state.settings
+        currency = settings.get("quote_currency", "USD")
+        return f"""
+🔻 <b>DRAWDOWN ALERT</b>
+
+<b>Current Drawdown:</b> {drawdown_pct:.1f}%
+<b>Current Equity:</b> {currency} {equity:.2f}
+<b>Peak Equity:</b> {currency} {peak_equity:.2f}
+🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    def format_daily_summary(self) -> str:
+        """Format a daily summary message."""
+        settings = self.state.settings
+        currency = settings.get("quote_currency", "USD")
+        equity = self.equity(self.state.last_price)
+        day_pnl = equity - self.state.day_start_equity
+        trades_today = [
+            t for t in self.state.trades
+            if t.time.startswith(today_key())
+        ]
+        buys = len([t for t in trades_today if t.side == "BUY"])
+        sells = len([t for t in trades_today if t.side == "SELL"])
+        return f"""
+📊 <b>DAILY SUMMARY</b>
+
+<b>Date:</b> {today_key()}
+<b>Equity:</b> {currency} {equity:.2f}
+<b>Day P/L:</b> {day_pnl:+.2f} ({pct(day_pnl, self.state.day_start_equity):+.2f}%)
+<b>Trades:</b> {len(trades_today)} ({buys} buys, {sells} sells)
+<b>Open Positions:</b> {len(self.state.positions)}
+<b>Signal:</b> {self.state.last_signal}
+"""
 
     def reset(self) -> None:
         with self.lock:
@@ -661,17 +1455,24 @@ class PaperBot:
             self.state.cash = float(settings["starting_cash"])
             self.state.day_start_equity = self.state.cash
             self.state.day_start_date = today_key()
+            self.state.peak_equity = self.state.cash
             self.state.running = running
+            self.state.news_events = []
+            self.state.news_last_update = ""
+            self.state.news_guard_status = "idle"
+            self.state.opening_range_analysis = {}
             self.save_state()
+            logger.info("Bot state reset")
+
+    # ─── Balance Sync ───────────────────────────────────────────────
 
     def should_sync_live_balance_on_start(self) -> bool:
         with self.lock:
             settings = dict(self.state.settings)
             current_coin = self.state.coin
-            current_positions = dict(self.state.positions)
             active_symbol = self.state.active_symbol
 
-        if current_coin > 0:
+        if current_coin != 0:
             with self.lock:
                 self.state.last_signal = (
                     f"Start preserving open {active_symbol or ''} position; "
@@ -702,7 +1503,7 @@ class PaperBot:
             raise RuntimeError("Live balance sync only supports Coinbase.")
         if not coinbase_live_is_armed():
             raise RuntimeError(coinbase_live_status_message())
-        if current_coin > 0:
+        if current_coin != 0:
             raise RuntimeError(
                 "Refusing to sync starting cash while the bot has an open paper/live position. "
                 "Sell or reset first."
@@ -720,9 +1521,11 @@ class PaperBot:
             self.state.active_stop_order_id = None
             self.state.day_start_equity = available_cash
             self.state.day_start_date = today_key()
+            self.state.peak_equity = available_cash
             self.state.last_signal = f"Synced {quote_currency} balance from Coinbase"
             self.save_state()
 
+        logger.info(f"Synced Coinbase balance: {available_cash:.2f} {quote_currency}")
         return {
             "ok": True,
             "quote_currency": quote_currency,
@@ -736,7 +1539,7 @@ class PaperBot:
 
         if settings.get("asset_class") != "forex" or settings.get("exchange") != "oanda_demo":
             raise RuntimeError("OANDA balance sync requires Asset Class = Forex and Exchange = OANDA demo.")
-        if current_coin > 0 or self.state.positions:
+        if current_coin != 0 or self.state.positions:
             raise RuntimeError(
                 "Refusing to sync OANDA paper balance while the bot has open paper/OANDA positions. "
                 "Sell or reset first."
@@ -757,15 +1560,19 @@ class PaperBot:
             self.state.active_stop_order_id = None
             self.state.day_start_equity = balance
             self.state.day_start_date = today_key()
+            self.state.peak_equity = balance
             self.state.last_signal = f"Synced {currency} paper balance from OANDA demo"
             self.journal("", "INFO", self.state.last_signal, self.state.last_price)
             self.save_state()
 
+        logger.info(f"Synced OANDA balance: {balance:.2f} {currency}")
         return {
             "ok": True,
             "quote_currency": currency,
             "available_cash": round(balance, 8),
         }
+
+    # ─── Position Management ───────────────────────────────────────
 
     def close_position_manual(self, symbol: str, mode: str = "profit_only") -> dict[str, Any]:
         symbol = normalize_forex_symbol(symbol or "").upper()
@@ -777,7 +1584,7 @@ class PaperBot:
         with self.lock:
             settings = dict(self.state.settings)
             position = dict((self.state.positions or {}).get(symbol, {}))
-            single_active = self.state.active_symbol == symbol and float(self.state.coin or 0.0) > 0
+            single_active = self.state.active_symbol == symbol and abs(self.state.coin or 0.0) > 0
 
         if not position and not single_active:
             raise RuntimeError(f"No open position found for {symbol}.")
@@ -799,14 +1606,20 @@ class PaperBot:
         if position:
             entry_price = float(position.get("entry_price", 0.0) or 0.0)
             quantity = float(position.get("quantity", 0.0) or 0.0)
+            is_short = bool(position.get("is_short", False))
         else:
             entry_price = float(self.state.entry_price or 0.0)
             quantity = float(self.state.coin or 0.0)
+            is_short = self.state.is_short
 
-        if entry_price <= 0 or quantity <= 0:
+        if entry_price <= 0 or quantity == 0:
             raise RuntimeError(f"Invalid open position state for {symbol}.")
 
-        pnl = (price - entry_price) * quantity
+        # Calculate P/L based on position direction
+        if is_short:
+            pnl = (entry_price - price) * abs(quantity)
+        else:
+            pnl = (price - entry_price) * abs(quantity)
 
         if mode == "profit_only" and pnl <= 0:
             raise RuntimeError(
@@ -819,17 +1632,19 @@ class PaperBot:
             else "Manual force close"
         )
 
-        if self.should_oanda_demo_trade() and symbol in self.state.positions:
-            self.oanda_demo_sell(symbol, price, reason, None)
-        elif position and settings.get("asset_class") == "forex" and settings.get("exchange") == "oanda_demo":
-            raise RuntimeError("OANDA demo orders are not armed, so this live demo position cannot be closed from the bot.")
+        # Close the position
+        if is_short:
+            # Closing a short = BUY
+            self.paper_buy(symbol, price, reason, None, is_short=True)
         else:
+            # Closing a long = SELL
             self.paper_sell(symbol, price, reason, None)
 
         with self.lock:
             self.state.last_signal = f"{reason}: {symbol}"
             self.save_state()
 
+        logger.info(f"Manual close: {symbol} {mode} at {price:.6f}")
         return {
             "ok": True,
             "symbol": symbol,
@@ -838,6 +1653,8 @@ class PaperBot:
             "estimated_pnl": pnl,
             "message": self.state.last_signal,
         }
+
+    # ─── Settings Update ───────────────────────────────────────────
 
     def update_settings(self, updates: dict[str, Any]) -> None:
         numeric_fields = {
@@ -890,6 +1707,17 @@ class PaperBot:
             "order_expiry_seconds",
             "order_retry_limit",
             "max_oanda_open_trades",
+            "news_guard_before_minutes",
+            "news_guard_after_minutes",
+            "opening_range_minutes",
+            "opening_range_atr_period",
+            "opening_range_manipulation_threshold",
+            "opening_range_stop_loss_atr_multiplier",
+            "opening_range_take_profit_atr_multiplier",
+            "max_drawdown_pct",
+            "telegram_drawdown_alert_pct",
+            "ema_short",
+            "ema_long",
         }
         bool_fields = {
             "live_trading_enabled",
@@ -908,6 +1736,17 @@ class PaperBot:
             "websocket_enabled",
             "closed_candle_only",
             "oanda_demo_trading_enabled",
+            "news_guard_enabled",
+            "news_guard_block_high",
+            "news_guard_block_medium",
+            "news_guard_block_low",
+            "telegram_enabled",
+            "telegram_alert_on_buy",
+            "telegram_alert_on_sell",
+            "telegram_alert_on_error",
+            "telegram_alert_on_daily_summary",
+            "telegram_alert_on_drawdown",
+            "allow_short_selling",
         }
         text_fields = {
             "asset_class",
@@ -918,6 +1757,11 @@ class PaperBot:
             "position_sizing_mode",
             "live_order_type",
         }
+        sensitive_fields = {
+            "telegram_bot_token",
+            "telegram_chat_id",
+            "oanda_account_type",
+        }
         lower_text_fields = {"chart_mode"}
         list_fields = {"watchlist"}
 
@@ -927,6 +1771,8 @@ class PaperBot:
                     self.state.settings[key] = float(value)
                 elif key in text_fields:
                     self.state.settings[key] = str(value).strip().upper()
+                elif key in sensitive_fields:
+                    self.state.settings[key] = str(value).strip()
                 elif key in lower_text_fields:
                     self.state.settings[key] = str(value).strip().lower()
                 elif key in list_fields:
@@ -946,10 +1792,10 @@ class PaperBot:
                 if self.state.settings["exchange"] != "oanda_demo":
                     self.state.settings["oanda_demo_trading_enabled"] = False
             self.state.settings["strategy"] = self.state.settings.get(
-                "strategy", "sma_cross"
+                "strategy", "opening_range"
             ).lower()
-            if self.state.settings["strategy"] not in {"sma_cross", "ewo_offset"}:
-                self.state.settings["strategy"] = "sma_cross"
+            if self.state.settings["strategy"] not in {"sma_cross", "ewo_offset", "opening_range", "ema_golden_cross"}:
+                self.state.settings["strategy"] = "opening_range"
             self.state.settings["position_sizing_mode"] = self.state.settings.get(
                 "position_sizing_mode", "balance_fraction"
             ).lower()
@@ -987,8 +1833,13 @@ class PaperBot:
             self.state.settings["live_granularity"] = normalize_granularity(
                 self.state.settings["live_granularity"]
             )
+            # Allow lower candle counts for faster timeframes
+            min_candles = strategy_minimum_candles(self.state.settings)
+            # For 5m timeframe, we can use fewer candles
+            if self.state.settings.get("live_granularity", 3600) <= 300:
+                min_candles = min(min_candles, 80)  # Allow 80 candles for 5m
             self.state.settings["live_candle_count"] = max(
-                strategy_minimum_candles(self.state.settings),
+                min_candles,
                 min(300, int(self.state.settings["live_candle_count"])),
             )
             self.state.settings["sr_lookback_candles"] = max(
@@ -1069,7 +1920,28 @@ class PaperBot:
             self.state.settings["max_oanda_open_trades"] = max(
                 1, int(self.state.settings.get("max_oanda_open_trades", 3))
             )
+            self.state.settings["opening_range_minutes"] = max(
+                1, int(self.state.settings["opening_range_minutes"])
+            )
+            self.state.settings["opening_range_atr_period"] = max(
+                2, int(self.state.settings["opening_range_atr_period"])
+            )
+            self.state.settings["opening_range_manipulation_threshold"] = max(
+                0.01, min(1.0, float(self.state.settings["opening_range_manipulation_threshold"]))
+            )
+            self.state.settings["opening_range_stop_loss_atr_multiplier"] = max(
+                0.1, float(self.state.settings["opening_range_stop_loss_atr_multiplier"])
+            )
+            self.state.settings["opening_range_take_profit_atr_multiplier"] = max(
+                0.1, float(self.state.settings["opening_range_take_profit_atr_multiplier"])
+            )
+            self.state.settings["max_drawdown_pct"] = max(
+                1.0, float(self.state.settings.get("max_drawdown_pct", 20.0))
+            )
             self.save_state()
+            logger.info("Settings updated")
+
+    # ─── Snapshot ──────────────────────────────────────────────────
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -1101,6 +1973,15 @@ class PaperBot:
             day_pnl = equity - self.state.day_start_equity
             total_pnl = equity - float(self.state.settings["starting_cash"])
             granularity = int(self.state.settings.get("live_granularity", 3600))
+
+            # ─── Account type label ───
+            account_type = self.state.settings.get("oanda_account_type", "standard")
+            if not account_type:
+                account_type = "standard"
+                self.state.settings["oanda_account_type"] = "standard"
+
+            account_type_label = "Spread Bet" if account_type == "spreadbet" else "CFD/Forex"
+
             return {
                 "running": self.state.running,
                 "settings": self.state.settings,
@@ -1165,34 +2046,75 @@ class PaperBot:
                 "open_orders": [asdict(item) for item in self.state.open_orders[-40:]][::-1],
                 "chart_regime": chart_row.get("regime"),
                 "live_status": self.live_status(),
+                "news_guard": self.news_guard_status(),
+                "opening_range_analysis": self.state.opening_range_analysis,
+                "peak_equity": self.state.peak_equity,
+                "stop_price": self.state.stop_price,
+                "target_price": self.state.target_price,
+                "exit_mode": self.state.exit_mode,
+                "is_short": self.state.is_short,
+                "oanda_account_type": account_type,
+                "account_type_label": account_type_label,
             }
 
+    # ─── Main Loop ──────────────────────────────────────────────────
+
     def run_loop(self) -> None:
-        while not self.stop_event.is_set():
+        """Main bot loop with auto-restart on failure."""
+        last_summary_date = ""
+        summary_sent_today = False
+
+        while not self.stop_event.is_set() and not self.shutdown_requested:
             try:
                 self.tick()
-            except Exception as exc:  # Keeps the local bot alive after transient API issues.
+
+                # ─── Send daily summary at 23:59 UTC ───
+                if self.state.settings.get("telegram_alert_on_daily_summary", True):
+                    now = datetime.now(timezone.utc)
+                    current_day = today_key()
+
+                    if current_day != last_summary_date:
+                        last_summary_date = current_day
+                        summary_sent_today = False
+
+                    if now.hour == 23 and now.minute == 59 and not summary_sent_today:
+                        self.send_telegram_alert(self.format_daily_summary())
+                        summary_sent_today = True
+                        logger.info("Daily summary sent")
+
+            except Exception as exc:
+                logger.error(f"Bot loop error: {exc}", exc_info=True)
                 with self.lock:
                     self.state.last_error = str(exc)
-                    self.state.last_signal = "Paused by data/API error"
+                    self.state.last_signal = f"Paused by error: {exc}"
                     self.save_state()
+                logger.info(f"Waiting {self.restart_delay}s before restarting loop...")
+                self.stop_event.wait(self.restart_delay)
 
             wait_seconds = int(self.state.settings.get("poll_seconds", 15))
             self.stop_event.wait(wait_seconds)
+
+        if self.shutdown_requested:
+            logger.info("Bot loop exited (shutdown requested)")
+        else:
+            logger.info("Bot loop stopped")
 
     def tick(self) -> None:
         with self.lock:
             settings = dict(self.state.settings)
 
         watchlist = parse_watchlist(settings.get("watchlist", settings["symbol"]))
+
         fetched_prices: dict[str, float] = {}
         fetched_candles: dict[str, list[Candle]] = {}
         errors: list[str] = []
         granularity = int(settings.get("live_granularity", 3600))
         candle_count = int(settings.get("live_candle_count", 300))
 
-        for symbol in watchlist:
+        # ─── Process each pair with logging ───
+        for idx, symbol in enumerate(watchlist):
             try:
+                logger.debug(f"Fetching {symbol}...")
                 candles = fetch_candles(
                     exchange=settings["exchange"],
                     symbol=symbol,
@@ -1205,11 +2127,34 @@ class PaperBot:
                     raise RuntimeError("No candles returned")
                 fetched_candles[symbol] = candles
                 fetched_prices[symbol] = candles[-1].close
+                logger.debug(f"✓ {symbol} fetched: {len(candles)} candles, price {fetched_prices[symbol]}")
             except Exception as exc:
+                logger.warning(f"✗ {symbol} failed: {exc}")
                 errors.append(f"{symbol}: {exc}")
+                # ─── Use fallback data ───
+                history = self.state.price_history.get(symbol, [])
+                if history:
+                    fallback_price = history[-1]
+                    fallback_candles = closes_to_candles(history[-40:])
+                    logger.debug(f"Using fallback data for {symbol}: {fallback_price}")
+                else:
+                    fallback_price = 1.0
+                    fallback_candles = [
+                        Candle(time=int(time.time()) - i, open=1.0, high=1.0, low=1.0, close=1.0, volume=0.0)
+                        for i in range(40, 0, -1)
+                    ]
+                    logger.debug(f"Using default data for {symbol}")
+                fetched_candles[symbol] = fallback_candles
+                fetched_prices[symbol] = fallback_price
 
         if not fetched_prices:
-            raise RuntimeError("; ".join(errors) or "No candle data returned")
+            logger.error("; ".join(errors) or "No candle data returned")
+            # Use cached data instead of failing
+            for symbol in watchlist:
+                if symbol in self.state.price_history:
+                    history = self.state.price_history[symbol]
+                    fetched_prices[symbol] = history[-1] if history else 1.0
+                    fetched_candles[symbol] = closes_to_candles(history[-40:]) if history else []
 
         with self.lock:
             active_price = self.price_for_active_position(fetched_prices)
@@ -1239,15 +2184,16 @@ class PaperBot:
             if decision.startswith("BUY"):
                 symbol = decision.split()[1]
                 candles = fetched_candles.get(symbol, [])
+                is_short = "SHORT" in decision or "short" in decision.lower()
                 if self.should_oanda_demo_trade():
-                    self.oanda_demo_buy(symbol, fetched_prices[symbol], decision, candles)
+                    self.oanda_demo_buy(symbol, fetched_prices[symbol], decision, candles, is_short=is_short)
                 elif self.wants_oanda_demo_trade():
                     self.state.last_signal = f"OANDA BUY blocked: {oanda_demo_status_message()}"
                     self.journal(symbol, "BLOCK", self.state.last_signal, fetched_prices[symbol])
                 elif self.should_live_trade():
                     self.live_buy(symbol, fetched_prices[symbol], decision, candles)
                 else:
-                    self.paper_buy(symbol, fetched_prices[symbol], decision, candles)
+                    self.paper_buy(symbol, fetched_prices[symbol], decision, candles, is_short=is_short)
             elif decision.startswith("SELL"):
                 parts = decision.split()
                 symbol = parts[1] if len(parts) > 1 else self.state.active_symbol or settings["symbol"]
@@ -1272,224 +2218,7 @@ class PaperBot:
                     self.paper_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity)
 
             self.save_state()
-
-    def track_order(
-        self,
-        order_id: str,
-        symbol: str,
-        product_id: str,
-        side: str,
-        role: str,
-        order_type: str,
-        price: float | None = None,
-        base_size: float | None = None,
-        quote_size: float | None = None,
-        reason: str = "",
-        details: dict[str, Any] | None = None,
-    ) -> ManagedOrder:
-        now_text = now_iso()
-        order = ManagedOrder(
-            order_id=order_id,
-            symbol=symbol,
-            product_id=product_id,
-            side=side.upper(),
-            role=role,
-            order_type=order_type,
-            status="OPEN",
-            created_at=now_text,
-            updated_at=now_text,
-            expires_at=time.time() + int(self.state.settings.get("order_expiry_seconds", 180)),
-            price=price,
-            base_size=base_size,
-            quote_size=quote_size,
-            reason=reason,
-            details=details or {},
-        )
-        self.state.open_orders.append(order)
-        self.state.open_orders = self.state.open_orders[-120:]
-        self.audit("ORDER_TRACKED", order=asdict(order))
-        return order
-
-    def managed_order(self, order_id: str) -> ManagedOrder | None:
-        return next((item for item in self.state.open_orders if item.order_id == order_id), None)
-
-    def manage_open_orders(self) -> None:
-        for order in list(self.state.open_orders):
-            if order.status in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}:
-                continue
-
-            try:
-                fill = coinbase_reconcile_order(order.order_id)
-            except Exception as exc:
-                order.updated_at = now_iso()
-                order.status = "RECONCILE_ERROR"
-                self.audit("ORDER_RECONCILE_ERROR", order_id=order.order_id, error=str(exc))
-                continue
-
-            self.apply_reconciled_order(order, fill)
-            if order.status == "FILLED":
-                continue
-
-            if time.time() >= order.expires_at:
-                self.expire_order(order)
-
-    def apply_reconciled_order(self, order: ManagedOrder, fill: dict[str, Any]) -> bool:
-        order.updated_at = now_iso()
-        order.status = fill.get("status", "UNKNOWN")
-        if fill["filled_size"] <= 0 or order.local_applied:
-            return False
-
-        filled_price = fill["average_price"] or order.price or self.state.last_price or 0.0
-        if order.role == "ENTRY":
-            filled_quote = (fill["filled_value"] or order.quote_size or 0.0) + fill["total_fee"]
-            self.state.live_daily_spend += min(order.quote_size or filled_quote, filled_quote)
-            self.paper_buy(
-                order.symbol,
-                filled_price,
-                f"LIVE {order.order_type.upper()} BUY filled {order.order_id} | {order.reason}",
-                spend_override=filled_quote,
-                fee_override=fill["total_fee"],
-                quantity_override=fill["filled_size"],
-                exchange_order_id=order.order_id,
-                exchange_order_status=order.status,
-                exchange_average_filled_price=filled_price,
-            )
-            if order.details.get("native_stop_requested"):
-                self.submit_native_stop_for_position(order, filled_price)
-        elif order.role in {"EXIT", "STOP"}:
-            self.paper_sell(
-                order.symbol,
-                filled_price,
-                f"LIVE {order.role} filled {order.order_id} | {order.reason}",
-                quantity_override=fill["filled_size"],
-                fee_override=fill["total_fee"],
-                exchange_order_id=order.order_id,
-                exchange_order_status=order.status,
-                exchange_average_filled_price=filled_price,
-            )
-            if order.role == "STOP" and self.state.coin <= 0:
-                self.state.active_stop_order_id = None
-
-        order.local_applied = True
-        order.status = "FILLED"
-        order.updated_at = now_iso()
-        self.audit("ORDER_FILLED_APPLIED", order=asdict(order), fill=fill)
-        return True
-
-    def expire_order(self, order: ManagedOrder) -> None:
-        try:
-            cancel_response = coinbase_cancel_orders([order.order_id])
-            order.status = "EXPIRED"
-            order.updated_at = now_iso()
-            if self.state.active_stop_order_id == order.order_id:
-                self.state.active_stop_order_id = None
-            self.audit("ORDER_EXPIRED_CANCELLED", order=asdict(order), cancel_response=cancel_response)
-        except Exception as exc:
-            order.status = "CANCEL_FAILED"
-            order.updated_at = now_iso()
-            self.audit("ORDER_EXPIRE_CANCEL_FAILED", order=asdict(order), error=str(exc))
-            return
-
-        if (
-            bool(self.state.settings.get("order_replace_enabled"))
-            and order.retry_count < int(self.state.settings.get("order_retry_limit", 1))
-            and order.role in {"ENTRY", "EXIT"}
-        ):
-            self.replace_order(order)
-
-    def replace_order(self, order: ManagedOrder) -> None:
-        try:
-            if order.order_type == "limit" and order.price and order.base_size:
-                replacement = coinbase_limit_order(
-                    product_id=order.product_id,
-                    side=order.side,
-                    base_size=order.base_size,
-                    limit_price=order.price,
-                )
-            elif order.side == "BUY" and order.quote_size:
-                replacement = coinbase_market_order(order.product_id, order.side, quote_size=order.quote_size)
-            elif order.base_size:
-                replacement = coinbase_market_order(order.product_id, order.side, base_size=order.base_size)
-            else:
-                return
-            replacement_id = coinbase_order_id(replacement)
-            new_order = self.track_order(
-                replacement_id,
-                order.symbol,
-                order.product_id,
-                order.side,
-                order.role,
-                order.order_type,
-                price=order.price,
-                base_size=order.base_size,
-                quote_size=order.quote_size,
-                reason=order.reason,
-                details=order.details,
-            )
-            new_order.retry_count = order.retry_count + 1
-            self.audit("ORDER_REPLACED", old_order_id=order.order_id, new_order_id=replacement_id)
-        except Exception as exc:
-            self.audit("ORDER_REPLACE_FAILED", order_id=order.order_id, error=str(exc))
-
-    def submit_native_stop_for_position(self, entry_order: ManagedOrder, entry_price: float) -> None:
-        if self.state.coin <= 0:
-            return
-        stop_price = float(entry_order.details.get("stop_price") or 0.0)
-        exit_mode = str(entry_order.details.get("exit_mode") or "fixed")
-        if stop_price <= 0:
-            candles = closes_to_candles(self.state.price_history.get(entry_order.symbol, []))
-            stop_price, _, exit_mode = exit_prices(entry_price, candles, self.state.settings)
-        stop_order = coinbase_stop_limit_order(
-            product_id=entry_order.product_id,
-            side="SELL",
-            base_size=self.state.coin,
-            stop_price=stop_price,
-            limit_price=stop_price * 0.995,
-        )
-        stop_order_id = coinbase_order_id(stop_order)
-        self.state.active_stop_order_id = stop_order_id
-        self.track_order(
-            stop_order_id,
-            entry_order.symbol,
-            entry_order.product_id,
-            "SELL",
-            "STOP",
-            "stop_limit",
-            price=stop_price,
-            base_size=self.state.coin,
-            reason=f"{exit_mode} native stop",
-            details={"entry_order_id": entry_order.order_id},
-        )
-        self.journal(
-            entry_order.symbol,
-            "INFO",
-            f"Native stop-limit submitted {stop_order_id} via {exit_mode} stop",
-            stop_price,
-            {"entry_order_id": entry_order.order_id, "stop_order": stop_order},
-        )
-
-    def sync_native_stop_fill(self) -> None:
-        if not self.state.active_stop_order_id or not self.state.active_symbol:
-            return
-        stop_order_id = self.state.active_stop_order_id
-        fill = coinbase_reconcile_order(stop_order_id)
-        if fill["filled_size"] <= 0:
-            return
-
-        symbol = self.state.active_symbol
-        filled_price = fill["average_price"] or self.state.last_price or 0.0
-        self.paper_sell(
-            symbol,
-            filled_price,
-            f"NATIVE STOP filled {stop_order_id}",
-            quantity_override=fill["filled_size"],
-            fee_override=fill["total_fee"],
-            exchange_order_id=stop_order_id,
-            exchange_order_status=fill["status"],
-            exchange_average_filled_price=filled_price,
-        )
-        if self.state.coin <= 0:
-            self.state.active_stop_order_id = None
+            logger.debug("TICK: State saved")
 
     def decide(
         self,
@@ -1498,23 +2227,220 @@ class PaperBot:
         candles_by_symbol: dict[str, list[Candle]] | None = None,
     ) -> str:
         settings = self.state.settings
+        strategy = settings.get("strategy", "opening_range")
         candles_by_symbol = candles_by_symbol or {}
-        signal_candles_by_symbol = {
-            symbol: signal_candles(candles, settings)
-            for symbol, candles in candles_by_symbol.items()
-        }
 
         if time.time() - self.state.last_action_time < float(settings["cooldown_seconds"]):
             return "Cooldown active"
 
+        # ─── NEWS GUARD CHECK ───
+        if settings.get("news_guard_enabled", False):
+            for symbol in watchlist:
+                blocked, reason = self.is_news_blocked(symbol, settings)
+                if blocked:
+                    return f"BLOCK {symbol} {reason}"
+
         active_price = self.price_for_active_position(fetched_prices)
         equity = self.equity(active_price)
+
+        # ─── DAILY LOSS CHECK ───
         daily_loss_limit = float(settings["daily_loss_limit_pct"]) / 100
         if equity <= self.state.day_start_equity * (1 - daily_loss_limit):
             return "Daily loss limit reached"
 
-        scan_rows = self.build_scan_rows(watchlist, signal_candles_by_symbol)
-        self.state.scan_rows = scan_rows
+        # ─── MAX DRAWDOWN CHECK ───
+        max_drawdown_pct = float(settings.get("max_drawdown_pct", 20.0))
+        drawdown_alert_pct = float(settings.get("telegram_drawdown_alert_pct", 10.0))
+        if self.state.peak_equity > 0:
+            current_drawdown = ((self.state.peak_equity - equity) / self.state.peak_equity) * 100
+            if current_drawdown > max_drawdown_pct:
+                return f"STOP Max drawdown {current_drawdown:.1f}% > {max_drawdown_pct}%"
+            if (current_drawdown > drawdown_alert_pct and
+                settings.get("telegram_alert_on_drawdown", True)):
+                self.send_telegram_alert(
+                    self.format_alert_drawdown(current_drawdown, equity, self.state.peak_equity)
+                )
+
+        # Update peak equity
+        if equity > self.state.peak_equity:
+            self.state.peak_equity = equity
+
+        # ─── EMA GOLDEN CROSS STRATEGY ───
+        if strategy == "ema_golden_cross":
+            scan_rows = self.build_ema_golden_cross_scan_rows(watchlist, candles_by_symbol)
+
+            # ─── Only keep rows for symbols in the watchlist ───
+            watchlist_set = set(watchlist)
+            filtered_rows = []
+            for row in scan_rows:
+                if row.get("symbol") in watchlist_set:
+                    filtered_rows.append(row)
+            self.state.scan_rows = filtered_rows
+
+            # Check for BUY signals
+            candidates = [
+                row for row in self.state.scan_rows
+                if row["signal"] == "BUY" and row["price"] is not None
+            ]
+            if candidates:
+                best = max(candidates, key=lambda row: row["score"])
+                return f"BUY {best['symbol']} EMA Golden Cross score {best['score']:.3f}"
+
+            # Check for SELL signals (shorting)
+            if settings.get("allow_short_selling", False):
+                sell_candidates = [
+                    row for row in self.state.scan_rows
+                    if row["signal"] == "SELL" and row["price"] is not None
+                ]
+                if sell_candidates:
+                    best = max(sell_candidates, key=lambda row: row["score"])
+                    return f"BUY {best['symbol']} SHORT EMA Death Cross"
+
+            waiting = [row for row in self.state.scan_rows if row["signal"].startswith("WAIT")]
+            if len(waiting) == len(self.state.scan_rows):
+                return "Waiting for enough price data"
+            return "HOLD no qualifying entry"
+
+        # ─── OPENING RANGE STRATEGY (Modified to loop through all watchlist) ───
+        if strategy == "opening_range":
+            scan_rows = []
+
+            for symbol in watchlist:
+                candles = candles_by_symbol.get(symbol, [])
+
+                # Check if we have enough data
+                if len(candles) < max(20, int(settings.get("opening_range_atr_period", 14)) + 1):
+                    # Not enough data - add a placeholder row
+                    scan_rows.append({
+                        "symbol": symbol,
+                        "price": fetched_prices.get(symbol),
+                        "signal": "WAIT data",
+                        "score": 0,
+                        "regime": "opening_range",
+                        "support": None,
+                        "resistance": None,
+                        "entry": None,
+                        "reason": "Not enough data for Opening Range",
+                        "opening_bias": None,
+                        "opening_range_ratio": None,
+                        "opening_manipulation": None,
+                        "opening_blowoff": None,
+                        "opening_high": None,
+                        "opening_low": None,
+                        "is_short": False,
+                    })
+                    continue
+
+                # Get the signal for this symbol
+                signal = self.opening_range_signal(symbol, candles)
+                analysis = signal.get("analysis", {})
+
+                # Build scan row for each symbol
+                scan_row = {
+                    "symbol": symbol,
+                    "price": candles[-1].close if candles else None,
+                    "signal": signal["signal"],
+                    "score": 0,
+                    "regime": "opening_range",
+                    "support": signal.get("stop"),
+                    "resistance": signal.get("target"),
+                    "entry": signal.get("entry"),
+                    "reason": signal["reason"],
+                    "opening_bias": analysis.get("bias"),
+                    "opening_range_ratio": analysis.get("range_ratio"),
+                    "opening_manipulation": analysis.get("manipulation"),
+                    "opening_blowoff": analysis.get("blowoff"),
+                    "opening_high": analysis.get("high"),
+                    "opening_low": analysis.get("low"),
+                    "is_short": signal.get("is_short", False),
+                }
+                scan_rows.append(scan_row)
+
+            # Update all scan rows
+            self.state.scan_rows = scan_rows
+
+            # ─── Find the best BUY signal (for trading) ───
+            buy_candidates = [
+                row for row in scan_rows
+                if row["signal"] == "BUY" and row["price"] is not None
+            ]
+
+            # Also check for SELL signals (short entries) if shorting is enabled
+            sell_candidates = []
+            if settings.get("allow_short_selling", False):
+                sell_candidates = [
+                    row for row in scan_rows
+                    if row["signal"] == "SELL" and row["price"] is not None
+                ]
+
+            # Check if we have an open position to manage
+            if abs(self.state.coin) > 0 and self.state.entry_price and self.state.active_symbol:
+                symbol = self.state.active_symbol
+                price = fetched_prices.get(symbol, active_price)
+                history = self.state.price_history.get(symbol, [])
+                candles = candles_by_symbol.get(symbol) or closes_to_candles(history)
+                signal_candle_set = signal_candles(candles, settings)
+                signal_history = [candle.close for candle in signal_candle_set] or history
+                self.state.highest_price = max(self.state.highest_price or price, price)
+                stop_price, target_price, exit_mode = exit_prices(
+                    entry_price=self.state.entry_price,
+                    candles=candles,
+                    settings=settings,
+                )
+
+                if partial_take_profit_ready(
+                    price=price,
+                    entry_price=self.state.entry_price,
+                    target_price=target_price,
+                    settings=settings,
+                    already_done=self.state.partial_take_profit_done,
+                ):
+                    self.state.partial_take_profit_done = True
+                    return f"SELL {symbol} partial {exit_mode} target"
+
+                trailing_stop = trailing_stop_price(
+                    entry_price=self.state.entry_price,
+                    highest_price=self.state.highest_price,
+                    settings=settings,
+                )
+                if trailing_stop and price <= trailing_stop:
+                    return f"SELL {symbol} trailing stop"
+
+                if price <= stop_price:
+                    return f"SELL {symbol} {exit_mode} stop"
+                if price >= target_price:
+                    return f"SELL {symbol} {exit_mode} target"
+
+                return f"HOLD {symbol} position open"
+
+            # ─── Decide on the best trade to take ───
+            # Prefer BUY signals over SELL signals for long-only mode
+            if buy_candidates:
+                best = max(buy_candidates, key=lambda row: row.get("score", 0))
+                symbol = best["symbol"]
+                is_short = best.get("is_short", False)
+                if is_short:
+                    return f"BUY {symbol} SHORT {best['reason']}"
+                else:
+                    return f"BUY {symbol} {best['reason']}"
+
+            # Check for SELL signals (short entries)
+            if sell_candidates and settings.get("allow_short_selling", False):
+                best = max(sell_candidates, key=lambda row: row.get("score", 0))
+                return f"BUY {best['symbol']} SHORT {best['reason']}"
+
+            # Check if we have any WAIT signals
+            waiting = [row for row in scan_rows if row["signal"].startswith("WAIT")]
+            if waiting:
+                return f"HOLD {waiting[0]['reason']}"
+
+            return "HOLD no qualifying entry"
+
+        # ─── EXISTING STRATEGIES (SMA Cross, EWO Offset) ───
+        signal_candles_by_symbol = {
+            symbol: signal_candles(candles, settings)
+            for symbol, candles in candles_by_symbol.items()
+        }
 
         if self.wants_oanda_demo_trade():
             return self.decide_oanda_multi(
@@ -1522,11 +2448,11 @@ class PaperBot:
                 watchlist,
                 candles_by_symbol,
                 signal_candles_by_symbol,
-                scan_rows,
+                self.state.scan_rows,
                 active_price,
             )
 
-        if self.state.coin > 0 and self.state.entry_price and self.state.active_symbol:
+        if abs(self.state.coin) > 0 and self.state.entry_price and self.state.active_symbol:
             symbol = self.state.active_symbol
             price = fetched_prices.get(symbol, active_price)
             history = self.state.price_history.get(symbol, [])
@@ -1579,19 +2505,37 @@ class PaperBot:
 
             return f"HOLD {symbol} position open"
 
+        # ─── Build scan rows for SMA Cross or EWO Offset ───
+        if strategy == "ewo_offset":
+            scan_rows = self.build_ewo_scan_rows(watchlist, signal_candles_by_symbol)
+        else:
+            scan_rows = self.build_scan_rows(watchlist, signal_candles_by_symbol)
+
+        # ─── Only keep rows for symbols in the watchlist ───
+        watchlist_set = set(watchlist)
+        filtered_rows = []
+        for row in scan_rows:
+            if row.get("symbol") in watchlist_set:
+                filtered_rows.append(row)
+            else:
+                logger.debug(f"Removing {row.get('symbol')} from scan rows (not in watchlist)")
+        self.state.scan_rows = filtered_rows
+
         candidates = [
-            row for row in scan_rows
+            row for row in self.state.scan_rows
             if row["signal"] == "BUY" and row["price"] is not None
         ]
         if candidates:
             best = max(candidates, key=lambda row: row["score"])
             return f"BUY {best['symbol']} strongest trend score {best['score']:.3f}"
 
-        waiting = [row for row in scan_rows if row["signal"].startswith("WAIT")]
-        if len(waiting) == len(scan_rows):
+        waiting = [row for row in self.state.scan_rows if row["signal"].startswith("WAIT")]
+        if len(waiting) == len(self.state.scan_rows):
             return "Waiting for enough price data"
 
         return "HOLD no qualifying entry"
+
+    # ─── Strategy Helpers ──────────────────────────────────────────
 
     def decide_oanda_multi(
         self,
@@ -1692,9 +2636,16 @@ class PaperBot:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         candles_by_symbol = candles_by_symbol or {}
+
+        # ─── EWO Offset Strategy ───
         if self.state.settings.get("strategy") == "ewo_offset":
             return self.build_ewo_scan_rows(watchlist, candles_by_symbol)
 
+        # ─── EMA Golden Cross Strategy ───
+        if self.state.settings.get("strategy") == "ema_golden_cross":
+            return self.build_ema_golden_cross_scan_rows(watchlist, candles_by_symbol)
+
+        # ─── SMA Cross Strategy ───
         settings = self.state.settings
         short_window = int(self.state.settings["short_window"])
         long_window = int(self.state.settings["long_window"])
@@ -1932,10 +2883,15 @@ class PaperBot:
         exchange_order_id: str | None = None,
         exchange_order_status: str | None = None,
         exchange_average_filled_price: float | None = None,
+        stop_override: float | None = None,
+        target_override: float | None = None,
+        is_short: bool = False,
     ) -> None:
+        """Place a BUY (long) or SELL (short) order."""
         settings = self.state.settings
         trade_fee = float(settings["trade_fee"])
         spend_reason = "manual override"
+
         if spend_override is not None:
             spend = spend_override
         else:
@@ -1948,40 +2904,127 @@ class PaperBot:
         spend = min(spend, self.state.cash)
 
         if spend < float(settings.get("min_order_value", 1.0)):
-            self.state.last_signal = f"BUY blocked: order below minimum {settings['quote_currency']} {settings.get('min_order_value', 1.0)}"
+            self.state.last_signal = f"{'SHORT' if is_short else 'BUY'} blocked: order below minimum {settings['quote_currency']} {settings.get('min_order_value', 1.0)}"
             self.journal(symbol, "BLOCK", self.state.last_signal, price, {"spend": spend})
             return
 
         fee_paid = fee_override if fee_override is not None else spend * trade_fee
         coin_bought = quantity_override if quantity_override is not None else (spend - fee_paid) / price
-        self.state.cash -= spend
-        self.state.coin += coin_bought
-        self.state.active_symbol = symbol
-        self.state.entry_price = price
-        self.state.highest_price = price
-        self.state.active_stop_order_id = None
-        self.state.partial_take_profit_done = False
-        self.state.last_price = price
-        self.state.last_action_time = time.time()
-        self.state.trades.append(
-            Trade(
-                time=now_iso(),
-                side="BUY",
-                symbol=symbol,
-                price=price,
-                quantity=coin_bought,
-                cash_after=self.state.cash,
-                coin_after=self.state.coin,
-                reason=f"{reason} | size {spend_reason}",
-                fee_paid=fee_paid,
-                exchange_order_id=exchange_order_id,
-                exchange_order_status=exchange_order_status,
-                exchange_average_filled_price=exchange_average_filled_price,
-                exchange_filled_size=coin_bought if exchange_order_id else None,
+
+        # Calculate stop/target – use overrides if provided
+        if stop_override is not None and target_override is not None:
+            stop_price = stop_override
+            target_price = target_override
+            exit_mode = "opening_range"
+        else:
+            stop_price, target_price, exit_mode = exit_prices(
+                entry_price=price,
+                candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
+                settings=settings,
             )
-        )
-        self.record_setup_buy(symbol, price, coin_bought, spend, fee_paid, reason)
-        self.journal(symbol, "BUY", reason, price, {"spend": spend, "quantity": coin_bought})
+
+        if is_short:
+            # ─── SHORT SELL ───
+            # For shorts, we use negative quantity
+            self.state.coin -= coin_bought  # Negative = short position
+            self.state.cash += spend  # We receive cash for shorting
+            self.state.active_symbol = symbol
+            self.state.entry_price = price
+            self.state.highest_price = price
+            self.state.stop_price = stop_price
+            self.state.target_price = target_price
+            self.state.exit_mode = exit_mode
+            self.state.active_stop_order_id = None
+            self.state.partial_take_profit_done = False
+            self.state.last_price = price
+            self.state.last_action_time = time.time()
+            self.state.is_short = True
+
+            self.state.positions[symbol] = {
+                "quantity": -coin_bought,  # Negative = short
+                "entry_price": price,
+                "highest_price": price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "exit_mode": exit_mode,
+                "partial_take_profit_done": False,
+                "entry_cost": spend,
+                "opened_at": now_iso(),
+                "is_short": True,
+            }
+
+            self.state.trades.append(
+                Trade(
+                    time=now_iso(),
+                    side="SHORT",
+                    symbol=symbol,
+                    price=price,
+                    quantity=-coin_bought,
+                    cash_after=self.state.cash,
+                    coin_after=self.state.coin,
+                    reason=f"{reason} | size {spend_reason} | {exit_mode} stop/target",
+                    fee_paid=fee_paid,
+                    exchange_order_id=exchange_order_id,
+                    exchange_order_status=exchange_order_status,
+                    exchange_average_filled_price=exchange_average_filled_price,
+                    exchange_filled_size=coin_bought if exchange_order_id else None,
+                )
+            )
+            self.journal(symbol, "SHORT", reason, price, {"spend": spend, "quantity": coin_bought, "stop": stop_price, "target": target_price})
+            logger.info(f"SHORT {symbol}: {coin_bought:.6f} @ {price:.6f} | {reason}")
+        else:
+            # ─── LONG BUY ───
+            self.state.cash -= spend
+            self.state.coin += coin_bought
+            self.state.active_symbol = symbol
+            self.state.entry_price = price
+            self.state.highest_price = price
+            self.state.stop_price = stop_price
+            self.state.target_price = target_price
+            self.state.exit_mode = exit_mode
+            self.state.active_stop_order_id = None
+            self.state.partial_take_profit_done = False
+            self.state.last_price = price
+            self.state.last_action_time = time.time()
+            self.state.is_short = False
+
+            self.state.positions[symbol] = {
+                "quantity": coin_bought,
+                "entry_price": price,
+                "highest_price": price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "exit_mode": exit_mode,
+                "partial_take_profit_done": False,
+                "entry_cost": spend,
+                "opened_at": now_iso(),
+                "is_short": False,
+            }
+
+            self.state.trades.append(
+                Trade(
+                    time=now_iso(),
+                    side="BUY",
+                    symbol=symbol,
+                    price=price,
+                    quantity=coin_bought,
+                    cash_after=self.state.cash,
+                    coin_after=self.state.coin,
+                    reason=f"{reason} | size {spend_reason} | {exit_mode} stop/target",
+                    fee_paid=fee_paid,
+                    exchange_order_id=exchange_order_id,
+                    exchange_order_status=exchange_order_status,
+                    exchange_average_filled_price=exchange_average_filled_price,
+                    exchange_filled_size=coin_bought if exchange_order_id else None,
+                )
+            )
+            self.record_setup_buy(symbol, price, coin_bought, spend, fee_paid, reason)
+            self.journal(symbol, "BUY", reason, price, {"spend": spend, "quantity": coin_bought, "stop": stop_price, "target": target_price})
+            logger.info(f"BUY {symbol}: {coin_bought:.6f} @ {price:.6f} | {reason}")
+
+        # Send Telegram alert
+        if settings.get("telegram_alert_on_buy", True):
+            self.send_telegram_alert(self.format_alert_trade(self.state.trades[-1]))
 
     def paper_sell(
         self,
@@ -1997,34 +3040,73 @@ class PaperBot:
         settings = self.state.settings
         trade_fee = float(settings["trade_fee"])
 
-        if self.state.coin <= 0:
+        if abs(self.state.coin) <= 0 and symbol not in self.state.positions:
             self.state.last_signal = "SELL blocked: no position"
             self.journal(symbol, "BLOCK", "SELL blocked: no position", price)
             return
 
-        sold_quantity = min(self.state.coin, quantity_override or self.state.coin)
+        position = self.state.positions.get(symbol, {})
+        position_quantity = float(position.get("quantity", 0.0))
+        coin_available = self.state.coin if self.state.active_symbol == symbol else position_quantity
+
+        if abs(coin_available) <= 0:
+            self.state.last_signal = f"SELL blocked: no {symbol} position"
+            self.journal(symbol, "BLOCK", f"SELL blocked: no {symbol} position", price)
+            return
+
+        # Determine if we're closing a short or a long
+        is_short = position.get("is_short", False) or self.state.is_short
+        sold_quantity = min(abs(coin_available), abs(quantity_override or coin_available))
         gross = sold_quantity * price
         fee_paid = fee_override if fee_override is not None else gross * trade_fee
         cash_received = gross - fee_paid
+
+        # Update cash and position
         self.state.cash += cash_received
-        self.state.coin -= sold_quantity
-        position_closed = self.state.coin <= 0.0000000001
-        if self.state.coin <= 0.0000000001:
+
+        if is_short:
+            # Closing a short – we buy back
+            self.state.coin += sold_quantity  # Reduce the negative
+            if symbol in self.state.positions:
+                remaining = position_quantity + sold_quantity  # Moving toward zero
+                if remaining >= 0:
+                    self.state.positions.pop(symbol, None)
+                else:
+                    position["quantity"] = remaining
+                    self.state.positions[symbol] = position
+        else:
+            # Closing a long – we sell
+            self.state.coin -= sold_quantity
+            if symbol in self.state.positions:
+                remaining = position_quantity - sold_quantity
+                if remaining <= 0:
+                    self.state.positions.pop(symbol, None)
+                else:
+                    position["quantity"] = remaining
+                    self.state.positions[symbol] = position
+
+        position_closed = abs(self.state.coin) <= 0.0000000001 and len(self.state.positions) == 0
+        if position_closed:
             self.state.coin = 0.0
             self.state.active_symbol = None
             self.state.entry_price = None
             self.state.highest_price = None
+            self.state.stop_price = None
+            self.state.target_price = None
             self.state.active_stop_order_id = None
             self.state.partial_take_profit_done = False
+            self.state.is_short = False
+
         self.state.last_price = price
         self.state.last_action_time = time.time()
+        side = "SELL" if not is_short else "BUY"
         self.state.trades.append(
             Trade(
                 time=now_iso(),
-                side="SELL",
+                side=side,
                 symbol=symbol,
                 price=price,
-                quantity=sold_quantity,
+                quantity=-sold_quantity if is_short else sold_quantity,
                 cash_after=self.state.cash,
                 coin_after=self.state.coin,
                 reason=reason,
@@ -2044,7 +3126,26 @@ class PaperBot:
             reason,
             position_closed,
         )
-        self.journal(symbol, "SELL", reason, price, {"quantity": sold_quantity})
+        self.journal(symbol, side, reason, price, {"quantity": sold_quantity})
+        logger.info(f"{side} {symbol}: {sold_quantity:.6f} @ {price:.6f} | {reason}")
+
+        # Send Telegram alert
+        if settings.get("telegram_alert_on_sell", True):
+            trade = self.state.trades[-1]
+            # Calculate P/L
+            buy_trade = next(
+                (t for t in reversed(self.state.trades[:-1]) if t.symbol == symbol and t.side in ["BUY", "SHORT"]),
+                None
+            )
+            pnl = None
+            if buy_trade:
+                if is_short:
+                    pnl = (price - buy_trade.price) * sold_quantity
+                else:
+                    pnl = (price - buy_trade.price) * sold_quantity
+            self.send_telegram_alert(self.format_alert_trade(trade, pnl))
+
+    # ─── OANDA Trading ─────────────────────────────────────────────
 
     def should_oanda_demo_trade(self) -> bool:
         settings = self.state.settings
@@ -2069,15 +3170,21 @@ class PaperBot:
         price: float,
         reason: str,
         candles: list[Candle] | None = None,
+        is_short: bool = False,
     ) -> None:
         settings = self.state.settings
         if symbol in self.state.positions:
-            self.state.last_signal = f"OANDA BUY blocked: {symbol} already has an open position"
+            self.state.last_signal = f"OANDA {'SHORT' if is_short else 'BUY'} blocked: {symbol} already has an open position"
             self.journal(symbol, "BLOCK", self.state.last_signal, price)
             return
         max_positions = int(settings.get("max_oanda_open_trades", 3))
         if len(self.state.positions) >= max_positions:
-            self.state.last_signal = f"OANDA BUY blocked: max open trades reached ({max_positions})"
+            self.state.last_signal = f"OANDA {'SHORT' if is_short else 'BUY'} blocked: max open trades reached ({max_positions})"
+            self.journal(symbol, "BLOCK", self.state.last_signal, price)
+            return
+
+        if is_short and not settings.get("allow_short_selling", False):
+            self.state.last_signal = f"OANDA SHORT blocked: short selling disabled"
             self.journal(symbol, "BLOCK", self.state.last_signal, price)
             return
 
@@ -2089,11 +3196,14 @@ class PaperBot:
         )
         spend = min(spend, self.state.cash)
         if spend < float(settings.get("min_order_value", 1.0)):
-            self.state.last_signal = f"OANDA BUY blocked: order below {settings['quote_currency']} {settings.get('min_order_value', 1.0)}"
+            self.state.last_signal = f"OANDA {'SHORT' if is_short else 'BUY'} blocked: order below {settings['quote_currency']} {settings.get('min_order_value', 1.0)}"
             self.journal(symbol, "BLOCK", self.state.last_signal, price, {"spend": spend})
             return
 
         units = int(max(1, spend / price))
+        if is_short:
+            units = -units  # Negative units for short
+
         stop_price, target_price, exit_mode = exit_prices(
             entry_price=price,
             candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
@@ -2103,49 +3213,81 @@ class PaperBot:
         fill = oanda_order_fill(response)
         fill_price = fill["price"] or price
         filled_units = fill["units"] or units
-        cost = filled_units * fill_price
+        cost = abs(filled_units * fill_price)
         fee = fill["commission"]
-        self.state.cash -= cost + fee
-        self.state.positions[symbol] = {
-            "quantity": filled_units,
-            "entry_price": fill_price,
-            "highest_price": fill_price,
-            "stop_price": stop_price,
-            "target_price": target_price,
-            "stop": stop_price,
-            "target": target_price,
-            "exit_mode": exit_mode,
-            "partial_take_profit_done": False,
-            "entry_cost": cost + fee,
-            "opened_at": now_iso(),
-            "trade_id": fill.get("trade_id"),
-        }
+
+        if is_short:
+            # Short position
+            self.state.coin -= abs(filled_units)
+            self.state.cash += cost
+            self.state.is_short = True
+            self.state.positions[symbol] = {
+                "quantity": -abs(filled_units),
+                "entry_price": fill_price,
+                "highest_price": fill_price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "stop": stop_price,
+                "target": target_price,
+                "exit_mode": exit_mode,
+                "partial_take_profit_done": False,
+                "entry_cost": cost,
+                "opened_at": now_iso(),
+                "trade_id": fill.get("trade_id"),
+                "is_short": True,
+            }
+        else:
+            # Long position
+            self.state.cash -= cost + fee
+            self.state.coin += abs(filled_units)
+            self.state.is_short = False
+            self.state.positions[symbol] = {
+                "quantity": abs(filled_units),
+                "entry_price": fill_price,
+                "highest_price": fill_price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "stop": stop_price,
+                "target": target_price,
+                "exit_mode": exit_mode,
+                "partial_take_profit_done": False,
+                "entry_cost": cost + fee,
+                "opened_at": now_iso(),
+                "trade_id": fill.get("trade_id"),
+                "is_short": False,
+            }
+
         self.state.active_symbol = symbol
         self.state.entry_price = fill_price
         self.state.highest_price = fill_price
+        self.state.stop_price = stop_price
+        self.state.target_price = target_price
         self.state.last_price = fill_price
         self.state.last_action_time = time.time()
+
+        side = "SHORT" if is_short else "BUY"
         trade_reason = f"{reason} | OANDA demo order | size {spend_reason} | {exit_mode} stop/target"
         self.state.trades.append(
             Trade(
                 time=now_iso(),
-                side="BUY",
+                side=side,
                 symbol=symbol,
                 price=fill_price,
-                quantity=filled_units,
+                quantity=abs(filled_units) if is_short else abs(filled_units),
                 cash_after=self.state.cash,
-                coin_after=filled_units,
+                coin_after=self.state.coin,
                 reason=trade_reason,
                 fee_paid=fee,
                 exchange_order_id=fill["order_id"],
                 exchange_order_status=fill["status"],
                 exchange_average_filled_price=fill_price,
-                exchange_filled_size=filled_units,
+                exchange_filled_size=abs(filled_units),
             )
         )
-        self.record_setup_buy(symbol, fill_price, filled_units, cost + fee, fee, trade_reason)
-        self.journal(symbol, "BUY", trade_reason, fill_price, {"spend": cost + fee, "quantity": filled_units})
-        self.journal(symbol, "INFO", "OANDA demo BUY filled", fill_price, fill)
+        self.record_setup_buy(symbol, fill_price, abs(filled_units), cost + fee, fee, trade_reason)
+        self.journal(symbol, side, trade_reason, fill_price, {"spend": cost + fee, "quantity": abs(filled_units)})
+        self.journal(symbol, "INFO", f"OANDA demo {side} filled", fill_price, fill)
+        logger.info(f"OANDA {side} {symbol}: {abs(filled_units)} units @ {fill_price:.6f}")
 
     def oanda_demo_sell(
         self,
@@ -2161,34 +3303,43 @@ class PaperBot:
             return
 
         current_quantity = float(position.get("quantity", 0.0))
-        quantity = min(current_quantity, quantity_override or current_quantity)
-        units = -int(max(1, round(quantity)))
+        quantity = min(abs(current_quantity), abs(quantity_override or current_quantity))
+        is_short = position.get("is_short", False)
+        units = -int(max(1, round(quantity))) if not is_short else int(max(1, round(quantity)))
+
         response = oanda_market_order(symbol, units)
         fill = oanda_order_fill(response)
         fill_price = fill["price"] or price
-        filled_units = min(current_quantity, fill["units"] or abs(units))
+        filled_units = min(abs(current_quantity), fill["units"] or abs(units))
         fee = fill["commission"]
         gross = filled_units * fill_price
         cash_received = gross - fee
         self.state.cash += cash_received
-        remaining = current_quantity - filled_units
+
+        remaining = abs(current_quantity) - filled_units
         position_closed = remaining <= 0.0000000001
         if position_closed:
             self.state.positions.pop(symbol, None)
         else:
-            position["quantity"] = remaining
+            position["quantity"] = -remaining if is_short else remaining
             self.state.positions[symbol] = position
+
         self.state.active_symbol = next(iter(self.state.positions), None)
         active_position = self.state.positions.get(self.state.active_symbol or "", {})
         self.state.entry_price = active_position.get("entry_price")
         self.state.highest_price = active_position.get("highest_price")
+        self.state.stop_price = active_position.get("stop_price")
+        self.state.target_price = active_position.get("target_price")
+        self.state.is_short = active_position.get("is_short", False)
         self.state.last_price = fill_price
         self.state.last_action_time = time.time()
+
+        side = "SELL" if not is_short else "BUY"
         trade_reason = f"{reason} | OANDA demo order"
         self.state.trades.append(
             Trade(
                 time=now_iso(),
-                side="SELL",
+                side=side,
                 symbol=symbol,
                 price=fill_price,
                 quantity=filled_units,
@@ -2203,8 +3354,11 @@ class PaperBot:
             )
         )
         self.record_setup_sell(symbol, fill_price, filled_units, cash_received, fee, trade_reason, position_closed)
-        self.journal(symbol, "SELL", trade_reason, fill_price, {"quantity": filled_units})
-        self.journal(symbol, "INFO", "OANDA demo SELL filled", fill_price, fill)
+        self.journal(symbol, side, trade_reason, fill_price, {"quantity": filled_units})
+        self.journal(symbol, "INFO", f"OANDA demo {side} filled", fill_price, fill)
+        logger.info(f"OANDA {side} {symbol}: {filled_units} units @ {fill_price:.6f}")
+
+    # ─── Live Trading ──────────────────────────────────────────────
 
     def should_live_trade(self) -> bool:
         settings = self.state.settings
@@ -2216,17 +3370,23 @@ class PaperBot:
         )
 
     def live_status(self) -> dict[str, Any]:
+        account_type = self.state.settings.get("oanda_account_type", "standard")
+        account_type_label = "Spread Bet" if account_type == "spreadbet" else "CFD/Forex"
+
+        # ─── Check if we're in forex mode ───
         if self.state.settings.get("asset_class", "crypto") == "forex":
             exchange = self.state.settings.get("exchange")
             demo_orders_enabled = bool(self.state.settings.get("oanda_demo_trading_enabled"))
             demo_orders_armed = exchange == "oanda_demo" and demo_orders_enabled and oanda_demo_orders_armed()
+
             message = (
                 oanda_demo_status_message()
                 if exchange == "oanda_demo" and demo_orders_enabled
                 else (
-                    "OANDA demo provides real account candles/pricing; OANDA demo order placement is disabled."
+                    f"OANDA {account_type_label} provides real account candles/pricing; "
+                    f"OANDA demo order placement is disabled."
                     if exchange == "oanda_demo"
-                    else "Forex demo mode uses synthetic paper data. Select OANDA demo for real OANDA practice data."
+                    else f"Forex demo mode uses synthetic paper data. Select OANDA demo for real OANDA practice data."
                 )
             )
             return {
@@ -2247,7 +3407,13 @@ class PaperBot:
                 "websocket_status": "forex paper only",
                 "websocket_last_seen": "",
                 "message": message,
+                "news_guard_enabled": bool(self.state.settings.get("news_guard_enabled", False)),
+                "news_guard_status": self.state.news_guard_status,
+                "account_type": account_type,
+                "account_type_label": account_type_label,
             }
+
+        # ─── Crypto mode ───
         armed = coinbase_live_is_armed()
         return {
             "enabled": bool(self.state.settings.get("live_trading_enabled")),
@@ -2267,6 +3433,10 @@ class PaperBot:
             "websocket_status": self.state.websocket_status,
             "websocket_last_seen": self.state.websocket_last_seen,
             "message": coinbase_live_status_message(),
+            "news_guard_enabled": bool(self.state.settings.get("news_guard_enabled", False)),
+            "news_guard_status": self.state.news_guard_status,
+            "account_type": "n/a",
+            "account_type_label": "Crypto",
         }
 
     def live_buy(
@@ -2275,6 +3445,7 @@ class PaperBot:
         price: float,
         reason: str,
         candles: list[Candle] | None = None,
+        is_short: bool = False,
     ) -> None:
         self.roll_live_daily_spend_if_needed()
         settings = self.state.settings
@@ -2290,7 +3461,7 @@ class PaperBot:
 
         minimum_order = max(1.0, float(settings.get("min_order_value", 1.0)))
         if quote_size < minimum_order:
-            self.state.last_signal = f"LIVE BUY blocked: order below {settings['quote_currency']} {minimum_order:.2f}"
+            self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: order below {settings['quote_currency']} {minimum_order:.2f}"
             self.journal(symbol, "BLOCK", self.state.last_signal, price, {"quote_size": quote_size})
             return
 
@@ -2335,14 +3506,14 @@ class PaperBot:
         if order_type in {"limit", "bracket", "native_stop_scaffold"}:
             order = coinbase_limit_order(
                 product_id=product_id,
-                side="BUY",
+                side="BUY" if not is_short else "SELL",
                 base_size=base_size,
                 limit_price=limit_price,
             )
         else:
             order = coinbase_market_order(
                 product_id=product_id,
-                side="BUY",
+                side="BUY" if not is_short else "SELL",
                 quote_size=quote_size,
             )
 
@@ -2351,7 +3522,7 @@ class PaperBot:
             order_id,
             symbol,
             product_id,
-            "BUY",
+            "BUY" if not is_short else "SELL",
             "ENTRY",
             order_type,
             price=limit_price if order_type != "market" else price,
@@ -2362,15 +3533,15 @@ class PaperBot:
                 "native_stop_requested": bool(settings.get("native_stop_enabled")) or order_type in {"bracket", "native_stop_scaffold"},
                 "stop_price": stop_price,
                 "exit_mode": exit_mode,
+                "is_short": is_short,
             },
         )
         fill = coinbase_reconcile_order(order_id)
         if self.apply_reconciled_order(managed, fill):
             return
         if fill["filled_size"] <= 0:
-            self.state.last_signal = f"LIVE BUY pending/unfilled: {order_id}"
+            self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} pending/unfilled: {order_id}"
             self.journal(symbol, "INFO", self.state.last_signal, price, {"order": order, "fill": fill})
-            return
 
     def live_sell(
         self,
@@ -2378,6 +3549,7 @@ class PaperBot:
         price: float,
         reason: str,
         quantity_override: float | None = None,
+        is_short: bool = False,
     ) -> None:
         settings = self.state.settings
         base_available = coinbase_available_balance(symbol)
@@ -2412,14 +3584,14 @@ class PaperBot:
             limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
             order = coinbase_limit_order(
                 product_id=product_id,
-                side="SELL",
+                side="SELL" if not is_short else "BUY",
                 base_size=base_size,
                 limit_price=price * (1 - limit_offset),
             )
         else:
             order = coinbase_market_order(
                 product_id=product_id,
-                side="SELL",
+                side="SELL" if not is_short else "BUY",
                 base_size=base_size,
             )
         order_id = coinbase_order_id(order)
@@ -2427,7 +3599,7 @@ class PaperBot:
             order_id,
             symbol,
             product_id,
-            "SELL",
+            "SELL" if not is_short else "BUY",
             "EXIT",
             order_type,
             price=price,
@@ -2436,13 +3608,13 @@ class PaperBot:
         )
         fill = coinbase_reconcile_order(order_id)
         if self.apply_reconciled_order(managed, fill):
-            if self.state.coin > 0 and bool(settings.get("native_stop_enabled")) and self.state.entry_price:
+            if abs(self.state.coin) > 0 and bool(settings.get("native_stop_enabled")) and self.state.entry_price:
                 self.submit_native_stop_for_position(
                     ManagedOrder(
                         order_id=order_id,
                         symbol=symbol,
                         product_id=product_id,
-                        side="SELL",
+                        side="SELL" if not is_short else "BUY",
                         role="EXIT",
                         order_type=order_type,
                         status="FILLED",
@@ -2457,7 +3629,8 @@ class PaperBot:
         if fill["filled_size"] <= 0:
             self.state.last_signal = f"LIVE SELL pending/unfilled: {order_id}"
             self.journal(symbol, "INFO", self.state.last_signal, price, {"order": order, "fill": fill})
-            return
+
+    # ─── Equity & Helpers ──────────────────────────────────────────
 
     def equity(self, price: float | None) -> float:
         if self.state.positions:
@@ -2465,7 +3638,8 @@ class PaperBot:
             for symbol, position in self.state.positions.items():
                 history = self.state.price_history.get(symbol, [])
                 current_price = history[-1] if history else price or float(position.get("entry_price", 0.0))
-                total += float(position.get("quantity", 0.0)) * current_price
+                quantity = float(position.get("quantity", 0.0))
+                total += quantity * current_price
             return total
         if not price:
             return self.state.cash
@@ -2482,6 +3656,7 @@ class PaperBot:
         if self.state.day_start_date != current_day:
             self.state.day_start_date = current_day
             self.state.day_start_equity = self.equity(price)
+            self.state.peak_equity = self.state.day_start_equity
 
     def roll_live_daily_spend_if_needed(self) -> None:
         current_day = today_key()
@@ -2489,6 +3664,239 @@ class PaperBot:
             self.state.live_day_start_date = current_day
             self.state.live_daily_spend = 0.0
 
+    # ─── Order Management ──────────────────────────────────────────
+
+    def track_order(
+        self,
+        order_id: str,
+        symbol: str,
+        product_id: str,
+        side: str,
+        role: str,
+        order_type: str,
+        price: float | None = None,
+        base_size: float | None = None,
+        quote_size: float | None = None,
+        reason: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> ManagedOrder:
+        now_text = now_iso()
+        order = ManagedOrder(
+            order_id=order_id,
+            symbol=symbol,
+            product_id=product_id,
+            side=side.upper(),
+            role=role,
+            order_type=order_type,
+            status="OPEN",
+            created_at=now_text,
+            updated_at=now_text,
+            expires_at=time.time() + int(self.state.settings.get("order_expiry_seconds", 180)),
+            price=price,
+            base_size=base_size,
+            quote_size=quote_size,
+            reason=reason,
+            details=details or {},
+        )
+        self.state.open_orders.append(order)
+        self.state.open_orders = self.state.open_orders[-120:]
+        self.audit("ORDER_TRACKED", order=asdict(order))
+        return order
+
+    def managed_order(self, order_id: str) -> ManagedOrder | None:
+        return next((item for item in self.state.open_orders if item.order_id == order_id), None)
+
+    def manage_open_orders(self) -> None:
+        for order in list(self.state.open_orders):
+            if order.status in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}:
+                continue
+
+            try:
+                fill = coinbase_reconcile_order(order.order_id)
+            except Exception as exc:
+                order.updated_at = now_iso()
+                order.status = "RECONCILE_ERROR"
+                self.audit("ORDER_RECONCILE_ERROR", order_id=order.order_id, error=str(exc))
+                logger.warning(f"Order reconcile error: {exc}")
+                continue
+
+            self.apply_reconciled_order(order, fill)
+            if order.status == "FILLED":
+                continue
+
+            if time.time() >= order.expires_at:
+                self.expire_order(order)
+
+    def apply_reconciled_order(self, order: ManagedOrder, fill: dict[str, Any]) -> bool:
+        order.updated_at = now_iso()
+        order.status = fill.get("status", "UNKNOWN")
+        if fill["filled_size"] <= 0 or order.local_applied:
+            return False
+
+        filled_price = fill["average_price"] or order.price or self.state.last_price or 0.0
+        is_short = order.details.get("is_short", False)
+
+        if order.role == "ENTRY":
+            filled_quote = (fill["filled_value"] or order.quote_size or 0.0) + fill["total_fee"]
+            self.state.live_daily_spend += min(order.quote_size or filled_quote, filled_quote)
+            self.paper_buy(
+                order.symbol,
+                filled_price,
+                f"LIVE {order.order_type.upper()} BUY filled {order.order_id} | {order.reason}",
+                spend_override=filled_quote,
+                fee_override=fill["total_fee"],
+                quantity_override=fill["filled_size"],
+                exchange_order_id=order.order_id,
+                exchange_order_status=order.status,
+                exchange_average_filled_price=filled_price,
+                stop_override=order.details.get("stop_price"),
+                target_override=order.details.get("target_price"),
+                is_short=is_short,
+            )
+            if order.details.get("native_stop_requested"):
+                self.submit_native_stop_for_position(order, filled_price)
+        elif order.role in {"EXIT", "STOP"}:
+            self.paper_sell(
+                order.symbol,
+                filled_price,
+                f"LIVE {order.role} filled {order.order_id} | {order.reason}",
+                quantity_override=fill["filled_size"],
+                fee_override=fill["total_fee"],
+                exchange_order_id=order.order_id,
+                exchange_order_status=order.status,
+                exchange_average_filled_price=filled_price,
+            )
+            if order.role == "STOP" and abs(self.state.coin) <= 0 and not self.state.positions:
+                self.state.active_stop_order_id = None
+
+        order.local_applied = True
+        order.status = "FILLED"
+        order.updated_at = now_iso()
+        self.audit("ORDER_FILLED_APPLIED", order=asdict(order), fill=fill)
+        return True
+
+    def expire_order(self, order: ManagedOrder) -> None:
+        try:
+            cancel_response = coinbase_cancel_orders([order.order_id])
+            order.status = "EXPIRED"
+            order.updated_at = now_iso()
+            if self.state.active_stop_order_id == order.order_id:
+                self.state.active_stop_order_id = None
+            self.audit("ORDER_EXPIRED_CANCELLED", order=asdict(order), cancel_response=cancel_response)
+        except Exception as exc:
+            order.status = "CANCEL_FAILED"
+            order.updated_at = now_iso()
+            self.audit("ORDER_EXPIRE_CANCEL_FAILED", order=asdict(order), error=str(exc))
+            logger.warning(f"Order expiry/cancel failed: {exc}")
+            return
+
+        if (
+            bool(self.state.settings.get("order_replace_enabled"))
+            and order.retry_count < int(self.state.settings.get("order_retry_limit", 1))
+            and order.role in {"ENTRY", "EXIT"}
+        ):
+            self.replace_order(order)
+
+    def replace_order(self, order: ManagedOrder) -> None:
+        try:
+            if order.order_type == "limit" and order.price and order.base_size:
+                replacement = coinbase_limit_order(
+                    product_id=order.product_id,
+                    side=order.side,
+                    base_size=order.base_size,
+                    limit_price=order.price,
+                )
+            elif order.side == "BUY" and order.quote_size:
+                replacement = coinbase_market_order(order.product_id, order.side, quote_size=order.quote_size)
+            elif order.base_size:
+                replacement = coinbase_market_order(order.product_id, order.side, base_size=order.base_size)
+            else:
+                return
+            replacement_id = coinbase_order_id(replacement)
+            new_order = self.track_order(
+                replacement_id,
+                order.symbol,
+                order.product_id,
+                order.side,
+                order.role,
+                order.order_type,
+                price=order.price,
+                base_size=order.base_size,
+                quote_size=order.quote_size,
+                reason=order.reason,
+                details=order.details,
+            )
+            new_order.retry_count = order.retry_count + 1
+            self.audit("ORDER_REPLACED", old_order_id=order.order_id, new_order_id=replacement_id)
+            logger.info(f"Order replaced: {order.order_id} → {replacement_id}")
+        except Exception as exc:
+            self.audit("ORDER_REPLACE_FAILED", order_id=order.order_id, error=str(exc))
+            logger.warning(f"Order replace failed: {exc}")
+
+    def submit_native_stop_for_position(self, entry_order: ManagedOrder, entry_price: float) -> None:
+        if abs(self.state.coin) <= 0:
+            return
+        stop_price = float(entry_order.details.get("stop_price") or 0.0)
+        exit_mode = str(entry_order.details.get("exit_mode") or "fixed")
+        if stop_price <= 0:
+            candles = closes_to_candles(self.state.price_history.get(entry_order.symbol, []))
+            stop_price, _, exit_mode = exit_prices(entry_price, candles, self.state.settings)
+        stop_order = coinbase_stop_limit_order(
+            product_id=entry_order.product_id,
+            side="SELL" if not self.state.is_short else "BUY",
+            base_size=abs(self.state.coin),
+            stop_price=stop_price,
+            limit_price=stop_price * 0.995,
+        )
+        stop_order_id = coinbase_order_id(stop_order)
+        self.state.active_stop_order_id = stop_order_id
+        self.track_order(
+            stop_order_id,
+            entry_order.symbol,
+            entry_order.product_id,
+            "SELL" if not self.state.is_short else "BUY",
+            "STOP",
+            "stop_limit",
+            price=stop_price,
+            base_size=abs(self.state.coin),
+            reason=f"{exit_mode} native stop",
+            details={"entry_order_id": entry_order.order_id},
+        )
+        self.journal(
+            entry_order.symbol,
+            "INFO",
+            f"Native stop-limit submitted {stop_order_id} via {exit_mode} stop",
+            stop_price,
+            {"entry_order_id": entry_order.order_id, "stop_order": stop_order},
+        )
+        logger.info(f"Native stop submitted: {stop_order_id} at {stop_price:.6f}")
+
+    def sync_native_stop_fill(self) -> None:
+        if not self.state.active_stop_order_id or not self.state.active_symbol:
+            return
+        stop_order_id = self.state.active_stop_order_id
+        fill = coinbase_reconcile_order(stop_order_id)
+        if fill["filled_size"] <= 0:
+            return
+
+        symbol = self.state.active_symbol
+        filled_price = fill["average_price"] or self.state.last_price or 0.0
+        self.paper_sell(
+            symbol,
+            filled_price,
+            f"NATIVE STOP filled {stop_order_id}",
+            quantity_override=fill["filled_size"],
+            fee_override=fill["total_fee"],
+            exchange_order_id=stop_order_id,
+            exchange_order_status=fill["status"],
+            exchange_average_filled_price=filled_price,
+        )
+        if abs(self.state.coin) <= 0 and not self.state.positions:
+            self.state.active_stop_order_id = None
+        logger.info(f"Native stop filled: {stop_order_id}")
+
+
+# ─── Helper functions ────────────────────────────────────────────
 
 def fetch_price(exchange: str, symbol: str, quote_currency: str) -> float:
     exchange = exchange.lower()
@@ -2710,6 +4118,7 @@ def fetch_candles(
 
     if asset_class == "forex":
         if exchange == "oanda_demo":
+            oanda_symbol = symbol.replace("_", "")  # Remove underscores
             return fetch_oanda_demo_candles(symbol, granularity, candle_count)
         return fetch_forex_demo_candles(symbol, granularity, candle_count)
 
@@ -2728,91 +4137,77 @@ def forex_pip_size(symbol: str) -> float:
 
 
 def normalize_forex_symbol(symbol: str) -> str:
+    """Convert OANDA instrument names to standard format."""
+    # Remove underscores and slashes
     normalized = symbol.upper().replace("/", "").replace("-", "").replace("_", "").strip()
-    aliases = {
-        "GPB": "GBP",
-    }
-    for wrong, correct in aliases.items():
-        if normalized.startswith(wrong):
-            normalized = correct + normalized[len(wrong):]
     return normalized
 
 
-def oanda_instrument(symbol: str) -> str:
-    symbol = normalize_forex_symbol(symbol)
-    if len(symbol) != 6:
-        raise RuntimeError("OANDA forex pairs must be six-letter symbols like EURUSD")
-    return f"{symbol[:3]}_{symbol[3:]}"
-
-
-def oanda_symbol(instrument: str) -> str:
-    return instrument.upper().replace("_", "")
-
-
-def oanda_granularity(seconds: int | float) -> str:
-    seconds = int(seconds)
-    mapping = {
-        60: "M1",
-        300: "M5",
-        900: "M15",
-        3600: "H1",
-        21600: "H6",
-        86400: "D",
-    }
-    if seconds not in mapping:
-        raise RuntimeError("OANDA demo supports 1m, 5m, 15m, 1h, 6h, and 1d candles")
-    return mapping[seconds]
-
-
-def oanda_api_base() -> str:
-    if os.environ.get("OANDA_API_BASE", "").strip():
-        return os.environ["OANDA_API_BASE"].strip().rstrip("/")
-    environment = os.environ.get("OANDA_ENV", "practice").strip().lower()
-    if environment == "live":
-        return "https://api-fxtrade.oanda.com"
-    return "https://api-fxpractice.oanda.com"
-
+# ─── Simplified OANDA Configuration ──────────────────────────────
 
 def oanda_account_id() -> str:
+    """Get OANDA account ID from environment."""
     return os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 
 
 def oanda_api_token() -> str:
+    """Get OANDA API token from environment."""
     return os.environ.get("OANDA_API_TOKEN", "").strip()
 
 
 def oanda_is_configured() -> bool:
+    """Check if OANDA credentials are configured."""
     return bool(oanda_account_id() and oanda_api_token())
 
 
 def oanda_is_practice() -> bool:
-    return (
-        os.environ.get("OANDA_ENV", "practice").strip().lower() == "practice"
-        and oanda_api_base() == "https://api-fxpractice.oanda.com"
-    )
+    """Check if we're using the practice environment."""
+    env = os.environ.get("OANDA_ENV", "practice").strip().lower()
+    return env == "practice"
+
+
+def oanda_api_base() -> str:
+    """Get the OANDA API base URL."""
+    # Check if explicitly set
+    if os.environ.get("OANDA_API_BASE", "").strip():
+        return os.environ["OANDA_API_BASE"].strip().rstrip("/")
+
+    # Check the environment
+    env = os.environ.get("OANDA_ENV", "practice").strip().lower()
+
+    if env == "live":
+        return "https://api-fxtrade.oanda.com"
+    return "https://api-fxpractice.oanda.com"
 
 
 def oanda_demo_orders_armed() -> bool:
-    return (
-        oanda_is_configured()
-        and oanda_is_practice()
-        and os.environ.get("OANDA_DEMO_TRADING_ENABLED", "").strip().lower() == "true"
-    )
+    """
+    Check if OANDA order placement is enabled.
+    """
+    # Check 1: Is the API configured?
+    if not oanda_is_configured():
+        return False
+
+    # Check 2: Is order placement enabled?
+    if os.environ.get("OANDA_DEMO_TRADING_ENABLED", "").strip().lower() != "true":
+        return False
+
+    return True
 
 
 def oanda_demo_status_message() -> str:
+    """Get a status message about OANDA configuration."""
     missing = []
     if not oanda_account_id():
         missing.append("OANDA_ACCOUNT_ID")
     if not oanda_api_token():
         missing.append("OANDA_API_TOKEN")
-    if not oanda_is_practice():
-        missing.append("OANDA_ENV=practice and OANDA_API_BASE=https://api-fxpractice.oanda.com")
     if os.environ.get("OANDA_DEMO_TRADING_ENABLED", "").strip().lower() != "true":
         missing.append("OANDA_DEMO_TRADING_ENABLED=true")
     if missing:
-        return "OANDA demo order placement locked. Missing: " + ", ".join(missing)
-    return "OANDA demo order placement armed for practice account only."
+        return "OANDA order placement locked. Missing: " + ", ".join(missing)
+    env = "practice" if oanda_is_practice() else "live"
+    return f"OANDA order placement armed for {env} account."
 
 
 def oanda_request(
@@ -2848,6 +4243,33 @@ def oanda_request(
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OANDA API error {exc.code}: {body}") from exc
+
+
+def oanda_instrument(symbol: str) -> str:
+    """Convert standard symbol to OANDA instrument format."""
+    symbol = normalize_forex_symbol(symbol)
+    if len(symbol) != 6:
+        raise RuntimeError("OANDA forex pairs must be six-letter symbols like EURUSD")
+    return f"{symbol[:3]}_{symbol[3:]}"
+
+
+def oanda_symbol(instrument: str) -> str:
+    return instrument.upper().replace("_", "")
+
+
+def oanda_granularity(seconds: int | float) -> str:
+    seconds = int(seconds)
+    mapping = {
+        60: "M1",
+        300: "M5",
+        900: "M15",
+        3600: "H1",
+        21600: "H6",
+        86400: "D",
+    }
+    if seconds not in mapping:
+        raise RuntimeError("OANDA demo supports 1m, 5m, 15m, 1h, 6h, and 1d candles")
+    return mapping[seconds]
 
 
 def parse_oanda_time(value: str) -> int:
@@ -3122,8 +4544,15 @@ def run_backtest_for_symbol(
     candles: list[Candle],
     settings: dict[str, Any],
 ) -> dict[str, Any]:
+
+    if settings.get("strategy") == "opening_range":
+        return run_opening_range_backtest(symbol, candles, settings)
+
     if settings.get("strategy") == "ewo_offset":
         return run_ewo_offset_backtest_for_symbol(symbol, candles, settings)
+
+    if settings.get("strategy") == "ema_golden_cross":
+        return run_ema_golden_cross_backtest(symbol, candles, settings)
 
     starting_cash = float(settings["starting_cash"])
     cash = starting_cash
@@ -3284,6 +4713,373 @@ def run_backtest_for_symbol(
     }
 
 
+def run_opening_range_backtest(
+    symbol: str,
+    candles: list[Candle],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Backtest the Opening Range strategy with both long and short support."""
+    starting_cash = float(settings["starting_cash"])
+    cash = starting_cash
+    coin = 0.0
+    entry_price: float | None = None
+    highest_price: float | None = None
+    partial_done = False
+    trade_fee = float(settings["trade_fee"])
+    slippage = float(settings.get("backtest_slippage_pct", 0.0)) / 100
+    trades: list[dict[str, Any]] = []
+    equity_curve: list[float] = []
+    peak_equity = starting_cash
+    max_drawdown_pct = 0.0
+    allow_short = settings.get("allow_short_selling", False)
+
+    days: dict[str, list[Candle]] = {}
+    for candle in candles:
+        date_key = datetime.fromtimestamp(candle.time, tz=timezone.utc).strftime("%Y-%m-%d")
+        days.setdefault(date_key, []).append(candle)
+
+    for date_key, day_candles in days.items():
+        if len(day_candles) < int(settings.get("opening_range_atr_period", 14)) + 1:
+            continue
+
+        first_candle = day_candles[0]
+        is_green = first_candle.close > first_candle.open
+        candle_range = first_candle.high - first_candle.low
+
+        atr = 0.0
+        prev_days = list(days.keys())
+        idx = prev_days.index(date_key)
+        if idx >= int(settings.get("opening_range_atr_period", 14)):
+            prev_candles = []
+            for prev_date in prev_days[idx - int(settings.get("opening_range_atr_period", 14)):idx]:
+                prev_candles.extend(days[prev_date])
+            if prev_candles:
+                atr = calculate_atr_from_candles(prev_candles, int(settings.get("opening_range_atr_period", 14)))
+
+        if atr == 0:
+            atr = candle_range
+
+        manipulation_threshold = float(settings.get("opening_range_manipulation_threshold", 0.20))
+        range_ratio = candle_range / atr if atr > 0 else 0
+        manipulation = range_ratio < manipulation_threshold
+        is_blowoff = range_ratio >= manipulation_threshold
+
+        trigger = first_candle.high if is_green else first_candle.low
+        stop_loss_mult = float(settings.get("opening_range_stop_loss_atr_multiplier", 1.5))
+        take_profit_mult = float(settings.get("opening_range_take_profit_atr_multiplier", 2.5))
+
+        # ─── CLOSE EXISTING POSITION AT END OF DAY ───
+        if coin != 0:
+            close_price = day_candles[-1].close
+            gross = abs(coin) * close_price
+            fee = gross * trade_fee
+            if coin > 0:
+                cash += gross - fee
+                trades.append({
+                    "time": day_candles[-1].time,
+                    "side": "SELL",
+                    "symbol": symbol,
+                    "price": close_price,
+                    "quantity": abs(coin),
+                    "cash_after": cash,
+                    "reason": "End of day close (long)",
+                    "fee_paid": fee,
+                })
+            else:
+                cash += gross - fee
+                trades.append({
+                    "time": day_candles[-1].time,
+                    "side": "BUY",
+                    "symbol": symbol,
+                    "price": close_price,
+                    "quantity": abs(coin),
+                    "cash_after": cash,
+                    "reason": "End of day close (short)",
+                    "fee_paid": fee,
+                })
+            coin = 0.0
+            entry_price = None
+
+        if manipulation:
+            # ─── BULLISH MANIPULATION ───
+            if is_green:
+                for candle in day_candles[1:]:
+                    if candle.close > trigger:
+                        entry = trigger
+                        stop = entry - (atr * stop_loss_mult)
+                        target = entry + (atr * take_profit_mult)
+                        break
+                else:
+                    continue
+
+                spend, spend_reason = position_spend(cash, entry, day_candles, settings)
+                spend = min(spend, cash)
+                if spend >= float(settings.get("min_order_value", 1.0)):
+                    fill_price = apply_slippage(entry, "BUY", slippage)
+                    fee_paid = spend * trade_fee
+                    coin = (spend - fee_paid) / fill_price
+                    cash -= spend
+                    entry_price = fill_price
+                    highest_price = fill_price
+                    trades.append({
+                        "time": first_candle.time,
+                        "side": "BUY",
+                        "symbol": symbol,
+                        "price": fill_price,
+                        "quantity": coin,
+                        "cash_after": cash,
+                        "reason": f"Opening Range BUY | {spend_reason}",
+                        "fee_paid": fee_paid,
+                    })
+
+                    # Check stop/target within the day
+                    for candle in day_candles:
+                        price = candle.close
+                        if price <= stop and stop > 0:
+                            gross = coin * price
+                            fee = gross * trade_fee
+                            cash += gross - fee
+                            trades.append({
+                                "time": candle.time,
+                                "side": "SELL",
+                                "symbol": symbol,
+                                "price": price,
+                                "quantity": coin,
+                                "cash_after": cash,
+                                "reason": "Stop loss hit (long)",
+                                "fee_paid": fee,
+                            })
+                            coin = 0.0
+                            entry_price = None
+                            break
+                        elif price >= target and target > 0:
+                            gross = coin * price
+                            fee = gross * trade_fee
+                            cash += gross - fee
+                            trades.append({
+                                "time": candle.time,
+                                "side": "SELL",
+                                "symbol": symbol,
+                                "price": price,
+                                "quantity": coin,
+                                "cash_after": cash,
+                                "reason": "Take profit hit (long)",
+                                "fee_paid": fee,
+                            })
+                            coin = 0.0
+                            entry_price = None
+                            break
+
+            # ─── BEARISH MANIPULATION (SHORT) ───
+            elif allow_short:
+                for candle in day_candles[1:]:
+                    if candle.close < trigger:
+                        entry = trigger
+                        stop = entry + (atr * stop_loss_mult)
+                        target = entry - (atr * take_profit_mult)
+                        break
+                else:
+                    continue
+
+                spend, spend_reason = position_spend(cash, entry, day_candles, settings)
+                spend = min(spend, cash)
+                if spend >= float(settings.get("min_order_value", 1.0)):
+                    fill_price = apply_slippage(entry, "SELL", slippage)
+                    fee_paid = spend * trade_fee
+                    coin = -(spend - fee_paid) / fill_price
+                    cash += spend
+                    entry_price = fill_price
+                    highest_price = fill_price
+                    trades.append({
+                        "time": first_candle.time,
+                        "side": "SHORT",
+                        "symbol": symbol,
+                        "price": fill_price,
+                        "quantity": abs(coin),
+                        "cash_after": cash,
+                        "reason": f"Opening Range SHORT | {spend_reason}",
+                        "fee_paid": fee_paid,
+                    })
+
+                    # Check stop/target within the day
+                    for candle in day_candles:
+                        price = candle.close
+                        if price >= stop and stop > 0:
+                            gross = abs(coin) * price
+                            fee = gross * trade_fee
+                            cash += gross - fee
+                            trades.append({
+                                "time": candle.time,
+                                "side": "BUY",
+                                "symbol": symbol,
+                                "price": price,
+                                "quantity": abs(coin),
+                                "cash_after": cash,
+                                "reason": "Stop loss hit (short)",
+                                "fee_paid": fee,
+                            })
+                            coin = 0.0
+                            entry_price = None
+                            break
+                        elif price <= target and target > 0:
+                            gross = abs(coin) * price
+                            fee = gross * trade_fee
+                            cash += gross - fee
+                            trades.append({
+                                "time": candle.time,
+                                "side": "BUY",
+                                "symbol": symbol,
+                                "price": price,
+                                "quantity": abs(coin),
+                                "cash_after": cash,
+                                "reason": "Take profit hit (short)",
+                                "fee_paid": fee,
+                            })
+                            coin = 0.0
+                            entry_price = None
+                            break
+
+        elif is_blowoff:
+            # Blow-off candles – wait for pullback
+            if is_green and allow_short:
+                # Bullish blow-off – wait for pullback to entry
+                for candle in day_candles[1:]:
+                    # Look for pullback to at least 50% of the move
+                    if candle.close < first_candle.open:
+                        entry = candle.close
+                        stop = entry - (atr * stop_loss_mult)
+                        target = entry + (atr * take_profit_mult * 1.5)
+                        break
+                else:
+                    continue
+
+                spend, spend_reason = position_spend(cash, entry, day_candles, settings)
+                spend = min(spend, cash)
+                if spend >= float(settings.get("min_order_value", 1.0)):
+                    fill_price = apply_slippage(entry, "BUY", slippage)
+                    fee_paid = spend * trade_fee
+                    coin = (spend - fee_paid) / fill_price
+                    cash -= spend
+                    entry_price = fill_price
+                    highest_price = fill_price
+                    trades.append({
+                        "time": first_candle.time,
+                        "side": "BUY",
+                        "symbol": symbol,
+                        "price": fill_price,
+                        "quantity": coin,
+                        "cash_after": cash,
+                        "reason": f"Blow-off pullback BUY | {spend_reason}",
+                        "fee_paid": fee_paid,
+                    })
+
+                    for candle in day_candles:
+                        price = candle.close
+                        if price <= stop and stop > 0:
+                            gross = coin * price
+                            fee = gross * trade_fee
+                            cash += gross - fee
+                            trades.append({
+                                "time": candle.time,
+                                "side": "SELL",
+                                "symbol": symbol,
+                                "price": price,
+                                "quantity": coin,
+                                "cash_after": cash,
+                                "reason": "Stop loss hit (blow-off)",
+                                "fee_paid": fee,
+                            })
+                            coin = 0.0
+                            entry_price = None
+                            break
+                        elif price >= target and target > 0:
+                            gross = coin * price
+                            fee = gross * trade_fee
+                            cash += gross - fee
+                            trades.append({
+                                "time": candle.time,
+                                "side": "SELL",
+                                "symbol": symbol,
+                                "price": price,
+                                "quantity": coin,
+                                "cash_after": cash,
+                                "reason": "Take profit hit (blow-off)",
+                                "fee_paid": fee,
+                            })
+                            coin = 0.0
+                            entry_price = None
+                            break
+
+    final_price = candles[-1].close if candles else 0.0
+    final_equity = cash + (coin * final_price)
+    total_pnl = final_equity - starting_cash
+    total_pnl_pct = pct(total_pnl, starting_cash)
+    sells = [trade for trade in trades if trade["side"] in ["SELL", "BUY"]]
+    wins = 0
+    losses = 0
+
+    for index, trade in enumerate(trades):
+        if trade["side"] == "SELL":
+            buy_trade = next(
+                (prior for prior in reversed(trades[:index]) if prior["side"] == "BUY" and prior["symbol"] == trade["symbol"]),
+                None
+            )
+            if buy_trade and trade["price"] > buy_trade["price"]:
+                wins += 1
+            else:
+                losses += 1
+        elif trade["side"] == "SHORT":
+            buy_trade = next(
+                (prior for prior in reversed(trades[:index]) if prior["side"] == "SHORT" and prior["symbol"] == trade["symbol"]),
+                None
+            )
+            if buy_trade and trade["price"] < buy_trade["price"]:
+                wins += 1
+            else:
+                losses += 1
+
+    return {
+        "symbol": symbol,
+        "candles": len(candles),
+        "start_price": candles[0].close if candles else None,
+        "end_price": final_price,
+        "final_equity": round(final_equity, 8),
+        "total_pnl": round(total_pnl, 8),
+        "total_pnl_pct": total_pnl_pct,
+        "max_drawdown_pct": round(max_drawdown_pct, 4),
+        "trades_count": len(trades),
+        "closed_trades": len([t for t in trades if t["side"] in ["SELL", "BUY"]]),
+        "win_rate": round((wins / (wins + losses)) * 100, 2) if (wins + losses) > 0 else 0.0,
+        "slippage_pct": float(settings.get("backtest_slippage_pct", 0.0)),
+        "open_position": coin != 0,
+        "trades": trades[-80:][::-1],
+        "equity_curve": [round(item, 8) for item in equity_curve[-300:]],
+    }
+
+
+def calculate_atr_from_candles(candles: list[Candle], period: int) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high = candles[i].high
+        low = candles[i].low
+        prev_close = candles[i-1].close
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        true_ranges.append(tr)
+
+    if not true_ranges:
+        return 0.0
+
+    recent_tr = true_ranges[-period:]
+    return sum(recent_tr) / len(recent_tr)
+
+
 def run_ewo_offset_backtest_for_symbol(
     symbol: str,
     candles: list[Candle],
@@ -3436,6 +5232,191 @@ def run_ewo_offset_backtest_for_symbol(
         "equity_curve": [round(item, 8) for item in equity_curve[-300:]],
     }
 
+def run_ema_golden_cross_backtest(
+    symbol: str,
+    candles: list[Candle],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Backtest the EMA Golden Cross strategy."""
+    starting_cash = float(settings["starting_cash"])
+    cash = starting_cash
+    coin = 0.0
+    entry_price: float | None = None
+    highest_price: float | None = None
+    partial_done = False
+    trade_fee = float(settings["trade_fee"])
+    slippage = float(settings.get("backtest_slippage_pct", 0.0)) / 100
+    ema_short = int(settings.get("ema_short", 50))
+    ema_long = int(settings.get("ema_long", 200))
+    trade_start_time = int(settings.get("trade_start_time", 0))
+    closes: list[float] = []
+    trades: list[dict[str, Any]] = []
+    equity_curve: list[float] = []
+    peak_equity = starting_cash
+    max_drawdown_pct = 0.0
+
+    for index, candle in enumerate(candles):
+        price = candle.close
+        closes.append(price)
+        active_candles = candles[:index + 1]
+
+        equity = cash + (coin * price)
+        peak_equity = max(peak_equity, equity)
+        if peak_equity > 0:
+            drawdown_pct = ((equity - peak_equity) / peak_equity) * 100
+            max_drawdown_pct = min(max_drawdown_pct, drawdown_pct)
+        equity_curve.append(equity)
+
+        if len(closes) < ema_long + 1:
+            continue
+
+        ema_short_value = ema(closes, ema_short)
+        ema_long_value = ema(closes, ema_long)
+        ema_short_prev = ema(closes[:-1], ema_short)
+        ema_long_prev = ema(closes[:-1], ema_long)
+
+        if None in (ema_short_value, ema_long_value, ema_short_prev, ema_long_prev):
+            continue
+
+        can_trade = candle.time >= trade_start_time
+
+        # Check for exit (Death Cross)
+        if can_trade and coin > 0 and entry_price:
+            if ema_short_prev >= ema_long_prev and ema_short_value < ema_long_value:
+                sold_quantity = coin
+                fill_price = apply_slippage(price, "SELL", slippage)
+                gross = sold_quantity * fill_price
+                fee_paid = gross * trade_fee
+                cash += gross - fee_paid
+                trades.append({
+                    "time": candle.time,
+                    "side": "SELL",
+                    "symbol": symbol,
+                    "price": fill_price,
+                    "quantity": sold_quantity,
+                    "cash_after": cash,
+                    "reason": "Death Cross (EMA crossed down)",
+                    "fee_paid": fee_paid,
+                })
+                coin = 0.0
+                entry_price = None
+                highest_price = None
+                continue
+
+            # Also check stop loss and take profit
+            stop_price, target_price, exit_mode = exit_prices(
+                entry_price=entry_price,
+                candles=active_candles,
+                settings=settings,
+            )
+            highest_price = max(highest_price or price, price)
+
+            if price <= stop_price:
+                sold_quantity = coin
+                fill_price = apply_slippage(price, "SELL", slippage)
+                gross = sold_quantity * fill_price
+                fee_paid = gross * trade_fee
+                cash += gross - fee_paid
+                trades.append({
+                    "time": candle.time,
+                    "side": "SELL",
+                    "symbol": symbol,
+                    "price": fill_price,
+                    "quantity": sold_quantity,
+                    "cash_after": cash,
+                    "reason": f"Stop loss hit ({exit_mode})",
+                    "fee_paid": fee_paid,
+                })
+                coin = 0.0
+                entry_price = None
+                highest_price = None
+                continue
+            elif price >= target_price:
+                sold_quantity = coin
+                fill_price = apply_slippage(price, "SELL", slippage)
+                gross = sold_quantity * fill_price
+                fee_paid = gross * trade_fee
+                cash += gross - fee_paid
+                trades.append({
+                    "time": candle.time,
+                    "side": "SELL",
+                    "symbol": symbol,
+                    "price": fill_price,
+                    "quantity": sold_quantity,
+                    "cash_after": cash,
+                    "reason": f"Take profit hit ({exit_mode})",
+                    "fee_paid": fee_paid,
+                })
+                coin = 0.0
+                entry_price = None
+                highest_price = None
+                continue
+
+        # Check for entry (Golden Cross)
+        if can_trade and coin == 0:
+            if ema_short_prev <= ema_long_prev and ema_short_value > ema_long_value:
+                spend, spend_reason = position_spend(cash, price, active_candles, settings)
+                spend = min(spend, cash)
+                if spend >= float(settings.get("min_order_value", 1.0)):
+                    fill_price = apply_slippage(price, "BUY", slippage)
+                    fee_paid = spend * trade_fee
+                    coin = (spend - fee_paid) / fill_price
+                    cash -= spend
+                    entry_price = fill_price
+                    highest_price = fill_price
+                    partial_done = False
+                    trades.append({
+                        "time": candle.time,
+                        "side": "BUY",
+                        "symbol": symbol,
+                        "price": fill_price,
+                        "quantity": coin,
+                        "cash_after": cash,
+                        "reason": f"Golden Cross (EMA {ema_short}/{ema_long})",
+                        "fee_paid": fee_paid,
+                    })
+
+    final_price = candles[-1].close if candles else 0.0
+    final_equity = cash + (coin * final_price)
+    total_pnl = final_equity - starting_cash
+    total_pnl_pct = pct(total_pnl, starting_cash)
+    sells = [trade for trade in trades if trade["side"] == "SELL"]
+    wins = 0
+    losses = 0
+
+    for index, trade in enumerate(trades):
+        if trade["side"] != "SELL":
+            continue
+        buy_trade = next(
+            (
+                prior for prior in reversed(trades[:index])
+                if prior["side"] == "BUY" and prior["symbol"] == trade["symbol"]
+            ),
+            None,
+        )
+        if buy_trade and trade["price"] > buy_trade["price"]:
+            wins += 1
+        else:
+            losses += 1
+
+    return {
+        "symbol": symbol,
+        "candles": len(candles),
+        "start_price": candles[0].close if candles else None,
+        "end_price": final_price,
+        "final_equity": round(final_equity, 8),
+        "total_pnl": round(total_pnl, 8),
+        "total_pnl_pct": total_pnl_pct,
+        "max_drawdown_pct": round(max_drawdown_pct, 4),
+        "trades_count": len(trades),
+        "closed_trades": len(sells),
+        "win_rate": round((wins / len(sells)) * 100, 2) if sells else 0.0,
+        "slippage_pct": float(settings.get("backtest_slippage_pct", 0.0)),
+        "open_position": coin > 0,
+        "trades": trades[-80:][::-1],
+        "equity_curve": [round(item, 8) for item in equity_curve[-300:]],
+    }
+
 
 def run_backtest(settings: dict[str, Any]) -> dict[str, Any]:
     settings = backtest_runtime_settings(settings)
@@ -3467,6 +5448,7 @@ def run_backtest(settings: dict[str, Any]) -> dict[str, Any]:
             results.append(run_backtest_for_symbol(symbol, candles, settings))
         except Exception as exc:
             errors.append(f"{symbol}: {exc}")
+            logger.warning(f"Backtest error for {symbol}: {exc}")
 
     results.sort(key=lambda item: item["total_pnl_pct"], reverse=True)
     return {
@@ -3750,6 +5732,9 @@ def backtest_runtime_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "support_stop_buffer_pct": (1.0, 0.1),
         "resistance_target_buffer_pct": (0.2, 0.05),
         "sr_zone_tolerance_pct": (0.3, 0.15),
+        "opening_range_manipulation_threshold": (0.5, 0.30),
+        "opening_range_stop_loss_atr_multiplier": (2.0, 0.8),
+        "opening_range_take_profit_atr_multiplier": (3.0, 1.2),
     }
     for key, (crypto_threshold, forex_value) in forex_caps.items():
         try:
@@ -3766,13 +5751,18 @@ def no_train_trades_message(settings: dict[str, Any]) -> str:
         return "No train-window trades found"
     if settings.get("strategy") == "ewo_offset":
         return (
-            "No train-window trades found; EWO/Freqtrade mode can be very strict on forex. "
+            "No train-window trades found; EWO/Freqtrade mode can be very strict on forex."
             "Try SMA Cross, more candles, or looser EWO/offset settings."
         )
     if settings.get("use_sr_filter"):
         return (
             "No train-window trades found; forex S/R filters may still be too tight. "
             "Try more candles or lower the S/R confirmation/range requirements."
+        )
+    if settings.get("strategy") == "opening_range":
+        return (
+            "No train-window trades found; Opening Range strategy needs at least 2 days of data "
+            "and clear breakouts. Try more candles or a smaller timeframe."
         )
     return "No train-window trades found; try more candles or a faster signal window"
 
@@ -3800,6 +5790,14 @@ def result_settings_summary(symbol: str, settings: dict[str, Any]) -> dict[str, 
             "ewo_low": float(settings["ewo_low"]),
             "rsi_buy": int(settings["rsi_buy"]),
         })
+    if settings.get("strategy") == "opening_range":
+        summary.update({
+            "opening_range_minutes": int(settings["opening_range_minutes"]),
+            "opening_range_atr_period": int(settings["opening_range_atr_period"]),
+            "opening_range_manipulation_threshold": float(settings["opening_range_manipulation_threshold"]),
+            "opening_range_stop_loss_atr_multiplier": float(settings["opening_range_stop_loss_atr_multiplier"]),
+            "opening_range_take_profit_atr_multiplier": float(settings["opening_range_take_profit_atr_multiplier"]),
+        })
     return summary
 
 
@@ -3813,10 +5811,15 @@ def run_walk_forward(settings: dict[str, Any]) -> dict[str, Any]:
     candle_count = int(settings.get("candle_count", 300))
     train_pct = float(settings.get("train_pct", 0.7))
     train_pct = min(0.85, max(0.5, train_pct))
-    if settings.get("strategy") == "ewo_offset":
+
+    strategy = settings.get("strategy", "sma_cross")
+    if strategy == "ewo_offset":
         candidates = ewo_offset_candidate_settings(settings)
+    elif strategy == "opening_range":
+        candidates = opening_range_candidate_settings(settings)
     else:
         candidates = optimizer_candidate_settings(settings)
+
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     combinations_tested = 0
@@ -3910,6 +5913,55 @@ def run_walk_forward(settings: dict[str, Any]) -> dict[str, Any]:
         "best": results[0] if results else None,
         "errors": errors,
     }
+
+
+def opening_range_candidate_settings(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    forex = is_forex_settings(settings)
+
+    if forex:
+        manipulation_thresholds = [0.15, 0.25, 0.35]
+        stop_multipliers = [0.5, 0.8, 1.2]
+        target_multipliers = [1.0, 1.5, 2.0]
+    else:
+        manipulation_thresholds = [0.15, 0.20, 0.30]
+        stop_multipliers = [1.0, 1.5, 2.0]
+        target_multipliers = [2.0, 2.5, 3.0]
+
+    atr_periods = [10, 14, 20]
+    opening_minutes = [15, 30, 60]
+
+    candidates: list[dict[str, Any]] = []
+
+    for threshold in manipulation_thresholds:
+        for stop_mult in stop_multipliers:
+            for target_mult in target_multipliers:
+                for atr_period in atr_periods:
+                    for opening_min in opening_minutes:
+                        candidates.append({
+                            **settings,
+                            "strategy": "opening_range",
+                            "opening_range_minutes": opening_min,
+                            "opening_range_atr_period": atr_period,
+                            "opening_range_manipulation_threshold": threshold,
+                            "opening_range_stop_loss_atr_multiplier": stop_mult,
+                            "opening_range_take_profit_atr_multiplier": target_mult,
+                        })
+
+    return candidates
+
+
+def strategy_minimum_candles(settings: dict[str, Any]) -> int:
+    if settings.get("strategy") == "ewo_offset":
+        return max(
+            205,
+            int(settings.get("base_nb_candles_buy", 14)) + 1,
+            int(settings.get("base_nb_candles_sell", 24)) + 1,
+        )
+    if settings.get("strategy") == "opening_range":
+        return max(48, int(settings.get("opening_range_atr_period", 14)) + 2)
+    if settings.get("strategy") == "ema_golden_cross":
+        return int(settings.get("ema_long", 200)) + 1
+    return int(settings["long_window"]) + 1
 
 
 def fetch_json(url: str, timeout: int = 10) -> dict[str, Any]:
@@ -4112,7 +6164,7 @@ def diagnostics() -> dict[str, Any]:
     accounts_path = "/api/v3/brokerage/accounts"
     return {
         "ok": True,
-        "server": "crypto-paper-bot",
+        "server": "Auxo",
         "dotenv_file_present": ENV_FILE.exists(),
         "dotenv_loaded_keys": sorted(DOTENV_LOADED_KEYS),
         "audit_log_file": str(AUDIT_LOG_FILE),
@@ -4139,6 +6191,7 @@ def diagnostics() -> dict[str, Any]:
         ),
         "cryptography_available": CRYPTOGRAPHY_AVAILABLE,
         "websocket_client_available": WEBSOCKET_AVAILABLE,
+        "requests_available": REQUESTS_AVAILABLE,
         "live_status": coinbase_live_status_message(),
         "coinbase_signed_uri_example": f"GET api.coinbase.com{accounts_path}",
     }
@@ -4313,6 +6366,30 @@ def coinbase_order_id(response: dict[str, Any]) -> str:
 def decimal_text(value: float, places: int) -> str:
     return f"{value:.{places}f}".rstrip("0").rstrip(".")
 
+def ema(values: list[float], window: int) -> float | None:
+    """Calculate Exponential Moving Average."""
+    if len(values) < window:
+        return None
+    multiplier = 2 / (window + 1)
+    ema_value = sum(values[:window]) / window
+    for price in values[window:]:
+        ema_value = (price - ema_value) * multiplier + ema_value
+    return ema_value
+
+
+def ema_series(values: list[float], window: int) -> list[float | None]:
+    """Calculate Exponential Moving Average for entire series."""
+    if len(values) < window:
+        return [None for _ in values]
+    multiplier = 2 / (window + 1)
+    result: list[float | None] = [None] * (window - 1)
+    ema_value = sum(values[:window]) / window
+    result.append(ema_value)
+    for price in values[window:]:
+        ema_value = (price - ema_value) * multiplier + ema_value
+        result.append(ema_value)
+    return result
+
 
 def sma(values: list[float], window: int) -> float | None:
     if len(values) < window:
@@ -4410,16 +6487,6 @@ def closes_to_candles(closes: list[float]) -> list[Candle]:
         Candle(time=index, open=price, high=price, low=price, close=price, volume=1.0)
         for index, price in enumerate(closes)
     ]
-
-
-def strategy_minimum_candles(settings: dict[str, Any]) -> int:
-    if settings.get("strategy") == "ewo_offset":
-        return max(
-            205,
-            int(settings.get("base_nb_candles_buy", 14)) + 1,
-            int(settings.get("base_nb_candles_sell", 24)) + 1,
-        )
-    return int(settings["long_window"]) + 1
 
 
 def support_resistance(candles: list[Candle], settings: dict[str, Any]) -> dict[str, Any]:
@@ -4733,27 +6800,37 @@ def open_trade_risk(
     chart_levels: dict[str, Any],
     price: float | None,
 ) -> dict[str, Any] | None:
-    if not state.active_symbol or not state.entry_price or state.coin <= 0 or not price:
+    if not state.active_symbol or not state.entry_price or abs(state.coin) <= 0 or not price:
         return None
 
     entry = float(state.entry_price)
     stop = chart_levels.get("stop")
     target = chart_levels.get("target")
-    risk_per_unit = entry - float(stop) if stop else 0.0
-    target_per_unit = float(target) - entry if target else 0.0
-    current_per_unit = float(price) - entry
+
+    if state.is_short:
+        # Short position
+        risk_per_unit = float(stop) - entry if stop else 0.0
+        target_per_unit = entry - float(target) if target else 0.0
+        current_per_unit = entry - float(price)
+    else:
+        # Long position
+        risk_per_unit = entry - float(stop) if stop else 0.0
+        target_per_unit = float(target) - entry if target else 0.0
+        current_per_unit = float(price) - entry
+
     return {
         "symbol": state.active_symbol,
         "entry": entry,
         "price": price,
         "stop": stop,
         "target": target,
-        "risk_cash": round(max(risk_per_unit, 0.0) * state.coin, 8),
-        "target_cash": round(max(target_per_unit, 0.0) * state.coin, 8),
-        "current_cash": round(current_per_unit * state.coin, 8),
+        "risk_cash": round(max(risk_per_unit, 0.0) * abs(state.coin), 8),
+        "target_cash": round(max(target_per_unit, 0.0) * abs(state.coin), 8),
+        "current_cash": round(current_per_unit * abs(state.coin), 8),
         "current_r": round(current_per_unit / risk_per_unit, 4) if risk_per_unit > 0 else None,
         "distance_to_stop_pct": pct(float(price) - float(stop), float(price)) if stop else None,
         "distance_to_target_pct": pct(float(target) - float(price), float(price)) if target else None,
+        "is_short": state.is_short,
     }
 
 
@@ -4764,22 +6841,42 @@ def position_rows(state: BotState) -> list[dict[str, Any]]:
         entry = float(position.get("entry_price", 0.0))
         history = state.price_history.get(symbol, [])
         current = history[-1] if history else entry
-        unrealized = (current - entry) * quantity
+        is_short = position.get("is_short", False)
+
+        if is_short:
+            unrealized = (entry - current) * abs(quantity)
+        else:
+            unrealized = (current - entry) * abs(quantity)
+
+        stop = (
+            position.get("stop_price") or
+            position.get("stop") or
+            position.get("stop_loss") or
+            position.get("stop_loss_price")
+        )
+        target = (
+            position.get("target_price") or
+            position.get("target") or
+            position.get("take_profit") or
+            position.get("take_profit_price")
+        )
+
         rows.append({
             "symbol": symbol,
             "quantity": quantity,
             "entry_price": entry,
             "current_price": current,
             "highest_price": position.get("highest_price"),
-            "stop_price": position.get("stop_price") or position.get("stop") or position.get("stop_loss") or position.get("stop_loss_price"),
-            "target_price": position.get("target_price") or position.get("target") or position.get("take_profit") or position.get("take_profit_price"),
-            "stop": position.get("stop_price") or position.get("stop") or position.get("stop_loss") or position.get("stop_loss_price"),
-            "target": position.get("target_price") or position.get("target") or position.get("take_profit") or position.get("take_profit_price"),
+            "stop_price": stop,
+            "target_price": target,
+            "stop": stop,
+            "target": target,
             "unrealized_pnl": round(unrealized, 8),
             "unrealized_pnl_pct": pct(current - entry, entry) if entry else 0.0,
             "opened_at": position.get("opened_at"),
             "trade_id": position.get("trade_id"),
             "partial_take_profit_done": bool(position.get("partial_take_profit_done", False)),
+            "is_short": is_short,
         })
     rows.sort(key=lambda item: item["symbol"])
     return rows
@@ -4793,6 +6890,16 @@ def setup_settings_key(settings: dict[str, Any]) -> str:
             f"{int(settings.get('base_nb_candles_sell', 24))} "
             f"rsi<{int(settings.get('rsi_buy', 69))}"
         )
+    if strategy == "opening_range":
+        return (
+            f"opening_range {int(settings.get('opening_range_minutes', 15))}m "
+            f"ATR{int(settings.get('opening_range_atr_period', 14))} "
+            f"thr{float(settings.get('opening_range_manipulation_threshold', 0.20)):.2f} "
+            f"SL{float(settings.get('opening_range_stop_loss_atr_multiplier', 1.5)):.1f}x "
+            f"TP{float(settings.get('opening_range_take_profit_atr_multiplier', 2.5)):.1f}x"
+        )
+    if strategy == "ema_golden_cross":
+        return f"EMA GC {int(settings.get('ema_short', 50))}/{int(settings.get('ema_long', 200))}"
     return (
         f"sma {int(settings.get('short_window', 5))}/"
         f"{int(settings.get('long_window', 20))}"
@@ -4979,6 +7086,9 @@ def symbol_performance(trades: list[Trade]) -> list[dict[str, Any]]:
         if trade.side == "BUY":
             stats[symbol]["buys"] += 1
             open_buys.setdefault(symbol, []).append(trade)
+        elif trade.side == "SHORT":
+            stats[symbol]["sells"] += 1
+            open_buys.setdefault(symbol, []).append(trade)
             continue
 
         if trade.side == "SELL":
@@ -4986,14 +7096,20 @@ def symbol_performance(trades: list[Trade]) -> list[dict[str, Any]]:
             buy = open_buys.get(symbol, []).pop(0) if open_buys.get(symbol) else None
             if not buy:
                 continue
-            buy_cost = (buy.quantity * buy.price) + buy.fee_paid
-            sell_value = (trade.quantity * trade.price) - trade.fee_paid
-            pnl = sell_value - buy_cost
+            if buy.side == "SHORT":
+                # Closing a short
+                pnl = (buy.price - trade.price) * abs(trade.quantity)
+            else:
+                # Closing a long
+                pnl = (trade.price - buy.price) * abs(trade.quantity)
             stats[symbol]["closed_pnl"] += pnl
             if pnl >= 0:
                 stats[symbol]["wins"] += 1
             else:
                 stats[symbol]["losses"] += 1
+        elif trade.side == "BUY" and trade.quantity < 0:
+            # This is a short entry (recorded as BUY with negative quantity)
+            stats[symbol]["sells"] += 1
 
     rows = []
     for row in stats.values():
@@ -5136,6 +7252,44 @@ def today_key() -> str:
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
 
 
+# ─── Currency mapping helpers for news guard ─────────────────────
+
+def country_to_currency(country_code: str) -> str:
+    mapping = {
+        'USA': 'USD',
+        'GBR': 'GBP',
+        'JPN': 'JPY',
+        'EUR': 'EUR',
+        'AUS': 'AUD',
+        'CAN': 'CAD',
+        'CHE': 'CHF',
+        'NZL': 'NZD',
+        'CHN': 'CNY',
+        'IND': 'INR',
+        'BRA': 'BRL',
+        'ZAF': 'ZAR',
+        'RUS': 'RUB',
+        'KOR': 'KRW',
+        'MEX': 'MXN',
+        'SGP': 'SGD',
+        'HKG': 'HKD',
+        'TWN': 'TWD',
+        'IDN': 'IDR',
+    }
+    return mapping.get(country_code.upper(), country_code)
+
+
+def symbol_to_currency(symbol: str, asset_class: str) -> str:
+    symbol = symbol.upper()
+    if asset_class == "forex":
+        if len(symbol) == 6 and symbol.isalpha():
+            return symbol[:3]
+        return symbol
+    return symbol
+
+
+# ─── HTTP request handling ────────────────────────────────────────
+
 def parse_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length", "0"))
     if length <= 0:
@@ -5147,10 +7301,12 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
     bot: PaperBot
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.bot = BotRequestHandler.bot
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def do_GET(self) -> None:
         try:
+            # ─── API endpoints ───
             if self.path == "/api/status":
                 self.send_json(self.bot.snapshot())
                 return
@@ -5171,19 +7327,237 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json(coinbase_products_for_quote("GBP"))
                 return
 
+            if self.path == "/api/scan-rows-debug":
+                self.send_json({
+                    "scan_rows_count": len(self.bot.state.scan_rows),
+                    "scan_rows": self.bot.state.scan_rows,
+                    "watchlist": parse_watchlist(self.bot.state.settings.get("watchlist", ""))
+                })
+                return
+
+            if self.path == "/api/oanda-test-pairs":
+                settings = self.bot.state.settings
+                watchlist = parse_watchlist(settings.get("watchlist", "EURUSD"))
+                granularity = int(settings.get("live_granularity", 300))
+                candle_count = 20  # Small count for testing
+
+                results = []
+                for symbol in watchlist:
+                    try:
+                        candles = fetch_candles(
+                            exchange=settings["exchange"],
+                            symbol=symbol,
+                            quote_currency=settings["quote_currency"],
+                            granularity=granularity,
+                            candle_count=candle_count,
+                            asset_class=str(settings.get("asset_class", "forex")),
+                        )
+                        results.append({
+                            "symbol": symbol,
+                            "success": True,
+                            "count": len(candles),
+                            "last_price": candles[-1].close if candles else None
+                        })
+                    except Exception as e:
+                        results.append({
+                            "symbol": symbol,
+                            "success": False,
+                            "error": str(e)[:100]
+                        })
+
+                self.send_json({
+                    "total": len(watchlist),
+                    "successful": len([r for r in results if r["success"]]),
+                    "failed": len([r for r in results if not r["success"]]),
+                    "results": results
+                })
+                return
+
             if self.path.startswith("/api/coinbase-products"):
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 quote = query.get("quote", ["GBP"])[0]
                 self.send_json(coinbase_products_for_quote(quote))
                 return
 
+            # ─── Force price update (debug) ───
+            if self.path == "/api/force-price":
+                payload = parse_json_body(self)
+                symbol = payload.get("symbol", "GBPCHF")
+                price = payload.get("price", 1.08)
+                with self.bot.lock:
+                    if symbol in self.bot.state.price_history:
+                        self.bot.state.price_history[symbol][-1] = price
+                    else:
+                        self.bot.state.price_history[symbol] = [price]
+                    self.bot.state.last_price = price
+                    self.bot.save_state()
+                self.send_json({"ok": True, "symbol": symbol, "price": price})
+                return
+
+            if self.path == "/api/oanda-direct-test":
+                import os
+                account_id = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
+                api_token = os.environ.get("OANDA_API_TOKEN", "").strip()
+                api_base = os.environ.get("OANDA_API_BASE", "https://api-fxtrade.oanda.com").strip()
+
+                result = {
+                    "account_id": account_id,
+                    "api_token": api_token[:20] + "..." if api_token else "not set",
+                    "api_base": api_base,
+                    "env": os.environ.get("OANDA_ENV", "not set"),
+                }
+
+                try:
+                    url = f"{api_base}/v3/accounts/{account_id}/summary"
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {api_token}",
+                            "Accept": "application/json",
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        data = json.loads(response.read().decode())
+                        result["success"] = True
+                        result["balance"] = data.get("account", {}).get("balance")
+                        result["currency"] = data.get("account", {}).get("currency")
+                except urllib.error.HTTPError as e:
+                    result["success"] = False
+                    result["status"] = e.code
+                    result["reason"] = e.reason
+                    result["body"] = e.read().decode()
+                except Exception as e:
+                    result["success"] = False
+                    result["error"] = str(e)
+
+                self.send_json(result)
+                return
+
+            if self.path == "/api/oanda-instruments":
+                try:
+                    account_id = urllib.parse.quote(oanda_account_id())
+                    data = oanda_request(f"/v3/accounts/{account_id}/instruments")
+                    instruments = [inst.get("name") for inst in data.get("instruments", [])]
+                    self.send_json({
+                        "total": len(instruments),
+                        "instruments": instruments[:50]  # Show first 50
+                    })
+                except Exception as e:
+                    self.send_json({"ok": False, "error": str(e)})
+                return
+
+            if self.path == "/api/oanda-debug":
+                import os
+                account_id = oanda_account_id()
+                api_token = oanda_api_token()
+                api_base = oanda_api_base()
+
+                self.send_json({
+                    "account_id": account_id,
+                    "api_token": api_token[:20] + "..." if api_token else "not set",
+                    "api_base": api_base,
+                    "is_configured": oanda_is_configured(),
+                    "env_vars": {
+                        "OANDA_ACCOUNT_ID": os.environ.get("OANDA_ACCOUNT_ID", "not set"),
+                        "OANDA_API_TOKEN": os.environ.get("OANDA_API_TOKEN", "not set")[:20] + "..." if os.environ.get("OANDA_API_TOKEN") else "not set",
+                        "OANDA_ENV": os.environ.get("OANDA_ENV", "not set"),
+                        "OANDA_API_BASE": os.environ.get("OANDA_API_BASE", "not set"),
+                        "OANDA_DEMO_TRADING_ENABLED": os.environ.get("OANDA_DEMO_TRADING_ENABLED", "not set"),
+                    }
+                })
+                return
+
+            # In BotRequestHandler.do_GET()
+            if self.path == "/api/oanda-debug-fetch":
+                import time
+                settings = self.bot.state.settings
+                watchlist = parse_watchlist(settings.get("watchlist", "EURUSD,GBPUSD,USDJPY"))
+                granularity = int(settings.get("live_granularity", 300))
+                candle_count = 20
+
+                results = []
+                for symbol in watchlist:
+                    try:
+                        start = time.time()
+                        candles = fetch_candles(
+                            exchange=settings["exchange"],
+                            symbol=symbol,
+                            quote_currency=settings["quote_currency"],
+                            granularity=granularity,
+                            candle_count=candle_count,
+                            asset_class=str(settings.get("asset_class", "forex")),
+                        )
+                        elapsed = time.time() - start
+                        results.append({
+                            "symbol": symbol,
+                            "success": True,
+                            "count": len(candles),
+                            " last_price": candles[-1].close if candles else None,
+                            "elapsed": round(elapsed, 3)
+                        })
+                    except Exception as e:
+                        results.append({
+                            "symbol": symbol,
+                            "success": False,
+                            "error": str(e)[:200],
+                            "error_type": type(e).__name__
+                        })
+
+                self.send_json({
+                    "total": len(watchlist),
+                    "successful": len([r for r in results if r["success"]]),
+                    "failed": len([r for r in results if not r["success"]]),
+                    "results": results
+                })
+                return
+
+            # ─── Static files ───
+            if self.path.endswith('.css') or self.path.endswith('.js') or self.path.endswith('.json') or self.path.endswith('.png') or self.path.endswith('.jpg') or self.path.endswith('.svg'):
+                self.serve_static_file()
+                return
+
+            # ─── Default: serve index.html ───
             if not self.path.startswith("/api/"):
                 self.send_index()
                 return
 
             super().do_GET()
         except Exception as exc:
+            logger.error(f"GET error: {exc}")
             self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def serve_static_file(self) -> None:
+        """Serve static files with correct MIME type."""
+        path = self.path.lstrip('/')
+        file_path = WEB_DIR / path
+
+        if not file_path.exists() or not file_path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        # Set correct MIME type
+        if path.endswith('.css'):
+            content_type = 'text/css'
+        elif path.endswith('.js'):
+            content_type = 'application/javascript'
+        elif path.endswith('.json'):
+            content_type = 'application/json'
+        elif path.endswith('.png'):
+            content_type = 'image/png'
+        elif path.endswith('.jpg') or path.endswith('.jpeg'):
+            content_type = 'image/jpeg'
+        elif path.endswith('.svg'):
+            content_type = 'image/svg+xml'
+        else:
+            content_type = 'application/octet-stream'
+
+        body = file_path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
         try:
@@ -5259,6 +7633,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
             self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
+            logger.error(f"POST error: {exc}")
             self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def send_json(self, data: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
@@ -5299,13 +7674,15 @@ def main() -> None:
     BotRequestHandler.bot = bot
 
     server = ThreadingHTTPServer(("0.0.0.0", port), BotRequestHandler)
-    print(f"CryptoBot running at http://localhost:{port}")
+    logger.info(f"Auxo running at http://localhost:{port}")
+    print(f"Auxo running at http://localhost:{port}")
     print("Press Ctrl+C to stop.")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         bot.stop()
+        logger.info("Auxo stopped")
         print("\nStopped.")
 
 
