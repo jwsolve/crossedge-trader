@@ -5,6 +5,10 @@
     <meta content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=yes" name="viewport" />
     <title>Auxo · Terminal</title>
     <meta name="theme-color" content="#0b1120" />
+
+    <!-- ─── Lightweight Charts from reliable CDN ─── -->
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+
     <style>
         /* ── auxo.css – All styles for Auxo ── */
 
@@ -374,13 +378,25 @@
             margin-left: auto;
         }
 
-        canvas#chart {
+        /* ── Lightweight Charts container ── */
+        #chartContainer {
             width: 100%;
             height: 400px;
             border-radius: 6px;
             background: var(--panel);
             cursor: crosshair;
             display: block;
+            position: relative;
+        }
+        #chartContainer .chart-error {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: var(--muted);
+            font-size: 14px;
+            text-align: center;
+            pointer-events: none;
         }
 
         /* ─── Open Trades ─── */
@@ -400,7 +416,7 @@
         }
         .trades-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
             gap: 12px;
         }
         .trade-card {
@@ -436,6 +452,19 @@
             color: var(--text);
         }
         .trade-card .detail .label { color: var(--muted); }
+        .trade-card .detail .tpsl-warning {
+            color: var(--warn);
+            font-style: italic;
+            font-size: 11px;
+        }
+        .trade-card .detail .tpsl-near-stop {
+            color: var(--bad);
+            font-weight: 600;
+        }
+        .trade-card .detail .tpsl-near-target {
+            color: var(--good);
+            font-weight: 600;
+        }
         .trade-card .actions {
             display: flex;
             gap: 6px;
@@ -659,8 +688,8 @@
             font-size: 13px;
         }
 
-        /* ─── Risk Profile Presets ─── */
-        .risk-profile-row {
+        /* ─── Strategy Presets ─── */
+        .presets-row {
             display: flex;
             flex-wrap: wrap;
             align-items: center;
@@ -671,7 +700,7 @@
             border: 1px solid var(--line);
             margin-bottom: 12px;
         }
-        .risk-profile-row .muted { color: var(--muted); font-weight: 500; font-size: 12px; }
+        .presets-row .muted { color: var(--muted); font-weight: 500; font-size: 12px; }
         .preset-btn {
             border: 1px solid var(--line);
             background: var(--button-bg);
@@ -686,6 +715,20 @@
         .preset-btn:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
         .preset-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
         .preset-status { font-size: 11px; color: var(--muted); margin-left: 6px; }
+
+        /* ─── Risk Profile Presets ─── */
+        .risk-profile-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            background: var(--panel-hover);
+            border-radius: 6px;
+            border: 1px solid var(--line);
+            margin-bottom: 12px;
+        }
+        .risk-profile-row .muted { color: var(--muted); font-weight: 500; font-size: 12px; }
 
         /* ─── Analysis Tab ─── */
         .analysis-section {
@@ -934,13 +977,19 @@
             .trade-card .actions { gap: 8px; }
             .trade-card .actions button { flex: 1; min-height: 40px; font-size: 13px; text-align: center; }
             .settings-group .body { grid-template-columns: 1fr; }
-            .risk-profile-row {
+            .presets-row {
                 flex-direction: column;
                 align-items: stretch;
                 gap: 4px;
                 padding: 10px 12px;
             }
             .preset-btn { padding: 8px 14px; font-size: 13px; text-align: center; }
+            .risk-profile-row {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 4px;
+                padding: 10px 12px;
+            }
             .backtest-row {
                 flex-direction: column;
                 align-items: stretch;
@@ -1009,7 +1058,7 @@
                 font-size: 12px;
                 min-height: 36px;
             }
-            canvas#chart { height: 260px; touch-action: none; }
+            #chartContainer { height: 260px; touch-action: none; }
         }
         @media (max-width: 420px) {
             body { padding: 6px 8px 20px; }
@@ -1020,7 +1069,7 @@
             .header-brand h1 { font-size: 17px; }
             .header-brand .badge { font-size: 10px; padding: 1px 8px; }
             .header-status .pill { font-size: 11px; padding: 4px 10px; min-height: 28px; }
-            canvas#chart { height: 200px; }
+            #chartContainer { height: 200px; }
             .trade-card .header { font-size: 14px; }
             .trade-card .detail { font-size: 12px; }
             .table-wrap table { font-size: 11px; min-width: 500px; }
@@ -1112,6 +1161,12 @@
         }
         body.dark .header-actions .theme-toggle { color: #e2e8f0; }
         body.dark .header-actions .theme-toggle:hover { background: #1e2a4a; }
+
+        /* ─── Streaming Status Pill ─── */
+        #streamingPill .dot.streaming { background: var(--good); }
+        #streamingPill .dot.connecting { background: var(--warn); }
+        #streamingPill .dot.off { background: var(--muted); }
+        #streamingPill .dot.error { background: var(--bad); }
     </style>
 </head>
 <body>
@@ -1120,7 +1175,8 @@
         <!-- ─── HEADER ─── -->
         <header class="header">
             <div class="header-brand">
-                <img src="/logo.jpg" class="logo" alt="Auxo" onerror="this.style.display='none';" />
+                <h1>Auxo</h1>
+                <span class="badge">v2.0</span>
             </div>
 
             <!-- Status Pills -->
@@ -1128,6 +1184,10 @@
                 <span class="pill" id="runPill"><span class="dot gray" id="runDot"></span><span id="runText">Stopped</span></span>
                 <span class="pill" id="tradingPill">Trading Disabled</span>
                 <span class="pill" id="armedPill">🔒 Locked</span>
+                <span class="pill" id="streamingPill">
+                    <span class="dot off" id="streamingDot"></span>
+                    <span id="streamingText">Streaming: Off</span>
+                </span>
                 <details class="health-details" id="healthDetails">
                     <summary>🟢 Healthy</summary>
                     <div class="popover" id="healthPopover">
@@ -1180,6 +1240,15 @@
                 <div class="chart-toolbar">
                     <div class="group">
                         <select id="chartSymbolSelect"></select>
+                        <select id="chartTimeframeSelect">
+                            <option value="60">1m</option>
+                            <option value="300">5m</option>
+                            <option value="900">15m</option>
+                            <option value="3600" selected>1h</option>
+                            <option value="21600">6h</option>
+                            <option value="86400">1d</option>
+                            <option value="604800">1w</option>
+                        </select>
                         <select id="chartModeSelect">
                             <option value="line">Line</option>
                             <option value="candles">Candles</option>
@@ -1199,13 +1268,21 @@
                                 <label><input type="checkbox" checked data-indicator="partial"> Partial TP</label>
                                 <label><input type="checkbox" checked data-indicator="trailing"> Trailing</label>
                                 <label><input type="checkbox" checked data-indicator="trades"> Buy/Sell markers</label>
+                                <label><input type="checkbox" checked data-indicator="trends"> Trend starts</label>
+                                <label><input type="checkbox" checked data-indicator="engulfing"> Engulfing</label>
+                                <label><input type="checkbox" checked data-indicator="breakouts"> Breakouts</label>
+                                <label><input type="checkbox" checked data-indicator="macd"> MACD</label>
+                                <label><input type="checkbox" checked data-indicator="rsi"> RSI</label>
+                                <label><input type="checkbox" checked data-indicator="volume"> Volume Spikes</label>
                             </div>
                         </details>
                         <button class="indicator-btn" id="refreshChartBtn" type="button">⟳</button>
                     </div>
                     <span class="chart-time-range" id="chartTimeRange"></span>
                 </div>
-                <canvas id="chart" height="400"></canvas>
+                <div id="chartContainer">
+                    <div class="chart-error" id="chartError" style="display:none;">⚠️ Chart library failed to load – check your internet connection.</div>
+                </div>
                 <div class="message-box" id="errorBox"></div>
             </section>
 
@@ -1250,14 +1327,28 @@
                     <input id="settingsSearch" placeholder="Search settings…" />
                 </div>
 
-                <!-- Risk Profile Presets -->
+                <!-- ─── STRATEGY PRESETS ─── -->
+                <div class="presets-row">
+                    <span class="muted">🚀 Strategy Presets:</span>
+                    <button type="button" id="presetOpeningRange" class="preset-btn">Opening Range</button>
+                    <button type="button" id="presetScalping" class="preset-btn">Scalping</button>
+                    <button type="button" id="presetMomentum" class="preset-btn">Momentum</button>
+                    <button type="button" id="presetMeanReversion" class="preset-btn">Mean Reversion</button>
+                    <button type="button" id="presetBreakout" class="preset-btn">Breakout</button>
+                    <button type="button" id="presetSwing" class="preset-btn">Swing Trading</button>
+                    <button type="button" id="presetEWO" class="preset-btn">EWO Offset</button>
+                    <button type="button" id="presetEMAGoldenCross" class="preset-btn">EMA Golden Cross</button>
+                    <span class="preset-status" id="presetStatus">Click to apply, then Save Settings</span>
+                </div>
+
+                <!-- ─── RISK PROFILE PRESETS ─── -->
                 <div class="risk-profile-row">
                     <span class="muted">⚡ Risk Profile:</span>
                     <button type="button" id="profileConservativeBtn" class="preset-btn">Conservative</button>
                     <button type="button" id="profileBalancedBtn" class="preset-btn">Balanced</button>
                     <button type="button" id="profileAggressiveBtn" class="preset-btn">Aggressive</button>
                     <button type="button" id="profileScalpingBtn" class="preset-btn">Scalping</button>
-                    <span class="preset-status" id="presetStatus">Click to apply, then Save Settings</span>
+                    <span class="preset-status" id="riskPresetStatus">Click to apply, then Save Settings</span>
                 </div>
 
                 <form id="settingsForm">
@@ -1272,6 +1363,7 @@
                             <label>Live trading <select name="live_trading_enabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
                             <label>OANDA demo orders <select name="oanda_demo_trading_enabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
                             <label>Max OANDA open trades <input name="max_oanda_open_trades" type="number" value="3" step="1" min="1" max="20" /></label>
+			    <label>Max Coinbase open trades <input name="max_coinbase_open_trades" type="number" value="3" step="1" min="1" max="20" /></label>
                         </div>
                     </details>
 
@@ -1285,6 +1377,7 @@
                                     <option value="ewo_offset">EWO SMA offset</option>
                                     <option value="opening_range">Opening Range</option>
                                     <option value="ema_golden_cross">EMA Golden Cross (50/200)</option>
+                                    <option value="self_learning">Self-Learning (AI)</option>
                                 </select>
                             </label>
                             <label>Allow Short Selling <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
@@ -1308,6 +1401,11 @@
                                 <label>EMA Short Period <input name="ema_short" type="number" value="50" step="1" min="5" /></label>
                                 <label>EMA Long Period <input name="ema_long" type="number" value="200" step="1" min="20" /></label>
                             </div>
+
+                            <!-- ─── Self-Learning Settings ─── -->
+                            <label>Self-Learning Enabled <select name="self_learning_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+                            <label>Signal Confidence Threshold <input name="signal_confidence_threshold" type="number" value="0.3" step="0.05" min="0.05" max="0.95" /></label>
+                            <label>Min Signals Required <input name="min_signals_required" type="number" value="1" step="1" min="0" max="5" /></label>
                         </div>
                     </details>
 
@@ -1328,7 +1426,7 @@
                     </details>
 
                     <!-- Entries & Exits -->
-                    <details class="settings-group" open>
+                    <details class="settings-group">
                         <summary>Entries &amp; Exits</summary>
                         <div class="body">
                             <label>Stop loss % <input name="stop_loss_pct" type="number" value="2" step="0.1" /></label>
@@ -1388,6 +1486,52 @@
                             <label>Weak win rate limit % <input name="weak_pair_win_rate_limit_pct" type="number" value="35" step="1" /></label>
                         </div>
                     </details>
+
+<!-- ─── STRATEGY CREATOR ─── -->
+<details class="settings-group">
+    <summary>Strategy Creator (AI Evolution)</summary>
+    <div class="body">
+        <label>Strategy Creator Enabled
+            <select name="strategy_creator_enabled">
+                <option value="false">Disabled</option>
+                <option value="true">Enabled</option>
+            </select>
+        </label>
+        <label>Auto-Evolution Enabled
+            <select name="strategy_evolution_enabled">
+                <option value="false">Disabled</option>
+                <option value="true">Enabled</option>
+            </select>
+        </label>
+        <label>Auto-Select Best Strategy
+            <select name="strategy_auto_select">
+                <option value="false">Disabled</option>
+                <option value="true">Enabled</option>
+            </select>
+        </label>
+        <label>Evolution Generations
+            <input name="strategy_generations" type="number" value="50" step="5" min="10" max="500" />
+        </label>
+        <label>Confidence Threshold
+            <input name="strategy_confidence_threshold" type="number" value="0.5" step="0.05" min="0.1" max="0.95" />
+        </label>
+        <label>Evolution Frequency (hours)
+            <input name="strategy_evolution_frequency" type="number" value="24" step="1" min="1" max="168" />
+        </label>
+        <label>Max Active Strategies
+            <input name="strategy_max_active" type="number" value="5" step="1" min="1" max="20" />
+        </label>
+        <div style="grid-column: 1 / -1; margin-top: 8px;">
+            <button type="button" id="evolveStrategiesBtn" class="preset-btn" style="background: var(--accent); color: #fff;">
+                🧬 Evolve Strategies Now
+            </button>
+            <button type="button" id="viewStrategiesBtn" class="preset-btn">
+                📊 View Strategies
+            </button>
+            <span class="status" id="strategyStatus">Ready</span>
+        </div>
+    </div>
+</details>
 
                     <!-- Advanced -->
                     <details class="settings-group">
@@ -1595,7 +1739,7 @@
     </div>
 
     <script>
-        // ─── auxo.js – Full application logic ───
+        // ─── auxo.js – Full application logic with all indicators ──
 
         // ---- DOM refs ----
         const $ = id => document.getElementById(id);
@@ -1617,14 +1761,18 @@
             healthPopover: $('healthPopover'),
             pairDisplay: $('pairDisplay'),
             chartSymbolSelect: $('chartSymbolSelect'),
+            chartTimeframeSelect: $('chartTimeframeSelect'),
             chartModeSelect: $('chartModeSelect'),
             lastPrice: $('lastPrice'),
             signalText: $('signalText'),
             errorBox: $('errorBox'),
-            chart: $('chart'),
+            chartContainer: $('chartContainer'),
+            chartError: $('chartError'),
             chartTimeRange: $('chartTimeRange'),
             positionsGrid: $('positionsGrid'),
             recentActivity: $('recentActivity'),
+            streamingDot: $('streamingDot'),
+            streamingText: $('streamingText'),
             // Trading
             startBtn: $('startBtn'),
             stopBtn: $('stopBtn'),
@@ -1635,6 +1783,8 @@
             settingsForm: $('settingsForm'),
             settingsStatus: $('settingsStatus'),
             settingsSearch: $('settingsSearch'),
+            presetStatus: $('presetStatus'),
+            riskPresetStatus: $('riskPresetStatus'),
             // Analysis
             backtestBtn: $('backtestBtn'),
             optimizerBtn: $('optimizerBtn'),
@@ -1670,7 +1820,6 @@
             btUseLiveSettings: $('btUseLiveSettings'),
             themeToggle: $('themeToggle'),
             refreshChartBtn: $('refreshChartBtn'),
-            presetStatus: $('presetStatus'),
         };
 
         // ---- state ----
@@ -1679,9 +1828,10 @@
         let lastStatusData = null;
         let selectedChartSymbol = localStorage.getItem('cryptobot-chart-symbol') || '';
         let chartMode = localStorage.getItem('cryptobot-chart-mode') || 'line';
+        let chartTimeframe = parseInt(localStorage.getItem('cryptobot-chart-timeframe')) || 3600;
+        let cachedCandles = {};
         let settingsFormDirty = false;
         let latestOptimizerBest = null;
-        let chartHoverIndex = null;
         let lastPrices = [];
         let lastSupport = null;
         let lastResistance = null;
@@ -1691,7 +1841,7 @@
         let lastChartSymbol = '';
         let settingsLoaded = false;
 
-        // indicator toggles
+        // indicator toggles - updated with new indicators
         let indicatorState = {
             support: true,
             resistance: true,
@@ -1701,6 +1851,12 @@
             partial: true,
             trailing: true,
             trades: true,
+            trends: true,
+            engulfing: true,
+            breakouts: true,
+            macd: true,
+            rsi: true,
+            volume: true,
         };
 
         // load from localStorage
@@ -1709,16 +1865,68 @@
             if (saved) Object.assign(indicatorState, saved);
         } catch (e) {}
 
+        // Set timeframe dropdown to saved value
+        if (els.chartTimeframeSelect) {
+            els.chartTimeframeSelect.value = String(chartTimeframe);
+        }
+
         // ---- helpers ----
+        function cssVar(name) {
+            return getComputedStyle(document.body).getPropertyValue(name).trim();
+        }
+
+        function getPriceFormat(price) {
+            if (!price || price <= 0) return { precision: 2, minMove: 0.01 };
+            const absPrice = Math.abs(price);
+            let precision, minMove;
+            if (absPrice < 0.0001) {
+                precision = 8;
+                minMove = 0.00000001;
+            } else if (absPrice < 0.001) {
+                precision = 6;
+                minMove = 0.000001;
+            } else if (absPrice < 0.01) {
+                precision = 5;
+                minMove = 0.00001;
+            } else if (absPrice < 1) {
+                precision = 4;
+                minMove = 0.0001;
+            } else if (absPrice < 100) {
+                precision = 2;
+                minMove = 0.01;
+            } else {
+                precision = 2;
+                minMove = 0.01;
+            }
+            return { precision, minMove };
+        }
+
         const money = v => `${displayCurrency || 'GBP'} ${Number(v || 0).toFixed(2)}`;
         const num = (v, dp = 8) => Number(v || 0).toFixed(dp).replace(/\.?0+$/, '');
+
         const priceText = (v, sym) => {
+            if (v === null || v === undefined) return '—';
+            const num = Number(v);
             if (displayAssetClass === 'forex') {
                 const dp = String(sym || '').toUpperCase().endsWith('JPY') ? 3 : 5;
-                return Number(v || 0).toFixed(dp);
+                return num.toFixed(dp);
             }
-            return money(v);
+            const { precision } = getPriceFormat(num);
+            return `${displayCurrency || 'GBP'} ${num.toFixed(precision)}`;
         };
+
+        function getTimeframeLabel(seconds) {
+            const labels = {
+                60: '1m',
+                300: '5m',
+                900: '15m',
+                3600: '1h',
+                21600: '6h',
+                86400: '1d',
+                604800: '1w'
+            };
+            return labels[seconds] || `${seconds}s`;
+        }
 
         // ---- API ----
         async function post(url, body = {}) {
@@ -1733,23 +1941,609 @@
             document.body.classList.toggle('dark', dark);
             els.themeToggle.textContent = dark ? '☀️' : '🌓';
             localStorage.setItem('cryptobot-theme', dark ? 'dark' : 'light');
-            if (lastStatusData) redrawChart();
+            // Redraw chart with new theme
+            if (lastStatusData) updateChartTheme();
         }
         applyTheme(localStorage.getItem('cryptobot-theme') || 'light');
         els.themeToggle.addEventListener('click', () => {
             applyTheme(document.body.classList.contains('dark') ? 'light' : 'dark');
         });
 
-        // ---- chart ----
-        function resizeChartCanvas(canvas) {
-            const rect = canvas.getBoundingClientRect();
-            const w = Math.max(320, Math.round(rect.width || canvas.width));
-            const h = Math.max(320, Math.round(rect.height || canvas.height));
-            if (canvas.width !== w || canvas.height !== h) { canvas.width = w;
-                canvas.height = h; }
+        // ---- Update streaming status ----
+        function updateStreamingUI(data) {
+            if (!els.streamingDot || !els.streamingText) return;
+
+            const wsStatus = data?.live_status?.websocket_status || 'disabled';
+            const wsEnabled = data?.settings?.websocket_enabled || false;
+            const oandaEnabled = data?.settings?.oanda_demo_trading_enabled || false;
+
+            const dot = els.streamingDot;
+            const text = els.streamingText;
+
+            if (wsEnabled && oandaEnabled) {
+                if (wsStatus === 'streaming' || wsStatus === 'connected') {
+                    dot.className = 'dot streaming';
+                    text.textContent = 'Streaming: Live';
+                    dot.style.background = 'var(--good)';
+                } else if (wsStatus === 'connecting' || wsStatus === 'connecting to OANDA...') {
+                    dot.className = 'dot connecting';
+                    text.textContent = 'Streaming: Connecting...';
+                    dot.style.background = 'var(--warn)';
+                } else if (wsStatus.includes('error')) {
+                    dot.className = 'dot error';
+                    text.textContent = 'Streaming: Error';
+                    dot.style.background = 'var(--bad)';
+                } else {
+                    dot.className = 'dot off';
+                    text.textContent = `Streaming: ${wsStatus}`;
+                    dot.style.background = 'var(--muted)';
+                }
+            } else if (oandaEnabled && !wsEnabled) {
+                dot.className = 'dot off';
+                text.textContent = 'Streaming: WS Off';
+                dot.style.background = 'var(--muted)';
+            } else {
+                dot.className = 'dot off';
+                text.textContent = 'Streaming: N/A';
+                dot.style.background = 'var(--muted)';
+            }
         }
 
-        function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim(); }
+        // ---- Check streaming status periodically ----
+        async function checkStreamingStatus() {
+            try {
+                const data = await getJson('/api/status');
+                if (data) {
+                    updateStreamingUI(data);
+                }
+            } catch (e) { /* ignore */ }
+        }
+
+        // ---- SMA/EMA helpers ----
+        function sma(values, window) {
+            if (values.length < window) return null;
+            const slice = values.slice(-window);
+            return slice.reduce((a, b) => a + b, 0) / window;
+        }
+
+        function ema(values, window) {
+            if (values.length < window) return null;
+            const multiplier = 2 / (window + 1);
+            let emaValue = values.slice(0, window).reduce((a, b) => a + b, 0) / window;
+            for (let i = window; i < values.length; i++) {
+                emaValue = (values[i] - emaValue) * multiplier + emaValue;
+            }
+            return emaValue;
+        }
+
+        function macd(values, fast = 12, slow = 26, signal = 9) {
+            if (values.length < slow + signal) return null;
+            const emaFast = ema(values, fast);
+            const emaSlow = ema(values, slow);
+            if (emaFast === null || emaSlow === null) return null;
+            const macdLine = emaFast - emaSlow;
+
+            const macdValues = [];
+            for (let i = slow; i < values.length; i++) {
+                const fastSlice = values.slice(0, i + 1);
+                const slowSlice = values.slice(0, i + 1);
+                const ef = ema(fastSlice, fast);
+                const es = ema(slowSlice, slow);
+                if (ef !== null && es !== null) {
+                    macdValues.push(ef - es);
+                }
+            }
+            if (macdValues.length < signal) return null;
+            const signalLine = ema(macdValues, signal);
+            const histogram = macdLine - (signalLine || 0);
+            return { macd: macdLine, signal: signalLine, histogram };
+        }
+
+        function rsi(values, window = 14) {
+            if (values.length < window + 1) return null;
+            let gains = 0, losses = 0;
+            for (let i = values.length - window; i < values.length; i++) {
+                const change = values[i] - values[i - 1];
+                if (change >= 0) gains += change;
+                else losses -= change;
+            }
+            const avgGain = gains / window;
+            const avgLoss = losses / window;
+            if (avgLoss === 0) return 100;
+            const rs = avgGain / avgLoss;
+            return 100 - (100 / (1 + rs));
+        }
+
+        function detectEngulfing(candles) {
+            const results = [];
+            for (let i = 1; i < candles.length; i++) {
+                const prev = candles[i - 1];
+                const curr = candles[i];
+                const prevBull = prev.close > prev.open;
+                const currBull = curr.close > curr.open;
+
+                if (!prevBull && currBull && curr.open <= prev.close && curr.close >= prev.open) {
+                    results.push({ index: i, type: 'bullish', price: curr.low });
+                }
+                if (prevBull && !currBull && curr.open >= prev.close && curr.close <= prev.open) {
+                    results.push({ index: i, type: 'bearish', price: curr.high });
+                }
+            }
+            return results;
+        }
+
+        function detectCrossovers(prices, shortWindow, longWindow) {
+            const results = [];
+            if (prices.length < longWindow + 1) return results;
+
+            for (let i = longWindow; i < prices.length; i++) {
+                const slice = prices.slice(0, i + 1);
+                const shortNow = sma(slice, shortWindow);
+                const longNow = sma(slice, longWindow);
+                const shortPrev = sma(slice.slice(0, -1), shortWindow);
+                const longPrev = sma(slice.slice(0, -1), longWindow);
+
+                if (shortNow === null || longNow === null || shortPrev === null || longPrev === null) continue;
+
+                if (shortPrev <= longPrev && shortNow > longNow) {
+                    results.push({ index: i, type: 'bullish', price: prices[i] });
+                }
+                if (shortPrev >= longPrev && shortNow < longNow) {
+                    results.push({ index: i, type: 'bearish', price: prices[i] });
+                }
+            }
+            return results;
+        }
+
+        function detectBreakouts(candles, support, resistance, lookback = 20) {
+            const results = [];
+            if (!support || !resistance || candles.length < lookback + 5) return results;
+
+            const recent = candles.slice(-lookback);
+            const avgVol = recent.reduce((sum, c) => sum + c.volume, 0) / recent.length;
+
+            for (let i = candles.length - 10; i < candles.length; i++) {
+                if (i < 0) continue;
+                const c = candles[i];
+                if (c.close > resistance * 1.002 && c.volume > avgVol * 1.2) {
+                    results.push({ index: i, type: 'resistance_breakout', price: c.close });
+                }
+                if (c.close < support * 0.998 && c.volume > avgVol * 1.2) {
+                    results.push({ index: i, type: 'support_breakdown', price: c.close });
+                }
+            }
+            return results;
+        }
+
+        function detectVolumeSpikes(candles, multiplier = 2) {
+            const results = [];
+            if (candles.length < 20) return results;
+
+            const avgVol = candles.slice(-20).reduce((sum, c) => sum + c.volume, 0) / 20;
+
+            for (let i = candles.length - 10; i < candles.length; i++) {
+                if (i < 0) continue;
+                const c = candles[i];
+                if (c.volume > avgVol * multiplier) {
+                    results.push({ index: i, price: c.close, volume: c.volume, avg: avgVol });
+                }
+            }
+            return results;
+        }
+
+        // ---- Lightweight Charts integration ----
+        let chart = null;
+        let priceSeries = null;
+        let horizontalSeries = {};
+        let indicatorMarkers = null;
+
+        function initChart() {
+            if (chart) {
+                chart.remove();
+                chart = null;
+                priceSeries = null;
+                horizontalSeries = {};
+                indicatorMarkers = null;
+            }
+
+            const container = els.chartContainer;
+            if (!container) return null;
+
+            if (els.chartError) els.chartError.style.display = 'none';
+
+            if (typeof LightweightCharts === 'undefined' || typeof LightweightCharts.createChart !== 'function') {
+                if (els.chartError) {
+                    els.chartError.style.display = 'block';
+                    els.chartError.textContent = '⚠️ Chart library failed to load – check internet connection and reload.';
+                }
+                console.error('Lightweight Charts library not loaded.');
+                return null;
+            }
+
+            const isDark = document.body.classList.contains('dark');
+
+            try {
+                const newChart = LightweightCharts.createChart(container, {
+                    width: container.clientWidth,
+                    height: 400,
+                    layout: {
+                        background: { color: isDark ? '#15203a' : '#ffffff' },
+                        textColor: isDark ? '#e2e8f0' : '#1e293b',
+                    },
+                    grid: {
+                        vertLines: { color: isDark ? '#2d3a5a' : '#dbe0e8' },
+                        horzLines: { color: isDark ? '#2d3a5a' : '#dbe0e8' },
+                    },
+                    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                    timeScale: {
+                        timeVisible: true,
+                        secondsVisible: false,
+                        borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                    },
+                    rightPriceScale: {
+                        borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                    },
+                    watermark: { visible: false },
+                });
+
+                if (typeof newChart.addCandlestickSeries !== 'function' ||
+                    typeof newChart.addLineSeries !== 'function') {
+                    console.error('Created chart is invalid – missing required methods.');
+                    if (els.chartError) {
+                        els.chartError.style.display = 'block';
+                        els.chartError.textContent = '⚠️ Chart library corrupted – try refreshing.';
+                    }
+                    return null;
+                }
+
+                chart = newChart;
+
+                const resizeObserver = new ResizeObserver(() => {
+                    if (chart) {
+                        try { chart.resize(container.clientWidth, 400); } catch (e) {}
+                    }
+                });
+                resizeObserver.observe(container);
+                chart._resizeObserver = resizeObserver;
+
+                return chart;
+            } catch (e) {
+                console.error('Failed to create chart:', e);
+                if (els.chartError) {
+                    els.chartError.style.display = 'block';
+                    els.chartError.textContent = `⚠️ Chart error: ${e.message}`;
+                }
+                return null;
+            }
+        }
+
+        function updateChartTheme() {
+            if (!chart) return;
+            const isDark = document.body.classList.contains('dark');
+            chart.applyOptions({
+                layout: {
+                    background: { color: isDark ? '#15203a' : '#ffffff' },
+                    textColor: isDark ? '#e2e8f0' : '#1e293b',
+                },
+                grid: {
+                    vertLines: { color: isDark ? '#2d3a5a' : '#dbe0e8' },
+                    horzLines: { color: isDark ? '#2d3a5a' : '#dbe0e8' },
+                },
+                timeScale: {
+                    borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                },
+                rightPriceScale: {
+                    borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                },
+            });
+            // Force redraw with current data
+            if (lastCandles && lastCandles.length > 0) {
+                drawChart(lastPrices, lastSupport, lastResistance,
+                          lastChartLevels, lastChartTrades, lastCandles);
+            }
+        }
+
+        function toLWCandles(candles) {
+            return candles.map(c => ({
+                time: c.time,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+            }));
+        }
+
+        function toLWLine(prices, candles) {
+            if (candles && candles.length) {
+                return candles.map(c => ({ time: c.time, value: c.close }));
+            }
+            return prices.map((p, i) => ({ time: i, value: p }));
+        }
+
+        function drawChart(prices, support, resistance, chartLevels, chartTrades, candles) {
+            // Ensure chart is valid; reinitialise if needed
+            if (!chart || typeof chart.addCandlestickSeries !== 'function') {
+                initChart();
+                if (!chart || typeof chart.addCandlestickSeries !== 'function') {
+                    console.warn('Chart not available – skipping draw.');
+                    return;
+                }
+            }
+
+            const sourceCandles = (candles || []).filter(c => c.close > 0);
+            const hasData = sourceCandles.length > 0 || (prices && prices.length > 0);
+
+            if (!hasData) {
+                chart.applyOptions({
+                    watermark: {
+                        visible: true,
+                        fontSize: 16,
+                        color: 'rgba(100, 100, 100, 0.5)',
+                        text: 'No data available – refresh or select a symbol',
+                        horzAlign: 'center',
+                        vertAlign: 'center',
+                    }
+                });
+                if (priceSeries) { chart.removeSeries(priceSeries); priceSeries = null; }
+                Object.keys(horizontalSeries).forEach(key => { chart.removeSeries(horizontalSeries[key]); });
+                horizontalSeries = {};
+                if (indicatorMarkers) { chart.removeSeries(indicatorMarkers); indicatorMarkers = null; }
+                return;
+            } else {
+                chart.applyOptions({ watermark: { visible: false } });
+            }
+
+            if (priceSeries) { chart.removeSeries(priceSeries); priceSeries = null; }
+            Object.keys(horizontalSeries).forEach(key => { chart.removeSeries(horizontalSeries[key]); });
+            horizontalSeries = {};
+            if (indicatorMarkers) { chart.removeSeries(indicatorMarkers); indicatorMarkers = null; }
+
+            const candleMode = chartMode === 'candles' && sourceCandles.length >= 2;
+
+            if (candleMode) {
+                const lastPrice = sourceCandles.length ? sourceCandles[sourceCandles.length - 1].close : 1;
+                const { precision, minMove } = getPriceFormat(lastPrice);
+                priceSeries = chart.addCandlestickSeries({
+                    upColor: cssVar('--good') || '#0b7e4a',
+                    downColor: cssVar('--bad') || '#b91c1c',
+                    borderUpColor: cssVar('--good') || '#0b7e4a',
+                    borderDownColor: cssVar('--bad') || '#b91c1c',
+                    wickUpColor: cssVar('--good') || '#0b7e4a',
+                    wickDownColor: cssVar('--bad') || '#b91c1c',
+                    priceFormat: {
+                        type: 'price',
+                        precision: precision,
+                        minMove: minMove,
+                    },
+                });
+                priceSeries.setData(toLWCandles(sourceCandles));
+            } else {
+                const lastPrice = sourceCandles.length ? sourceCandles[sourceCandles.length - 1].close : (prices.length ? prices[prices.length - 1] : 1);
+                const { precision, minMove } = getPriceFormat(lastPrice);
+                const lineData = sourceCandles.length ? sourceCandles.map(c => ({ time: c.time, value: c.close })) :
+                                                        prices.map((p, i) => ({ time: i, value: p }));
+                priceSeries = chart.addLineSeries({
+                    color: cssVar('--accent') || '#2563eb',
+                    lineWidth: 2,
+                    priceFormat: {
+                        type: 'price',
+                        precision: precision,
+                        minMove: minMove,
+                    },
+                });
+                priceSeries.setData(lineData);
+            }
+
+            // ── Horizontal levels ──
+            const levelMap = {
+                support: { value: support, label: 'Support', color: cssVar('--good') || '#0b7e4a', dash: [6,5] },
+                resistance: { value: resistance, label: 'Resistance', color: cssVar('--bad') || '#b91c1c', dash: [6,5] },
+                entry: { value: chartLevels.entry, label: 'Entry', color: cssVar('--accent') || '#2563eb', dash: [] },
+                stop: { value: chartLevels.stop, label: 'Stop', color: cssVar('--bad') || '#b91c1c', dash: [3,4] },
+                target: { value: chartLevels.target, label: 'Target', color: cssVar('--good') || '#0b7e4a', dash: [3,4] },
+                partial: { value: chartLevels.partial, label: 'Partial', color: cssVar('--warn') || '#b45309', dash: [4,4] },
+                trailing: { value: chartLevels.trailing, label: 'Trailing', color: '#8b5cf6', dash: [2,5] },
+            };
+
+            let timePoints = [];
+            if (sourceCandles.length > 0) {
+                timePoints = sourceCandles.map(c => c.time);
+            } else if (prices.length > 0) {
+                timePoints = prices.map((_, i) => i);
+            }
+            if (timePoints.length < 2) timePoints = [0, 1];
+
+            Object.keys(levelMap).forEach(key => {
+                const item = levelMap[key];
+                if (!indicatorState[key]) return;
+                if (item.value === null || item.value === undefined) return;
+                const val = Number(item.value);
+                if (isNaN(val) || val <= 0) return;
+
+                const series = chart.addLineSeries({
+                    color: item.color,
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    priceLineVisible: true,
+                    priceLineWidth: 1,
+                    priceLineColor: item.color,
+                    priceLineStyle: LightweightCharts.LineStyle.Dashed,
+                    priceLineLabelVisible: true,
+                    priceLineLabel: item.label + ' ' + priceText(val, lastChartSymbol),
+                    lastValueVisible: false,
+                    crosshairMarkerVisible: false,
+                });
+                const firstTime = timePoints[0];
+                const lastTime = timePoints[timePoints.length - 1];
+                series.setData([
+                    { time: firstTime, value: val },
+                    { time: lastTime, value: val },
+                ]);
+                horizontalSeries[key] = series;
+            });
+
+            // ── Markers ──
+            const markerData = [];
+
+            if (indicatorState.trades) {
+                chartTrades.slice(-20).forEach(t => {
+                    const price = Number(t.price || 0);
+                    if (!price) return;
+                    let timeIdx = 0;
+                    if (sourceCandles.length) {
+                        let diff = Infinity;
+                        sourceCandles.forEach((c, i) => {
+                            const d = Math.abs(c.time - (t.time || 0));
+                            if (d < diff) { diff = d; timeIdx = i; }
+                        });
+                    }
+                    const time = sourceCandles[timeIdx] ? sourceCandles[timeIdx].time : timeIdx;
+                    const isBuy = t.side === 'BUY';
+                    markerData.push({
+                        time: time,
+                        position: isBuy ? 'belowBar' : 'aboveBar',
+                        color: isBuy ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
+                        shape: isBuy ? 'arrowUp' : 'arrowDown',
+                        text: t.side,
+                    });
+                });
+            }
+
+            if (indicatorState.engulfing) {
+                const engulfing = detectEngulfing(sourceCandles);
+                engulfing.forEach(e => {
+                    const candle = sourceCandles[e.index];
+                    if (!candle) return;
+                    const isBullish = e.type === 'bullish';
+                    markerData.push({
+                        time: candle.time,
+                        position: isBullish ? 'belowBar' : 'aboveBar',
+                        color: isBullish ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
+                        shape: 'circle',
+                        text: 'ENG',
+                    });
+                });
+            }
+
+            if (indicatorState.breakouts) {
+                const breakouts = detectBreakouts(sourceCandles, support, resistance);
+                breakouts.forEach(b => {
+                    const candle = sourceCandles[b.index];
+                    if (!candle) return;
+                    const isBull = b.type === 'resistance_breakout';
+                    markerData.push({
+                        time: candle.time,
+                        position: 'aboveBar',
+                        color: '#f59e0b',
+                        shape: 'circle',
+                        text: isBull ? 'BRK↑' : 'BRK↓',
+                    });
+                });
+            }
+
+            if (indicatorState.trends) {
+                const settings = lastStatusData?.settings || {};
+                const shortWindow = parseInt(settings.short_window) || 5;
+                const longWindow = parseInt(settings.long_window) || 20;
+                const crossovers = detectCrossovers(
+                    sourceCandles.length ? sourceCandles.map(c => c.close) : prices,
+                    shortWindow, longWindow
+                );
+                crossovers.forEach(c => {
+                    const candle = sourceCandles[c.index];
+                    if (!candle) return;
+                    const isBullish = c.type === 'bullish';
+                    markerData.push({
+                        time: candle.time,
+                        position: isBullish ? 'belowBar' : 'aboveBar',
+                        color: isBullish ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
+                        shape: 'circle',
+                        text: isBullish ? '↑TR' : '↓TR',
+                    });
+                });
+            }
+
+            if (sourceCandles.length > 0) {
+                const lastCandle = sourceCandles[sourceCandles.length - 1];
+                const lastTime = lastCandle.time;
+
+                if (indicatorState.macd) {
+                    const macdData = macd(
+                        sourceCandles.length ? sourceCandles.map(c => c.close) : prices,
+                        12, 26, 9
+                    );
+                    if (macdData && macdData.signal !== null) {
+                        const isBuy = macdData.macd > macdData.signal;
+                        markerData.push({
+                            time: lastTime,
+                            position: 'aboveBar',
+                            color: isBuy ? '#06b6d4' : '#ec4899',
+                            shape: 'circle',
+                            text: isBuy ? 'MACD↑' : 'MACD↓',
+                        });
+                    }
+                }
+
+                if (indicatorState.rsi) {
+                    const rsiVal = rsi(
+                        sourceCandles.length ? sourceCandles.map(c => c.close) : prices,
+                        14
+                    );
+                    if (rsiVal !== null) {
+                        if (rsiVal >= 70) {
+                            markerData.push({
+                                time: lastTime,
+                                position: 'aboveBar',
+                                color: cssVar('--bad') || '#b91c1c',
+                                shape: 'circle',
+                                text: `RSI ${Math.round(rsiVal)}`,
+                            });
+                        } else if (rsiVal <= 30) {
+                            markerData.push({
+                                time: lastTime,
+                                position: 'belowBar',
+                                color: cssVar('--good') || '#0b7e4a',
+                                shape: 'circle',
+                                text: `RSI ${Math.round(rsiVal)}`,
+                            });
+                        }
+                    }
+                }
+
+                if (indicatorState.volume) {
+                    const spikes = detectVolumeSpikes(sourceCandles, 2);
+                    if (spikes.length > 0) {
+                        const lastSpike = spikes[spikes.length - 1];
+                        const candle = sourceCandles[lastSpike.index];
+                        if (candle) {
+                            markerData.push({
+                                time: candle.time,
+                                position: 'aboveBar',
+                                color: '#a855f7',
+                                shape: 'circle',
+                                text: `VOL ${Math.round(lastSpike.volume / lastSpike.avg)}x`,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (markerData.length > 0) {
+                const dummySeries = chart.addLineSeries({
+                    color: 'transparent',
+                    lineWidth: 0,
+                    priceLineVisible: false,
+                    lastValueVisible: false,
+                    crosshairMarkerVisible: false,
+                });
+                const firstTime = sourceCandles.length ? sourceCandles[0].time : 0;
+                dummySeries.setData([{ time: firstTime, value: 0 }]);
+                dummySeries.setMarkers(markerData);
+                indicatorMarkers = dummySeries;
+            }
+
+            updateChartTimeRange(sourceCandles);
+        }
 
         function updateChartTimeRange(candles) {
             if (!els.chartTimeRange || !candles || candles.length < 2) {
@@ -1774,312 +2568,115 @@
             }
         }
 
-        function redrawChart() {
-            drawChart(lastPrices, lastSupport, lastResistance, lastChartLevels, lastChartTrades, lastCandles);
-        }
+        // ---- Refresh chart ----
+        async function refreshChartWithTimeframe() {
+            const symbol = els.chartSymbolSelect?.value ||
+                           lastStatusData?.active_symbol ||
+                           lastStatusData?.settings?.symbol ||
+                           'BTC';
 
-        function drawChart(prices, support, resistance, chartLevels, chartTrades, candles) {
-            const sourceCandles = (candles || []).map(c => ({
-                time: Number(c.time || 0),
-                open: Number(c.open || c.close || 0),
-                high: Number(c.high || c.close || 0),
-                low: Number(c.low || c.close || 0),
-                close: Number(c.close || 0),
-                volume: Number(c.volume || 0)
-            })).filter(c => c.close > 0);
-            const candleMode = chartMode === 'candles' && sourceCandles.length >= 2;
-            const chartPrices = candleMode ? sourceCandles.map(c => c.close) : (prices || []);
-            lastPrices = chartPrices;
-            lastSupport = support;
-            lastResistance = resistance;
-            lastChartLevels = chartLevels || {};
-            lastChartTrades = chartTrades || [];
-            lastCandles = candles || [];
+            const cacheKey = `${symbol}_${chartTimeframe}`;
 
-            const canvas = els.chart;
-            resizeChartCanvas(canvas);
-            const ctx = canvas.getContext('2d');
-            const W = canvas.width,
-                H = canvas.height;
-            ctx.clearRect(0, 0, W, H);
-            ctx.fillStyle = cssVar('--panel') || '#ffffff';
-            ctx.fillRect(0, 0, W, H);
-
-            if (chartPrices.length < 2) {
-                ctx.fillStyle = cssVar('--muted') || '#64748b';
-                ctx.font = '14px system-ui';
-                ctx.fillText('Waiting for price data…', 20, 30);
+            const cached = cachedCandles[cacheKey];
+            if (cached && (Date.now() - cached.timestamp < 300000)) {
+                updateChartWithCandles(cached.data, symbol);
                 return;
             }
 
-            const lows = candleMode ? sourceCandles.map(c => c.low) : chartPrices;
-            const highs = candleMode ? sourceCandles.map(c => c.high) : chartPrices;
-            let min = Math.min(...lows);
-            let max = Math.max(...highs);
+            try {
+                els.signalText.textContent = '⏳ Loading...';
 
-            const planLines = [];
-            if (indicatorState.support && support !== null && support !== undefined) planLines.push({ value: support, label: 'Support', color: cssVar('--good') || '#0b7e4a', dash: [6, 5] });
-            if (indicatorState.resistance && resistance !== null && resistance !== undefined) planLines.push({ value: resistance, label: 'Resistance', color: cssVar('--bad') || '#b91c1c', dash: [6, 5] });
-            if (indicatorState.entry && chartLevels.entry) planLines.push({ value: chartLevels.entry, label: 'Entry', color: cssVar('--accent') || '#2563eb', dash: [] });
-            if (indicatorState.stop && chartLevels.stop) planLines.push({ value: chartLevels.stop, label: 'Stop', color: cssVar('--bad') || '#b91c1c', dash: [3, 4] });
-            if (indicatorState.target && chartLevels.target) planLines.push({ value: chartLevels.target, label: 'Target', color: cssVar('--good') || '#0b7e4a', dash: [3, 4] });
-            if (indicatorState.partial && chartLevels.partial) planLines.push({ value: chartLevels.partial, label: 'Partial', color: cssVar('--warn') || '#b45309', dash: [4, 4] });
-            if (indicatorState.trailing && chartLevels.trailing) planLines.push({ value: chartLevels.trailing, label: 'Trailing', color: '#8b5cf6', dash: [2, 5] });
+                const response = await fetch(`/api/candles?symbol=${symbol}&granularity=${chartTimeframe}&count=500&quote=${displayCurrency}`);
+                const data = await response.json();
 
-            const lineVals = planLines.map(l => Number(l.value)).filter(v => v > 0);
-            if (lineVals.length) { min = Math.min(min, ...lineVals);
-                max = Math.max(max, ...lineVals); }
-            const range = Math.max(max - min, 0.00000001);
-            const pad = 20;
-            const bottomPad = 40;
-            const xFor = i => pad + (i / Math.max(1, chartPrices.length - 1)) * (W - pad * 2);
-            const yFor = p => H - bottomPad - ((p - min) / range) * (H - pad - bottomPad);
+                if (data.ok && data.candles && data.candles.length > 0) {
+                    cachedCandles[cacheKey] = {
+                        data: data,
+                        timestamp: Date.now()
+                    };
 
-            ctx.strokeStyle = cssVar('--line') || '#dbe0e8';
-            ctx.lineWidth = 1;
-            for (let i = 0; i < 4; i++) {
-                const y = pad + ((H - pad - bottomPad) / 3) * i;
-                ctx.beginPath();
-                ctx.moveTo(pad, y);
-                ctx.lineTo(W - pad, y);
-                ctx.stroke();
-            }
+                    updateChartWithCandles(data, symbol);
+                    updateChartTimeRange(data.candles);
 
-            if (candleMode) {
-                const bw = Math.max(3, Math.min(12, ((W - pad * 2) / sourceCandles.length) * 0.6));
-                sourceCandles.forEach((c, i) => {
-                    const x = xFor(i);
-                    const yO = yFor(c.open),
-                        yH = yFor(c.high),
-                        yL = yFor(c.low),
-                        yC = yFor(c.close);
-                    const up = c.close >= c.open;
-                    const col = up ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c');
-                    ctx.strokeStyle = col;
-                    ctx.fillStyle = col;
-                    ctx.lineWidth = 1;
-                    ctx.beginPath();
-                    ctx.moveTo(x, yH);
-                    ctx.lineTo(x, yL);
-                    ctx.stroke();
-                    const top = Math.min(yO, yC),
-                        bh = Math.max(2, Math.abs(yC - yO));
-                    ctx.fillRect(x - bw / 2, top, bw, bh);
-                });
-            } else {
-                ctx.strokeStyle = cssVar('--accent') || '#2563eb';
-                ctx.lineWidth = 2;
-                ctx.beginPath();
-                chartPrices.forEach((p, i) => {
-                    const x = xFor(i),
-                        y = yFor(p);
-                    if (i === 0) ctx.moveTo(x, y);
-                    else ctx.lineTo(x, y);
-                });
-                ctx.stroke();
-            }
-
-            const lastP = Number(chartPrices[chartPrices.length - 1]);
-            const lx = xFor(chartPrices.length - 1),
-                ly = yFor(lastP);
-            ctx.fillStyle = cssVar('--accent') || '#2563eb';
-            ctx.beginPath();
-            ctx.arc(lx, ly, 4, 0, Math.PI * 2);
-            ctx.fill();
-
-            planLines.forEach((level, idx) => {
-                const y = yFor(Number(level.value));
-                ctx.strokeStyle = level.color;
-                ctx.lineWidth = 1.5;
-                ctx.setLineDash(level.dash);
-                ctx.beginPath();
-                ctx.moveTo(pad, y);
-                ctx.lineTo(W - pad, y);
-                ctx.stroke();
-                ctx.setLineDash([]);
-                ctx.fillStyle = level.color;
-                ctx.font = '11px system-ui';
-                const label = `${level.label} ${priceText(level.value, lastChartSymbol)}`;
-                ctx.fillText(label, W - 200, 18 + idx * 16);
-            });
-
-            const timestamps = candleMode ? sourceCandles.map(c => c.time) : null;
-            const dataLength = chartPrices.length;
-            const maxLabels = Math.min(10, dataLength);
-            const step = Math.max(1, Math.floor(dataLength / maxLabels));
-
-            ctx.fillStyle = cssVar('--muted') || '#64748b';
-            ctx.font = '10px system-ui';
-            ctx.textAlign = 'center';
-
-            for (let i = 0; i < dataLength; i += step) {
-                const x = xFor(i);
-                let timeLabel = '';
-                if (timestamps && timestamps[i]) {
-                    const date = new Date(timestamps[i] * 1000);
-                    const hours = date.getHours().toString().padStart(2, '0');
-                    const mins = date.getMinutes().toString().padStart(2, '0');
-                    timeLabel = `${hours}:${mins}`;
+                    const tfLabel = getTimeframeLabel(chartTimeframe);
+                    els.signalText.textContent = `📊 ${tfLabel}`;
                 } else {
-                    timeLabel = `#${i + 1}`;
+                    els.signalText.textContent = '❌ No data';
                 }
-                if (i % (step * 1) === 0 || i === dataLength - 1) {
-                    ctx.fillText(timeLabel, x, H - 12);
-                }
+            } catch (e) {
+                console.error('Failed to fetch candles:', e);
+                els.signalText.textContent = '❌ Error loading chart';
             }
-
-            if (dataLength > 0) {
-                const firstX = xFor(0);
-                let firstLabel = '';
-                if (timestamps && timestamps[0]) {
-                    const date = new Date(timestamps[0] * 1000);
-                    const hours = date.getHours().toString().padStart(2, '0');
-                    const mins = date.getMinutes().toString().padStart(2, '0');
-                    firstLabel = `${hours}:${mins}`;
-                } else {
-                    firstLabel = '#1';
-                }
-                ctx.textAlign = 'left';
-                ctx.fillStyle = cssVar('--muted') || '#64748b';
-                ctx.font = '10px system-ui';
-                ctx.fillText(firstLabel, pad, H - 12);
-
-                const lastX = xFor(dataLength - 1);
-                let lastLabel = '';
-                if (timestamps && timestamps[dataLength - 1]) {
-                    const date = new Date(timestamps[dataLength - 1] * 1000);
-                    const hours = date.getHours().toString().padStart(2, '0');
-                    const mins = date.getMinutes().toString().padStart(2, '0');
-                    lastLabel = `${hours}:${mins}`;
-                } else {
-                    lastLabel = `#${dataLength}`;
-                }
-                ctx.textAlign = 'right';
-                ctx.fillStyle = cssVar('--accent') || '#2563eb';
-                ctx.font = '10px system-ui';
-                ctx.fillText(lastLabel, W - pad, H - 12);
-            }
-
-            if (indicatorState.trades) {
-                chartTrades.slice(-12).forEach(t => {
-                    const price = Number(t.price || 0);
-                    if (!price) return;
-                    let ci = 0,
-                        cd = Infinity;
-                    chartPrices.forEach((p, i) => { const d = Math.abs(Number(p) - price); if (d < cd) { cd = d;
-                            ci = i; } });
-                    const x = xFor(ci),
-                        y = yFor(price);
-                    const isBuy = t.side === 'BUY';
-                    ctx.fillStyle = isBuy ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c');
-                    ctx.beginPath();
-                    if (isBuy) { ctx.moveTo(x, y - 7);
-                        ctx.lineTo(x - 6, y + 5);
-                        ctx.lineTo(x + 6, y + 5); } else { ctx.moveTo(x, y + 7);
-                        ctx.lineTo(x - 6, y - 5);
-                        ctx.lineTo(x + 6, y - 5); }
-                    ctx.closePath();
-                    ctx.fill();
-                });
-            }
-
-            if (chartHoverIndex !== null && chartPrices.length) {
-                const idx = Math.max(0, Math.min(chartPrices.length - 1, chartHoverIndex));
-                const hp = Number(chartPrices[idx]);
-                const hx = xFor(idx),
-                    hy = yFor(hp);
-                ctx.strokeStyle = cssVar('--muted') || '#64748b';
-                ctx.lineWidth = 1;
-                ctx.setLineDash([4, 4]);
-                ctx.beginPath();
-                ctx.moveTo(hx, pad);
-                ctx.lineTo(hx, H - bottomPad);
-                ctx.moveTo(pad, hy);
-                ctx.lineTo(W - pad, hy);
-                ctx.stroke();
-                ctx.setLineDash([]);
-                ctx.fillStyle = cssVar('--accent') || '#2563eb';
-                ctx.beginPath();
-                ctx.arc(hx, hy, 4, 0, Math.PI * 2);
-                ctx.fill();
-
-                let timeLabel = '';
-                if (timestamps && timestamps[idx]) {
-                    const date = new Date(timestamps[idx] * 1000);
-                    timeLabel = date.toLocaleString();
-                } else {
-                    timeLabel = `Bar #${idx + 1}`;
-                }
-
-                const label = `${candleMode ? 'Close' : ''} ${priceText(hp, lastChartSymbol)} ${timeLabel}`;
-                ctx.font = '12px system-ui';
-                const tw = ctx.measureText(label).width + 16,
-                    th = 24;
-                const bx = Math.min(W - tw - pad, hx + 10),
-                    by = Math.max(pad, Math.min(H - bottomPad - th, hy - 32));
-                ctx.fillStyle = cssVar('--panel') || '#ffffff';
-                ctx.strokeStyle = cssVar('--line') || '#dbe0e8';
-                ctx.lineWidth = 1;
-                ctx.fillRect(bx, by, tw, th);
-                ctx.strokeRect(bx, by, tw, th);
-                ctx.fillStyle = cssVar('--text') || '#1e293b';
-                ctx.fillText(label, bx + 8, by + 16);
-            }
-
-            ctx.fillStyle = cssVar('--muted') || '#64748b';
-            ctx.font = '11px system-ui';
-            ctx.textAlign = 'left';
-            ctx.fillText(`High ${priceText(max, lastChartSymbol)}`, pad, 14);
-            ctx.fillText(`Low ${priceText(min, lastChartSymbol)}`, pad, H - bottomPad + 18);
-
-            ctx.textAlign = 'right';
-            ctx.fillStyle = cssVar('--muted') || '#64748b';
-            ctx.font = '10px system-ui';
-            ctx.fillText(`${chartPrices.length} bars`, W - pad, 14);
         }
 
-        // ---- chart events ----
-        function handleChartMove(e) {
-            if (lastPrices.length < 2) return;
-            const rect = els.chart.getBoundingClientRect();
-            const pad = 20;
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const x = clientX - rect.left;
-            const ratio = Math.max(0, Math.min(1, (x - pad) / Math.max(1, rect.width - pad * 2)));
-            chartHoverIndex = Math.round(ratio * (lastPrices.length - 1));
-            redrawChart();
+        function updateChartWithCandles(data, symbol) {
+            const candles = data.candles.map(c => ({
+                time: c.time,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume
+            }));
+
+            lastCandles = candles;
+            lastPrices = candles.map(c => c.close);
+            lastSupport = data.support;
+            lastResistance = data.resistance;
+            lastChartSymbol = symbol;
+
+            const pos = (lastStatusData?.positions || []).find(p => p.symbol === symbol) || null;
+            lastChartLevels = {
+                entry: pos?.entry_price || pos?.entry || null,
+                stop: pos?.stop_price || pos?.stop || pos?.stop_loss || null,
+                target: pos?.target_price || pos?.target || pos?.take_profit || null,
+                partial: pos?.partial_take_profit_price || pos?.partial || null,
+                trailing: pos?.trailing_stop_price || pos?.trailing || null,
+            };
+
+            lastChartTrades = (lastStatusData?.trades || [])
+                .filter(t => String(t.symbol || '') === symbol)
+                .slice(-30);
+
+            drawChart(lastPrices, lastSupport, lastResistance,
+                      lastChartLevels, lastChartTrades, lastCandles);
         }
 
-        els.chart.addEventListener('mousemove', handleChartMove);
-        els.chart.addEventListener('mouseleave', () => { chartHoverIndex = null;
-            redrawChart(); });
-
-        els.chart.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            handleChartMove(e);
-        }, { passive: false });
-        els.chart.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            handleChartMove(e);
-        }, { passive: false });
-        els.chart.addEventListener('touchend', () => {
-            chartHoverIndex = null;
-            redrawChart();
+        // ---- Refresh button ----
+        els.refreshChartBtn.addEventListener('click', () => {
+            if (lastStatusData) {
+                refreshChartWithTimeframe();
+            }
         });
 
-        window.addEventListener('resize', redrawChart);
-        els.refreshChartBtn.addEventListener('click', () => { if (lastStatusData) redrawChart(); });
+        // ---- Timeframe selector ----
+        els.chartTimeframeSelect?.addEventListener('change', function() {
+            chartTimeframe = parseInt(this.value);
+            localStorage.setItem('cryptobot-chart-timeframe', String(chartTimeframe));
+            if (lastStatusData) {
+                refreshChartWithTimeframe();
+            }
+        });
 
+        // ─── FIXED: Indicator toggles ──────────────────────────────────
         document.querySelectorAll('#indicatorDropdown input[data-indicator]').forEach(cb => {
             const key = cb.dataset.indicator;
             cb.checked = indicatorState[key] !== false;
             cb.addEventListener('change', () => {
                 indicatorState[key] = cb.checked;
                 localStorage.setItem('cryptobot-indicators', JSON.stringify(indicatorState));
-                if (lastStatusData) redrawChart();
+                console.log(`Indicator "${key}" toggled to ${cb.checked}`);
+
+                // Force a full chart refresh – this will redraw everything
+                if (lastStatusData) {
+                    refreshChartWithTimeframe();
+                } else {
+                    console.warn('No status data – cannot refresh chart.');
+                }
             });
         });
 
+        // ---- Trade card click ----
         function setupTradeCardClick() {
             document.addEventListener('click', function(e) {
                 const card = e.target.closest('.trade-card');
@@ -2092,8 +2689,7 @@
                 els.chartSymbolSelect.value = symbol;
                 localStorage.setItem('cryptobot-chart-symbol', symbol);
                 if (lastStatusData) {
-                    chartHoverIndex = null;
-                    render(lastStatusData);
+                    refreshChartWithTimeframe();
                 }
                 card.style.transition = 'background 0.15s';
                 card.style.background = 'var(--accent)';
@@ -2106,6 +2702,281 @@
         }
         setupTradeCardClick();
 
+        // ---- STRATEGY PRESETS ----
+        const strategyPresets = {
+            openingRange: {
+                strategy: 'opening_range',
+                live_granularity: 900,
+                live_candle_count: 300,
+                poll_seconds: 15,
+                opening_range_minutes: 15,
+                opening_range_atr_period: 14,
+                opening_range_manipulation_threshold: 0.20,
+                opening_range_stop_loss_atr_multiplier: 1.5,
+                opening_range_take_profit_atr_multiplier: 2.5,
+                stop_loss_pct: 2.0,
+                take_profit_pct: 3.0,
+                max_position_pct: 0.25,
+                risk_per_trade_pct: 1.0,
+                daily_loss_limit_pct: 5.0,
+                max_drawdown_pct: 20.0,
+                partial_take_profit_enabled: true,
+                trailing_stop_enabled: true,
+                allow_short_selling: false,
+                use_sr_filter: true,
+                regime_filter_enabled: false,
+                closed_candle_only: true,
+                description: 'Classic Opening Range breakout strategy'
+            },
+            scalping: {
+                strategy: 'ewo_offset',
+                live_granularity: 300,
+                live_candle_count: 100,
+                poll_seconds: 5,
+                short_window: 5,
+                long_window: 20,
+                base_nb_candles_buy: 8,
+                base_nb_candles_sell: 16,
+                low_offset: 0.998,
+                low_offset_2: 0.995,
+                high_offset: 1.002,
+                high_offset_2: 1.005,
+                ewo_high: 0.05,
+                ewo_high_2: -0.05,
+                ewo_low: -0.15,
+                rsi_buy: 65,
+                stop_loss_pct: 0.8,
+                take_profit_pct: 1.2,
+                max_position_pct: 0.25,
+                risk_per_trade_pct: 1.5,
+                daily_loss_limit_pct: 6.0,
+                max_drawdown_pct: 15.0,
+                max_oanda_open_trades: 4,
+                partial_take_profit_enabled: true,
+                partial_take_profit_pct: 50,
+                partial_take_profit_at_target_pct: 50,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 0.6,
+                trailing_activation_pct: 1.0,
+                allow_short_selling: true,
+                closed_candle_only: false,
+                use_sr_filter: false,
+                regime_filter_enabled: false,
+                description: 'High-frequency scalping with tight stops'
+            },
+            momentum: {
+                strategy: 'sma_cross',
+                live_granularity: 900,
+                live_candle_count: 200,
+                poll_seconds: 10,
+                short_window: 8,
+                long_window: 21,
+                stop_loss_pct: 1.5,
+                take_profit_pct: 2.5,
+                max_position_pct: 0.30,
+                risk_per_trade_pct: 1.2,
+                daily_loss_limit_pct: 4.0,
+                max_drawdown_pct: 18.0,
+                max_oanda_open_trades: 3,
+                partial_take_profit_enabled: true,
+                partial_take_profit_pct: 50,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 1.0,
+                trailing_activation_pct: 2.0,
+                allow_short_selling: true,
+                use_sr_filter: true,
+                regime_filter_enabled: true,
+                allow_trending_regime: true,
+                allow_ranging_regime: false,
+                allow_volatile_regime: false,
+                allow_dead_regime: false,
+                closed_candle_only: true,
+                description: 'Trend following with 8/21 SMA cross'
+            },
+            meanReversion: {
+                strategy: 'sma_cross',
+                live_granularity: 900,
+                live_candle_count: 300,
+                poll_seconds: 15,
+                short_window: 20,
+                long_window: 50,
+                stop_loss_pct: 1.8,
+                take_profit_pct: 1.8,
+                max_position_pct: 0.20,
+                risk_per_trade_pct: 0.8,
+                daily_loss_limit_pct: 3.0,
+                max_drawdown_pct: 12.0,
+                max_oanda_open_trades: 2,
+                partial_take_profit_enabled: false,
+                trailing_stop_enabled: false,
+                allow_short_selling: true,
+                use_sr_filter: true,
+                regime_filter_enabled: true,
+                allow_trending_regime: false,
+                allow_ranging_regime: true,
+                allow_volatile_regime: false,
+                allow_dead_regime: false,
+                closed_candle_only: true,
+                description: 'Buy dips, sell rips with SMA reversion'
+            },
+            breakout: {
+                strategy: 'opening_range',
+                live_granularity: 300,
+                live_candle_count: 200,
+                poll_seconds: 10,
+                opening_range_minutes: 30,
+                opening_range_atr_period: 10,
+                opening_range_manipulation_threshold: 0.15,
+                opening_range_stop_loss_atr_multiplier: 1.2,
+                opening_range_take_profit_atr_multiplier: 2.0,
+                stop_loss_pct: 1.2,
+                take_profit_pct: 2.0,
+                max_position_pct: 0.30,
+                risk_per_trade_pct: 1.5,
+                daily_loss_limit_pct: 5.0,
+                max_drawdown_pct: 20.0,
+                max_oanda_open_trades: 3,
+                partial_take_profit_enabled: true,
+                partial_take_profit_pct: 50,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 0.8,
+                trailing_activation_pct: 1.5,
+                allow_short_selling: true,
+                use_sr_filter: true,
+                regime_filter_enabled: false,
+                closed_candle_only: true,
+                description: 'Breakout trading with 30-min opening range'
+            },
+            swing: {
+                strategy: 'sma_cross',
+                live_granularity: 3600,
+                live_candle_count: 300,
+                poll_seconds: 30,
+                short_window: 10,
+                long_window: 30,
+                stop_loss_pct: 2.5,
+                take_profit_pct: 5.0,
+                max_position_pct: 0.35,
+                risk_per_trade_pct: 1.5,
+                daily_loss_limit_pct: 5.0,
+                max_drawdown_pct: 25.0,
+                max_oanda_open_trades: 2,
+                partial_take_profit_enabled: true,
+                partial_take_profit_pct: 30,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 1.5,
+                trailing_activation_pct: 3.0,
+                allow_short_selling: true,
+                use_sr_filter: true,
+                regime_filter_enabled: true,
+                allow_trending_regime: true,
+                allow_ranging_regime: true,
+                allow_volatile_regime: false,
+                allow_dead_regime: false,
+                closed_candle_only: true,
+                description: 'Multi-day swing trades with 1h candles'
+            },
+            ewo: {
+                strategy: 'ewo_offset',
+                live_granularity: 900,
+                live_candle_count: 300,
+                poll_seconds: 15,
+                short_window: 5,
+                long_window: 20,
+                base_nb_candles_buy: 14,
+                base_nb_candles_sell: 24,
+                low_offset: 0.975,
+                low_offset_2: 0.955,
+                high_offset: 0.991,
+                high_offset_2: 0.997,
+                ewo_high: 2.327,
+                ewo_high_2: -2.327,
+                ewo_low: -20.988,
+                rsi_buy: 69,
+                stop_loss_pct: 2.0,
+                take_profit_pct: 3.0,
+                max_position_pct: 0.25,
+                risk_per_trade_pct: 1.0,
+                daily_loss_limit_pct: 5.0,
+                max_drawdown_pct: 20.0,
+                max_oanda_open_trades: 3,
+                partial_take_profit_enabled: true,
+                partial_take_profit_pct: 50,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 1.0,
+                trailing_activation_pct: 2.0,
+                allow_short_selling: false,
+                use_sr_filter: true,
+                regime_filter_enabled: false,
+                closed_candle_only: true,
+                description: 'EWO SMA offset with RSI filter'
+            },
+            emaGoldenCross: {
+                strategy: 'ema_golden_cross',
+                live_granularity: 3600,
+                live_candle_count: 300,
+                poll_seconds: 20,
+                ema_short: 50,
+                ema_long: 200,
+                stop_loss_pct: 2.5,
+                take_profit_pct: 4.0,
+                max_position_pct: 0.30,
+                risk_per_trade_pct: 1.5,
+                daily_loss_limit_pct: 5.0,
+                max_drawdown_pct: 20.0,
+                max_oanda_open_trades: 3,
+                partial_take_profit_enabled: true,
+                partial_take_profit_pct: 50,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 1.0,
+                trailing_activation_pct: 2.0,
+                allow_short_selling: true,
+                use_sr_filter: true,
+                regime_filter_enabled: true,
+                allow_trending_regime: true,
+                allow_ranging_regime: false,
+                allow_volatile_regime: false,
+                allow_dead_regime: false,
+                closed_candle_only: true,
+                description: 'Classic 50/200 EMA Golden Cross strategy'
+            }
+        };
+
+        function applyStrategyPreset(name) {
+            const preset = strategyPresets[name];
+            if (!preset) return;
+
+            Object.entries(preset).forEach(([key, value]) => {
+                const field = els.settingsForm.elements[key];
+                if (field) {
+                    field.value = String(value);
+                }
+            });
+
+            settingsFormDirty = true;
+            els.presetStatus.textContent = preset.description;
+            els.presetStatus.style.color = 'var(--good)';
+
+            document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+            const activeBtn = document.getElementById(`preset${name.charAt(0).toUpperCase() + name.slice(1)}`);
+            if (activeBtn) activeBtn.classList.add('active');
+
+            updateEMASettingsVisibility();
+
+            const event = new Event('change');
+            els.settingsForm.elements.strategy.dispatchEvent(event);
+        }
+
+        document.getElementById('presetOpeningRange').addEventListener('click', () => applyStrategyPreset('openingRange'));
+        document.getElementById('presetScalping').addEventListener('click', () => applyStrategyPreset('scalping'));
+        document.getElementById('presetMomentum').addEventListener('click', () => applyStrategyPreset('momentum'));
+        document.getElementById('presetMeanReversion').addEventListener('click', () => applyStrategyPreset('meanReversion'));
+        document.getElementById('presetBreakout').addEventListener('click', () => applyStrategyPreset('breakout'));
+        document.getElementById('presetSwing').addEventListener('click', () => applyStrategyPreset('swing'));
+        document.getElementById('presetEWO').addEventListener('click', () => applyStrategyPreset('ewo'));
+        document.getElementById('presetEMAGoldenCross').addEventListener('click', () => applyStrategyPreset('emaGoldenCross'));
+
+        // ---- Risk Profiles ----
         const riskProfiles = {
             conservative: {
                 risk_per_trade_pct: 0.5,
@@ -2224,20 +3095,27 @@
         function applyRiskProfile(name) {
             const profile = riskProfiles[name];
             if (!profile) return;
+
             Object.entries(profile).forEach(([key, value]) => {
                 const field = els.settingsForm.elements[key];
                 if (field) {
                     field.value = String(value);
                 }
             });
+
             settingsFormDirty = true;
-            els.presetStatus.textContent = `${name.charAt(0).toUpperCase() + name.slice(1)} profile applied. Save to persist.`;
-            els.presetStatus.style.color = 'var(--good)';
+            els.riskPresetStatus.textContent = `${name.charAt(0).toUpperCase() + name.slice(1)} profile applied. Save to persist.`;
+            els.riskPresetStatus.style.color = 'var(--good)';
+
             document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
-            const activeBtn = document.getElementById(`profile${name.charAt(0).toUpperCase() + name.slice(1)}Btn`);
-            if (activeBtn) activeBtn.classList.add('active');
         }
 
+        document.getElementById('profileConservativeBtn').addEventListener('click', () => applyRiskProfile('conservative'));
+        document.getElementById('profileBalancedBtn').addEventListener('click', () => applyRiskProfile('balanced'));
+        document.getElementById('profileAggressiveBtn').addEventListener('click', () => applyRiskProfile('aggressive'));
+        document.getElementById('profileScalpingBtn').addEventListener('click', () => applyRiskProfile('scalping'));
+
+        // ---- Show/hide EMA settings ----
         function updateEMASettingsVisibility() {
             const strategyField = els.settingsForm.elements['strategy'];
             const emaSettings = document.getElementById('emaSettings');
@@ -2246,6 +3124,7 @@
             emaSettings.classList.toggle('visible', show);
         }
 
+        // ---- Load settings ----
         function loadSettings(data) {
             const settings = data.settings || {};
             Object.entries(settings).forEach(([k, v]) => {
@@ -2259,6 +3138,7 @@
             els.settingsStatus.textContent = 'Settings loaded.';
         }
 
+        // ---- main render ----
         function render(data) {
             lastStatusData = data;
             const settings = data.settings || {};
@@ -2328,10 +3208,23 @@
             renderJournal(data.journal || []);
             renderSetupLearning(data.setup_performance || [], data.setup_records || []);
 
-            const chartData = getChartData(data);
-            lastChartSymbol = chartData.symbol;
-            drawChart(chartData.prices, chartData.support, chartData.resistance, chartData.chartLevels, chartData.chartTrades, chartData.candles);
-            updateChartTimeRange(chartData.candles);
+            // ─── CHART ──────────────────────────────────────────────
+            const cacheKey = `${selectedChartSymbol}_${chartTimeframe}`;
+            const cached = cachedCandles[cacheKey];
+
+            if (cached && (Date.now() - cached.timestamp < 300000)) {
+                updateChartWithCandles(cached.data, selectedChartSymbol);
+                updateChartTimeRange(cached.data.candles);
+            } else {
+                const chartData = getChartData(data);
+                lastChartSymbol = chartData.symbol;
+                drawChart(chartData.prices, chartData.support, chartData.resistance,
+                          chartData.chartLevels, chartData.chartTrades, chartData.candles);
+                updateChartTimeRange(chartData.candles);
+                refreshChartWithTimeframe();
+            }
+
+            updateStreamingUI(data);
         }
 
         function getChartData(data) {
@@ -2353,29 +3246,108 @@
 
         // ---- sub-renderers ----
         function renderPositions(rows) {
-            if (!rows.length) {
-                els.positionsGrid.innerHTML = '<div class="no-positions">No active positions.</div>';
+            const container = document.getElementById('positionsGrid');
+            if (!container) return;
+
+            if (!rows || rows.length === 0) {
+                container.innerHTML = '<div class="no-positions">No active positions.</div>';
                 return;
             }
-            els.positionsGrid.innerHTML = rows.map(row => {
+
+            container.innerHTML = rows.map(row => {
                 const sym = row.symbol || '-';
                 const entry = row.entry_price ?? row.entry ?? null;
                 const current = row.current_price ?? row.price ?? row.last_price ?? null;
                 const pnl = row.unrealized_pnl ?? row.pnl ?? row.current_pnl ?? null;
                 const pnlPct = row.unrealized_pnl_pct ?? row.pnl_pct ?? null;
                 const cls = Number(pnl || 0) >= 0 ? 'good' : 'bad';
-                const stop = row.stop_price ?? row.stop ?? null;
-                const target = row.target_price ?? row.target ?? null;
+                const stop = row.stop_price ?? row.stop ?? row.stop_loss ?? null;
+                const target = row.target_price ?? row.target ?? row.take_profit ?? null;
                 const qty = row.quantity ?? row.qty ?? 0;
+                const isShort = row.is_short || false;
+                const sideText = isShort ? 'SHORT' : 'LONG';
+                const sideClass = isShort ? 'bad' : 'good';
+
+                let stopDisplay = '—';
+                let stopClass = '';
+                if (stop) {
+                    const stopDist = row.stop_distance_pct || 0;
+                    stopDisplay = priceText(stop, sym);
+                    if (Math.abs(stopDist) < 1.5) {
+                        stopClass = 'tpsl-near-stop';
+                        stopDisplay += ' 🔴';
+                    } else if (Math.abs(stopDist) < 3) {
+                        stopClass = 'warn';
+                    }
+                } else {
+                    stopDisplay = '<span class="tpsl-warning">⚠️ None</span>';
+                }
+
+                let targetDisplay = '—';
+                let targetClass = '';
+                if (target) {
+                    const targetDist = row.target_distance_pct || 0;
+                    targetDisplay = priceText(target, sym);
+                    if (Math.abs(targetDist) < 1.5) {
+                        targetClass = 'tpsl-near-target';
+                        targetDisplay += ' 🟢';
+                    } else if (Math.abs(targetDist) < 3) {
+                        targetClass = 'warn';
+                    }
+                } else {
+                    targetDisplay = '<span class="tpsl-warning">⚠️ None</span>';
+                }
+
+                let stopPct = 0;
+                let targetPct = 0;
+                let positionInRange = 50;
+                if (stop && target && current) {
+                    const range = Math.abs(target - stop);
+                    if (range > 0) {
+                        const currentPosition = Math.abs(current - stop);
+                        positionInRange = Math.min((currentPosition / range) * 100, 100);
+                        const stopDistance = Math.abs(current - stop);
+                        stopPct = Math.min((stopDistance / range) * 100, 100);
+                        const targetDistance = Math.abs(target - current);
+                        targetPct = Math.min((targetDistance / range) * 100, 100);
+                    }
+                } else {
+                    stopPct = Math.min(Math.abs(row.stop_distance_pct || 0) * 5, 100);
+                    targetPct = Math.min(Math.abs(row.target_distance_pct || 0) * 5, 100);
+                }
+
+                const hasLevels = stop || target;
+
                 return `<div class="trade-card">
                     <div class="header">
                         <span><strong>${sym}</strong> <span class="muted" style="font-weight:400;font-size:12px;">${Number(qty).toFixed(4)}</span></span>
                         <span class="pl ${cls}">${pnl !== null && pnl !== undefined ? money(pnl) : '-'}${pnlPct !== undefined && pnlPct !== null ? ` (${Number(pnlPct).toFixed(2)}%)` : ''}</span>
                     </div>
+                    <div class="detail"><span class="label">Side</span><span class="${sideClass}">${sideText}</span></div>
                     <div class="detail"><span class="label">Entry</span><span>${entry ? priceText(entry, sym) : '-'}</span></div>
                     <div class="detail"><span class="label">Current</span><span><strong>${current ? priceText(current, sym) : '-'}</strong></span></div>
-                    <div class="detail"><span class="label">Stop</span><span>${stop ? priceText(stop, sym) : '-'}</span></div>
-                    <div class="detail"><span class="label">Target</span><span>${target ? priceText(target, sym) : '-'}</span></div>
+                    <div class="detail"><span class="label">Stop Loss</span><span class="${stopClass}">${stopDisplay}</span></div>
+                    <div class="detail"><span class="label">Take Profit</span><span class="${targetClass}">${targetDisplay}</span></div>
+                    ${hasLevels ? `
+                    <div class="detail" style="padding:6px 0 0;">
+                        <div style="width:100%;">
+                            <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-bottom:2px;">
+                                <span style="color:var(--bad);">Stop ${Math.abs(row.stop_distance_pct || 0).toFixed(2)}%</span>
+                                <span>Current</span>
+                                <span style="color:var(--good);">Target ${Math.abs(row.target_distance_pct || 0).toFixed(2)}%</span>
+                            </div>
+                            <div style="background:var(--line);border-radius:2px;height:4px;overflow:hidden;position:relative;">
+                                <div style="background:var(--good);width:100%;height:100%;position:absolute;left:0;top:0;opacity:0.2;"></div>
+                                <div style="background:var(--bad);width:${positionInRange}%;height:100%;position:absolute;left:0;top:0;transition:width 0.3s;z-index:1;"></div>
+                                <div style="position:absolute;left:${positionInRange}%;top:-2px;width:2px;height:8px;background:var(--text);z-index:2;border-radius:1px;"></div>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:1px;">
+                                <span>${Math.abs(row.stop_distance_pct || 0).toFixed(2)}% away</span>
+                                <span>${Math.abs(row.target_distance_pct || 0).toFixed(2)}% away</span>
+                            </div>
+                        </div>
+                    </div>
+                    ` : ''}
                     <div class="actions">
                         <button data-symbol="${sym}" data-mode="profit_only">Take Profit</button>
                         <button class="danger" data-symbol="${sym}" data-mode="force">Force Close</button>
@@ -2568,7 +3540,9 @@
                 btn.classList.add('active');
                 const id = btn.dataset.tab;
                 Object.entries(tabPanes).forEach(([k, el]) => el.classList.toggle('active', k === id));
-                if (id === 'dashboard' && lastStatusData) redrawChart();
+                if (id === 'dashboard' && lastStatusData) {
+                    // chart already there
+                }
             });
         });
 
@@ -2592,11 +3566,7 @@
             });
         });
 
-        document.getElementById('profileConservativeBtn').addEventListener('click', () => applyRiskProfile('conservative'));
-        document.getElementById('profileBalancedBtn').addEventListener('click', () => applyRiskProfile('balanced'));
-        document.getElementById('profileAggressiveBtn').addEventListener('click', () => applyRiskProfile('aggressive'));
-        document.getElementById('profileScalpingBtn').addEventListener('click', () => applyRiskProfile('scalping'));
-
+        // Start / Stop
         els.startBtn.addEventListener('click', async () => {
             const r = await post('/api/start');
             if (!r.ok) { els.errorBox.style.display = 'block';
@@ -2611,6 +3581,7 @@
             refresh();
         });
 
+        // OANDA actions
         els.syncOandaBalanceBtn.addEventListener('click', async () => {
             els.syncOandaBalanceBtn.disabled = true;
             els.tradingStatus.textContent = 'Syncing OANDA…';
@@ -2631,9 +3602,25 @@
             } catch (e) { els.tradingStatus.textContent = e.message; } finally { els.oandaAuthCheckBtn.disabled = false; }
         });
 
+        // ─── Settings form submission ───
         els.settingsForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            const payload = Object.fromEntries(new FormData(els.settingsForm).entries());
+
+            const formData = new FormData(els.settingsForm);
+            const payload = Object.fromEntries(formData.entries());
+
+            const booleanFields = [
+                'websocket_enabled', 'oanda_demo_trading_enabled', 'live_trading_enabled',
+                'telegram_enabled', 'news_guard_enabled', 'self_learning_enabled'
+            ];
+            booleanFields.forEach(field => {
+                if (field in payload) {
+                    payload[field] = payload[field] === 'true';
+                }
+            });
+
+            console.log('Saving settings:', payload);
+
             const r = await post('/api/settings', payload);
             if (!r.ok) {
                 els.errorBox.style.display = 'block';
@@ -2641,14 +3628,23 @@
                 return;
             }
             settingsFormDirty = false;
-            els.settingsStatus.textContent = 'Settings saved.';
+            els.settingsStatus.textContent = 'Settings saved. Streaming will update.';
             settingsLoaded = false;
-            refresh();
+
+            await refresh();
+
+            const status = await getJson('/api/status');
+            if (status.live_status) {
+                const wsStatus = status.live_status.websocket_status || 'unknown';
+                const wsEnabled = status.settings?.websocket_enabled || false;
+                els.tradingStatus.textContent = `WebSocket: ${wsEnabled ? wsStatus : 'disabled'}`;
+            }
         });
 
         els.settingsForm.addEventListener('input', () => { settingsFormDirty = true; });
         els.settingsForm.addEventListener('change', () => { settingsFormDirty = true; });
 
+        // Settings search
         els.settingsSearch.addEventListener('input', function() {
             const term = this.value.toLowerCase().trim();
             const groups = qsa('.settings-group');
@@ -2662,21 +3658,21 @@
             });
         });
 
+        // Chart symbol/mode
         els.chartSymbolSelect.addEventListener('change', () => {
             selectedChartSymbol = els.chartSymbolSelect.value;
             localStorage.setItem('cryptobot-chart-symbol', selectedChartSymbol);
-            if (lastStatusData) { chartHoverIndex = null;
-                render(lastStatusData); }
+            if (lastStatusData) { refreshChartWithTimeframe(); }
         });
         els.chartModeSelect.addEventListener('change', async () => {
             chartMode = els.chartModeSelect.value;
             localStorage.setItem('cryptobot-chart-mode', chartMode);
             if (els.settingsForm.elements.chart_mode) els.settingsForm.elements.chart_mode.value = chartMode;
-            if (lastStatusData) { chartHoverIndex = null;
-                render(lastStatusData); }
+            if (lastStatusData) { refreshChartWithTimeframe(); }
             await post('/api/settings', { chart_mode: chartMode });
         });
 
+        // Close position (delegated)
         document.addEventListener('click', async (e) => {
             const btn = e.target.closest('[data-symbol]');
             if (!btn) return;
@@ -2688,6 +3684,7 @@
             else refresh();
         });
 
+        // Scanner
         els.fetchGbpPairsBtn.addEventListener('click', async () => {
             const quote = (els.settingsForm.elements.quote_currency?.value || 'GBP').trim().toUpperCase();
             els.fetchGbpPairsBtn.disabled = true;
@@ -2722,6 +3719,66 @@
             } catch (e) { els.gbpPairsStatus.textContent = e.message; } finally { els.compareQuotesBtn.disabled = false; }
         });
 
+        // Strategy Creator
+        document.getElementById('evolveStrategiesBtn')?.addEventListener('click', async function() {
+            const btn = this;
+            const statusEl = document.getElementById('strategyStatus');
+
+            btn.disabled = true;
+            btn.textContent = '⏳ Evolving...';
+            if (statusEl) statusEl.textContent = 'Evolving strategies...';
+
+            try {
+                const r = await post('/api/evolve-strategies', { generations: 50 });
+                if (r.ok) {
+                    if (statusEl) {
+                        statusEl.textContent = `✅ Evolved: ${r.strategy?.name || 'New strategy'} (${r.strategy?.win_rate || 0}% win rate)`;
+                    }
+                    alert(`Strategy evolved successfully!\n\nName: ${r.strategy?.name}\nWin Rate: ${r.strategy?.win_rate}%\nFitness: ${r.strategy?.fitness_score}`);
+                } else {
+                    if (statusEl) statusEl.textContent = `❌ Failed: ${r.error}`;
+                    alert(`Evolution failed: ${r.error}`);
+                }
+            } catch (e) {
+                if (statusEl) statusEl.textContent = `❌ Error: ${e.message}`;
+                alert(`Error: ${e.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🧬 Evolve Strategies Now';
+            }
+        });
+
+        document.getElementById('viewStrategiesBtn')?.addEventListener('click', async function() {
+            try {
+                const r = await getJson('/api/strategy-dashboard');
+                if (r.ok && r.summary) {
+                    let details = r.summary.strategy_details || [];
+                    if (details.length === 0) {
+                        alert('No strategies available yet. Click "Evolve Strategies Now" first!');
+                        return;
+                    }
+
+                    let msg = '📊 STRATEGY DASHBOARD\n';
+                    msg += `Active Strategies: ${r.summary.active_strategies}\n`;
+                    msg += `Current Strategy ID: ${r.active_strategy_id || 'None'}\n\n`;
+
+                    details.forEach((s, i) => {
+                        msg += `${i+1}. ${s.name}\n`;
+                        msg += `   Win Rate: ${s.win_rate}%\n`;
+                        msg += `   Fitness: ${s.fitness}\n`;
+                        msg += `   Trades: ${s.trades}\n\n`;
+                    });
+
+                    alert(msg);
+                } else {
+                    alert('No strategies available. Click "Evolve Strategies Now" first!');
+                }
+            } catch (e) {
+                alert(`Error loading strategies: ${e.message}`);
+            }
+        });
+
+        // Backtest
         els.backtestBtn.addEventListener('click', async () => {
             const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
             const bt = { granularity: els.btGranularity.value, candle_count: els.btCandles.value };
@@ -2790,6 +3847,7 @@
                 els.backtestStatus.textContent = 'Failed.'; } finally { els.applyOptimizerBtn.disabled = false; }
         });
 
+        // ---- refresh loop ----
         async function refresh() {
             try {
                 const data = await getJson('/api/status');
@@ -2797,14 +3855,19 @@
                 if (!settingsLoaded) {
                     loadSettings(data);
                 }
+                updateStreamingUI(data);
             } catch (e) { /* ignore */ }
         }
 
+        // Start the bot
         refresh();
         setInterval(refresh, 3000);
+        setInterval(checkStreamingStatus, 5000);
 
+        // ─── Ensure EMA settings are shown/hidden based on strategy ───
         setTimeout(updateEMASettingsVisibility, 500);
 
+        // Also update when strategy changes
         document.addEventListener('change', function(e) {
             if (e.target && e.target.name === 'strategy') {
                 updateEMASettingsVisibility();

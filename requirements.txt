@@ -1,5 +1,8 @@
 # CrossEdge Trader Python dependencies
 
+flask
+cryptography
+
 requests>=2.32.0
 python-dotenv>=1.0.1
 websocket-client>=1.8.0
