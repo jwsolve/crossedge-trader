@@ -5155,10 +5155,10 @@ class PaperBot:
             signal_candle_set = signal_candles(closes_to_candles(history), settings)
             signal_history = [candle.close for candle in signal_candle_set] or history
             current_highest = max(highest_price or price, price)
-            stop_price, target_price, exit_mode = self.exit_prices(
+            stop_price, target_price, exit_mode = exit_prices(
                 entry_price=entry_price,
-                candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
-                settings=self.state.settings,
+                candles=active_candles,
+                settings=settings,
             )
 
             position = positions.get(symbol, {})
@@ -6496,15 +6496,83 @@ class PaperBot:
             )
             logger.info(f"Native stop submitted: {stop_order_id} at {stop_price:.6f}")
         except Exception as e:
-            logger.warning(f"Native stop submission failed: {e}. Falling back to simulated stop.")
-            self.state.stop_price = stop_price
-            self.journal(
-                entry_order.symbol,
-                "WARNING",
-                f"Native stop failed, using simulated stop at {stop_price:.6f}",
-                stop_price,
-                {"error": str(e)},
-            )
+            error_text = str(e)
+            if self.should_live_trade():
+                # FAIL CLOSED: an armed live position must never be left relying only
+                # on the process-local simulated stop. Attempt an immediate market exit.
+                logger.critical(
+                    f"Native stop submission failed for LIVE position: {error_text}. "
+                    "Attempting emergency market exit."
+                )
+                self.journal(
+                    entry_order.symbol,
+                    "CRITICAL",
+                    "LIVE native stop failed; attempting emergency market exit",
+                    stop_price,
+                    {"error": error_text},
+                )
+                try:
+                    emergency = coinbase_market_order(
+                        product_id=product_id,
+                        side="BUY" if self.state.is_short else "SELL",
+                        base_size=base_size,
+                    )
+                    emergency_id = coinbase_order_id(emergency)
+                    fill = coinbase_reconcile_order(emergency_id)
+                    filled_size = float(fill.get("filled_size") or 0.0)
+                    filled_price = float(fill.get("average_price") or stop_price or 0.0)
+                    if filled_size > 0:
+                        self.paper_sell(
+                            entry_order.symbol,
+                            filled_price,
+                            f"EMERGENCY MARKET EXIT after native stop failure",
+                            quantity_override=filled_size,
+                            fee_override=float(fill.get("total_fee") or 0.0),
+                            exchange_order_id=emergency_id,
+                            exchange_order_status=fill.get("status"),
+                            exchange_average_filled_price=filled_price,
+                        )
+                        self.state.active_stop_order_id = None
+                        self.state.stop_price = None
+                        logger.critical(
+                            f"Emergency live exit filled: {emergency_id} "
+                            f"{filled_size:.10f} @ {filled_price:.8f}"
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Emergency market exit returned no filled size "
+                            f"(order {emergency_id}, status={fill.get('status')})"
+                        )
+                except Exception as emergency_error:
+                    self.state.stop_price = None
+                    self.journal(
+                        entry_order.symbol,
+                        "CRITICAL",
+                        "LIVE position may be unprotected: emergency market exit failed",
+                        stop_price,
+                        {
+                            "native_stop_error": error_text,
+                            "emergency_exit_error": str(emergency_error),
+                        },
+                    )
+                    raise RuntimeError(
+                        "Native protective stop failed and emergency live exit failed: "
+                        f"{emergency_error}"
+                    ) from emergency_error
+            else:
+                # Paper mode can safely fall back to the existing process-local stop.
+                logger.warning(
+                    f"Native stop submission failed: {error_text}. "
+                    "Falling back to simulated stop in paper mode."
+                )
+                self.state.stop_price = stop_price
+                self.journal(
+                    entry_order.symbol,
+                    "WARNING",
+                    f"Native stop failed, using simulated stop at {stop_price:.6f}",
+                    stop_price,
+                    {"error": error_text},
+                )
 
     def sync_native_stop_fill(self) -> None:
         if not self.state.active_stop_order_id or not self.state.active_symbol:
@@ -7473,28 +7541,48 @@ def fetch_coinbase_candles(
     granularity: int,
     candle_count: int,
 ) -> list[Candle]:
-    candle_count = max(20, min(300, int(candle_count)))
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(seconds=granularity * candle_count)
+    # Coinbase's public candles endpoint returns at most 300 candles per request.
+    # Fetch historical windows in chunks so the validation lab can use a genuinely
+    # longer sample instead of silently truncating to the most recent 300 candles.
+    candle_count = max(20, min(3000, int(candle_count)))
     product = f"{symbol}-{quote_currency}"
-    query = urllib.parse.urlencode({
-        "granularity": int(granularity),
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-    })
-    data = fetch_json(f"https://api.exchange.coinbase.com/products/{product}/candles?{query}")
-    candles = [
-        Candle(
-            time=int(item[0]),
-            low=float(item[1]),
-            high=float(item[2]),
-            open=float(item[3]),
-            close=float(item[4]),
-            volume=float(item[5]),
-        )
-        for item in data
-    ]
-    return sorted(candles, key=lambda item: item.time)[-candle_count:]
+    end = datetime.now(timezone.utc)
+    all_candles: dict[int, Candle] = {}
+    remaining = candle_count
+    chunk_size = 300
+    step = timedelta(seconds=int(granularity))
+
+    while remaining > 0:
+        chunk = min(chunk_size, remaining)
+        start = end - (step * chunk)
+        query = urllib.parse.urlencode({
+            "granularity": int(granularity),
+            "start": start.isoformat().replace("+00:00", "Z"),
+            "end": end.isoformat().replace("+00:00", "Z"),
+        })
+        data = fetch_json(f"https://api.exchange.coinbase.com/products/{product}/candles?{query}")
+        if not data:
+            break
+
+        for item in data:
+            candle = Candle(
+                time=int(item[0]),
+                low=float(item[1]),
+                high=float(item[2]),
+                open=float(item[3]),
+                close=float(item[4]),
+                volume=float(item[5]),
+            )
+            all_candles[candle.time] = candle
+
+        earliest = min(int(item[0]) for item in data)
+        end = datetime.fromtimestamp(earliest, tz=timezone.utc) - step
+        received = len(data)
+        remaining -= received
+        if received <= 0:
+            break
+
+    return sorted(all_candles.values(), key=lambda item: item.time)[-candle_count:]
 
 def fetch_kraken_candles(
     symbol: str,
@@ -7688,10 +7776,10 @@ def run_backtest_for_symbol(
         if can_trade and coin > 0 and entry_price:
             reason = None
             highest_price = max(highest_price or price, price)
-            stop_price, target_price, exit_mode = self.exit_prices(
+            stop_price, target_price, exit_mode = exit_prices(
                 entry_price=entry_price,
-                candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
-                settings=self.state.settings,
+                candles=active_candles,
+                settings=settings,
             )
             partial_quantity = 0.0
             if partial_take_profit_ready(price, entry_price, target_price, settings, partial_done):
@@ -8175,10 +8263,10 @@ def run_ewo_offset_backtest_for_symbol(
         if can_trade and coin > 0 and entry_price:
             reason = None
             highest_price = max(highest_price or price, price)
-            stop_price, target_price, exit_mode = self.exit_prices(
+            stop_price, target_price, exit_mode = exit_prices(
                 entry_price=entry_price,
-                candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
-                settings=self.state.settings,
+                candles=active_candles,
+                settings=settings,
             )
             partial_quantity = 0.0
             if partial_take_profit_ready(price, entry_price, target_price, settings, partial_done):
@@ -8357,10 +8445,10 @@ def run_ema_golden_cross_backtest(
                 highest_price = None
                 continue
 
-            stop_price, target_price, exit_mode = self.exit_prices(
+            stop_price, target_price, exit_mode = exit_prices(
                 entry_price=entry_price,
-                candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
-                settings=self.state.settings,
+                candles=active_candles,
+                settings=settings,
             )
             highest_price = max(highest_price or price, price)
 
@@ -8949,6 +9037,49 @@ def apply_slippage(price: float, side: str, slippage_fraction: float) -> float:
     if side.upper() == "BUY":
         return price * (1 + slippage_fraction)
     return price * (1 - slippage_fraction)
+
+def exit_prices(
+    entry_price: float,
+    candles: list[Candle],
+    settings: dict[str, Any],
+) -> tuple[float, float, str]:
+    """Backtest-safe exit calculation without PaperBot instance state."""
+    if not candles or len(candles) < 14:
+        return (
+            entry_price * (1 - float(settings["stop_loss_pct"]) / 100),
+            entry_price * (1 + float(settings["take_profit_pct"]) / 100),
+            "fixed",
+        )
+
+    if settings.get("use_atr_exits", True):
+        atr_period = int(settings.get("atr_period", 14))
+        atr_value = calculate_atr_from_candles(candles, atr_period)
+        if atr_value > 0:
+            stop_mult = float(settings.get("atr_stop_multiplier", 1.5))
+            target_mult = float(settings.get("atr_target_multiplier", 2.5))
+            stop = entry_price - (atr_value * stop_mult)
+            target = entry_price + (atr_value * target_mult)
+            if (entry_price - stop) / entry_price * 100 >= 0.2:
+                return stop, target, f"ATR ({atr_value:.4f})"
+
+    if settings.get("use_dynamic_sr_exits"):
+        levels = support_resistance(candles, settings)
+        support = levels.get("support")
+        resistance = levels.get("resistance")
+        confirmed = levels.get("confirmed", levels.get("sr_confirmed", False))
+        if support and resistance and confirmed:
+            stop_buffer = float(settings.get("support_stop_buffer_pct", 2.0)) / 100
+            target_buffer = float(settings.get("resistance_target_buffer_pct", 0.5)) / 100
+            sr_stop = float(support) * (1 - stop_buffer)
+            sr_target = float(resistance) * (1 - target_buffer)
+            if sr_stop < entry_price < sr_target:
+                return sr_stop, sr_target, "S/R"
+
+    return (
+        entry_price * (1 - float(settings["stop_loss_pct"]) / 100),
+        entry_price * (1 + float(settings["take_profit_pct"]) / 100),
+        "fixed",
+    )
 
 def position_spend(
     cash: float,
@@ -9835,6 +9966,17 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 payload = parse_json_body(self)
                 settings = {**self.bot.snapshot()["settings"], **payload}
                 self.send_json(run_walk_forward(settings))
+                return
+
+            if self.path == "/api/validation":
+                payload = parse_json_body(self)
+                settings = {**self.bot.snapshot()["settings"], **payload}
+                try:
+                    from validation_engine import run_validation_suite
+                    self.send_json(run_validation_suite(settings))
+                except Exception as exc:
+                    logger.exception("Validation suite failed")
+                    self.send_json({"ok": False, "error": str(exc)})
                 return
 
             if self.path == "/api/close-position":

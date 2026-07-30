@@ -387,6 +387,7 @@
             cursor: crosshair;
             display: block;
             position: relative;
+            overflow: hidden; /* prevent overflow */
         }
         #chartContainer .chart-error {
             position: absolute;
@@ -407,6 +408,7 @@
             padding: 14px;
             box-shadow: var(--shadow);
             margin-bottom: 14px;
+            clear: both; /* ensure it starts after chart */
         }
         .trades-section h2 {
             font-size: 16px;
@@ -1058,7 +1060,13 @@
                 font-size: 12px;
                 min-height: 36px;
             }
-            #chartContainer { height: 260px; touch-action: none; }
+            #chartContainer {
+                height: 320px;
+                touch-action: none;
+            }
+            .chart-section {
+                margin-bottom: 20px; /* extra spacing for mobile */
+            }
         }
         @media (max-width: 420px) {
             body { padding: 6px 8px 20px; }
@@ -1069,7 +1077,12 @@
             .header-brand h1 { font-size: 17px; }
             .header-brand .badge { font-size: 10px; padding: 1px 8px; }
             .header-status .pill { font-size: 11px; padding: 4px 10px; min-height: 28px; }
-            #chartContainer { height: 200px; }
+            #chartContainer {
+                height: 260px;
+            }
+            .chart-section {
+                margin-bottom: 20px;
+            }
             .trade-card .header { font-size: 14px; }
             .trade-card .detail { font-size: 12px; }
             .table-wrap table { font-size: 11px; min-width: 500px; }
@@ -1584,6 +1597,7 @@
                     <button data-tab="backtester">Backtester</button>
                     <button data-tab="optimizer">Optimizer</button>
                     <button data-tab="walkforward">Walk-Forward</button>
+                    <button data-tab="validation">Validation Lab</button>
                     <button data-tab="learning">Setup Learning</button>
                 </div>
 
@@ -1713,6 +1727,61 @@
                     </div>
                 </div>
 
+                <!-- Validation Lab -->
+                <div class="analysis-pane" id="pane-validation">
+                    <div class="backtest-row">
+                        <label>Timeframe <select id="validationGranularity"><option value="900">15m</option><option value="3600" selected>1h</option><option value="21600">6h</option><option value="86400">1d</option></select></label>
+                        <label>Candles <input id="validationCandles" type="number" value="300" step="1" min="300" max="3000" style="width:90px;" /></label>
+                        <div class="actions"><button class="primary" id="validationBtn">Run Full Validation</button></div>
+                        <span class="status" id="validationStatus">Research-only; results are evidence, not a profitability guarantee.</span>
+                    </div>
+                    <div class="message-box" id="validationErrorBox"></div>
+                    <div class="backtest-metrics" id="validationMetrics">
+                        <span><span class="muted">Verdict:</span> <strong id="validationVerdict">—</strong></span>
+                        <span><span class="muted">Evidence score:</span> <strong id="validationScore">—</strong></span>
+                        <span><span class="muted">Symbols:</span> <strong id="validationSymbols">—</strong></span>
+                        <span><span class="muted">Closed trades:</span> <strong id="validationTrades">—</strong></span>
+                        <span><span class="muted">Profit factor:</span> <strong id="validationPF">—</strong></span>
+                        <span><span class="muted">Expectancy:</span> <strong id="validationExpectancy">—</strong></span>
+                        <span><span class="muted">Max DD:</span> <strong id="validationDD">—</strong></span>
+                    </div>
+                    <details class="settings-group" open>
+                        <summary>Component comparison</summary>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Variant</th><th>Return</th><th>P/L</th><th>Profit Factor</th><th>Expectancy</th><th>Drawdown</th><th>Trades</th><th>Win Rate</th></tr></thead>
+                                <tbody id="validationVariantsBody"><tr><td colspan="8" class="muted" style="text-align:center;padding:16px 0;">No validation run.</td></tr></tbody>
+                            </table>
+                        </div>
+                    </details>
+                    <details class="settings-group">
+                        <summary>Slippage stress</summary>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Slippage</th><th>Return</th><th>P/L</th><th>Profit Factor</th><th>Drawdown</th><th>Trades</th></tr></thead>
+                                <tbody id="validationSlippageBody"><tr><td colspan="6" class="muted" style="text-align:center;padding:16px 0;">No validation run.</td></tr></tbody>
+                            </table>
+                        </div>
+                    </details>
+                    <details class="settings-group">
+                        <summary>Monte Carlo</summary>
+                        <div class="backtest-metrics" id="validationMonteCarlo">No validation run.</div>
+                    </details>
+                    <details class="settings-group">
+                        <summary>Parameter sensitivity</summary>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Stop ×</th><th>Target ×</th><th>Return</th><th>PF</th><th>Win Rate</th><th>Drawdown</th><th>Trades</th></tr></thead>
+                                <tbody id="validationSensitivityBody"><tr><td colspan="7" class="muted" style="text-align:center;padding:16px 0;">No validation run.</td></tr></tbody>
+                            </table>
+                        </div>
+                    </details>
+                    <details class="settings-group">
+                        <summary>Components not scored</summary>
+                        <div class="muted" id="validationNotScored">Regime, XGBoost, expectancy, learning and optimiser are not scored by the candle backtester.</div>
+                    </details>
+                </div>
+
                 <!-- Setup Learning -->
                 <div class="analysis-pane" id="pane-learning">
                     <div class="table-wrap">
@@ -1800,6 +1869,23 @@
             backtestTradesBody: $('backtestTradesBody'),
             optimizerBody: $('optimizerBody'),
             walkForwardBody: $('walkForwardBody'),
+            validationBtn: $('validationBtn'),
+            validationStatus: $('validationStatus'),
+            validationErrorBox: $('validationErrorBox'),
+            validationVerdict: $('validationVerdict'),
+            validationScore: $('validationScore'),
+            validationSymbols: $('validationSymbols'),
+            validationTrades: $('validationTrades'),
+            validationPF: $('validationPF'),
+            validationExpectancy: $('validationExpectancy'),
+            validationDD: $('validationDD'),
+            validationVariantsBody: $('validationVariantsBody'),
+            validationSlippageBody: $('validationSlippageBody'),
+            validationMonteCarlo: $('validationMonteCarlo'),
+            validationSensitivityBody: $('validationSensitivityBody'),
+            validationNotScored: $('validationNotScored'),
+            validationGranularity: $('validationGranularity'),
+            validationCandles: $('validationCandles'),
             scanBody: $('scanBody'),
             quoteCompareBody: $('quoteCompareBody'),
             bestSetupSummary: $('bestSetupSummary'),
@@ -3793,6 +3879,71 @@
                 els.backtestErrorBox.textContent = e.message;
                 els.backtestStatus.textContent = 'Failed.'; } finally { els.backtestBtn.disabled = false; }
         });
+        els.validationBtn.addEventListener('click', async () => {
+            const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
+            const payload = {
+                ...settings,
+                validation_granularity: els.validationGranularity.value,
+                validation_candles: els.validationCandles.value,
+            };
+            els.validationBtn.disabled = true;
+            els.validationStatus.textContent = 'Running validation suite…';
+            els.validationErrorBox.style.display = 'none';
+            try {
+                const r = await post('/api/validation', payload);
+                if (!r.ok) throw new Error(r.error || 'Validation failed');
+
+                const v = r.variants?.current || {};
+                els.validationVerdict.textContent = r.verdict || '—';
+                els.validationScore.textContent = `${r.evidence_score ?? '—'}/100`;
+                els.validationSymbols.textContent = `${r.data?.symbols_tested?.length || 0}/${r.data?.symbols_requested?.length || 0}`;
+                els.validationTrades.textContent = v.closed_trades ?? '—';
+                els.validationPF.textContent = v.profit_factor ?? '—';
+                els.validationExpectancy.textContent = `${v.expectancy_pct ?? 0}%`;
+                els.validationDD.textContent = `${v.max_drawdown_pct ?? 0}%`;
+
+                const rows = Object.entries(r.variants || {}).map(([name, x]) => `
+                    <tr><td>${name}</td><td>${x.return_pct}%</td><td>${money(x.total_pnl)}</td>
+                    <td>${x.profit_factor}</td><td>${x.expectancy_pct}%</td>
+                    <td>${x.max_drawdown_pct}%</td><td>${x.closed_trades}</td><td>${x.win_rate}%</td></tr>
+                `).join('');
+                els.validationVariantsBody.innerHTML = rows || '<tr><td colspan="8" class="muted">No results.</td></tr>';
+
+                els.validationSlippageBody.innerHTML = (r.slippage_stress || []).map(x => `
+                    <tr><td>${x.slippage_pct}%</td><td>${x.return_pct}%</td><td>${money(x.total_pnl)}</td>
+                    <td>${x.profit_factor}</td><td>${x.max_drawdown_pct}%</td><td>${x.closed_trades}</td></tr>
+                `).join('');
+
+                const mc = r.monte_carlo || {};
+                els.validationMonteCarlo.innerHTML = mc.status === 'ok'
+                    ? `<span><span class="muted">Simulations:</span> <strong>${mc.simulations}</strong></span>
+                       <span><span class="muted">Positive paths:</span> <strong>${mc.probability_positive_pct}%</strong></span>
+                       <span><span class="muted">Median return:</span> <strong>${mc.median_return_pct}%</strong></span>
+                       <span><span class="muted">5–95% return:</span> <strong>${mc.p05_return_pct}% to ${mc.p95_return_pct}%</strong></span>
+                       <span><span class="muted">95% max DD:</span> <strong>${mc.p95_max_drawdown_pct}%</strong></span>`
+                    : `Insufficient closed trades for Monte Carlo (${mc.trades || 0}).`;
+
+                els.validationSensitivityBody.innerHTML = (r.parameter_sensitivity || []).map(x => `
+                    <tr><td>${x.stop_multiplier}×</td><td>${x.target_multiplier}×</td>
+                    <td>${x.return_pct}%</td><td>${x.profit_factor}</td><td>${x.win_rate}%</td>
+                    <td>${x.max_drawdown_pct}%</td><td>${x.trades}</td></tr>
+                `).join('');
+
+                els.validationNotScored.textContent = (r.components_not_scored || []).join(', ') + '.';
+                els.validationStatus.textContent = `Completed: ${r.verdict || 'No verdict'}.`;
+                if (r.errors?.length) {
+                    els.validationErrorBox.style.display = 'block';
+                    els.validationErrorBox.textContent = `Warnings: ${r.errors.join(' | ')}`;
+                }
+            } catch (e) {
+                els.validationErrorBox.style.display = 'block';
+                els.validationErrorBox.textContent = e.message;
+                els.validationStatus.textContent = 'Validation failed.';
+            } finally {
+                els.validationBtn.disabled = false;
+            }
+        });
+
         els.optimizerBtn.addEventListener('click', async () => {
             const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
             const bt = { granularity: els.btGranularity.value, candle_count: els.btCandles.value };
