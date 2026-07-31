@@ -3609,8 +3609,10 @@ class PaperBot:
                 return
 
             with self.lock:
+                # IMPORTANT: starting_cash is the immutable account baseline.
+                # Automatic exchange balance sync must only update live available cash;
+                # otherwise every trade silently moves the P/L baseline.
                 self.state.cash = actual_balance
-                self.state.settings['starting_cash'] = actual_balance
 
                 current_day = today_key()
                 if self.state.day_start_date != current_day:
@@ -3643,7 +3645,8 @@ class PaperBot:
         available_cash = coinbase_available_balance(quote_currency)
 
         with self.lock:
-            self.state.settings["starting_cash"] = available_cash
+            # A balance sync updates available cash only. The starting-cash baseline
+            # must remain unchanged unless the user explicitly edits that setting.
             self.state.cash = available_cash
             self.state.coin = 0.0
             self.state.active_symbol = None
@@ -3690,8 +3693,9 @@ class PaperBot:
             self.state.active_stop_order_id = None
             self.state.partial_take_profit_done = False
 
+            # Keep the configured starting-cash baseline fixed; OANDA sync only
+            # updates the current account cash balance.
             self.state.cash = balance
-            self.state.settings["starting_cash"] = balance
             self.state.settings["quote_currency"] = currency
             self.state.day_start_equity = balance
             self.state.peak_equity = balance
@@ -4335,6 +4339,24 @@ class PaperBot:
                 equity = self._calculate_equity_local(price)
                 total_pnl = equity - float(self.state.settings.get("starting_cash", 0))
 
+            # Account accounting: starting_cash is the fixed baseline; cash is the
+            # current available balance; equity includes open positions.
+            starting_cash = float(self.state.settings.get("starting_cash", 0.0))
+            open_position_value = equity - cash
+            if self.should_oanda_demo_trade() and oanda_data.get("ok"):
+                # OANDA supplies its own unrealised P/L.
+                unrealized_pnl = float(oanda_data.get("unrealized_pnl", unrealized_pnl) or 0.0)
+            else:
+                unrealized_pnl = 0.0
+                for symbol, position in self.state.positions.items():
+                    quantity = float(position.get("quantity", 0.0))
+                    entry = position.get("entry_price")
+                    history = self.state.price_history.get(symbol, [])
+                    current = history[-1] if history else price
+                    if entry is not None and current is not None:
+                        unrealized_pnl += quantity * (float(current) - float(entry))
+            realized_pnl = total_pnl - unrealized_pnl
+
             day_pnl = equity - self.state.day_start_equity
 
             expectancy_summary = self.expectancy.summary() if hasattr(self, 'expectancy') else {}
@@ -4352,7 +4374,11 @@ class PaperBot:
             return {
                 "running": self.state.running,
                 "settings": self.state.settings,
+                "starting_cash": round(starting_cash, 2),
                 "cash": round(cash, 2),
+                "open_position_value": round(open_position_value, 2),
+                "realized_pnl": round(realized_pnl, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
                 "coin": round(self.state.coin, 12),
                 "active_symbol": self.state.active_symbol,
                 "chart_symbol": chart_symbol,

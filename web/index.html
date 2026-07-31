@@ -1243,6 +1243,14 @@
                     <div class="value" id="cash">£0.00</div>
                 </div>
                 <div class="metric-card">
+                    <div class="label">Starting Cash</div>
+                    <div class="value" id="startingCash">£0.00</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Unrealised P/L</div>
+                    <div class="value" id="unrealizedPnl">£0.00</div>
+                </div>
+                <div class="metric-card">
                     <div class="label">Open Positions</div>
                     <div class="value" id="position">0</div>
                 </div>
@@ -1820,6 +1828,8 @@
             equity: $('equity'),
             totalPnl: $('totalPnl'),
             cash: $('cash'),
+            startingCash: $('startingCash'),
+            unrealizedPnl: $('unrealizedPnl'),
             position: $('position'),
             runPill: $('runPill'),
             runDot: $('runDot'),
@@ -3238,6 +3248,11 @@
             els.totalPnl.textContent = money(data.total_pnl);
             els.totalPnl.className = 'value ' + (Number(data.total_pnl) >= 0 ? 'good' : 'bad');
             els.cash.textContent = money(data.cash);
+            if (els.startingCash) els.startingCash.textContent = money(data.starting_cash);
+            if (els.unrealizedPnl) {
+                els.unrealizedPnl.textContent = money(data.unrealized_pnl);
+                els.unrealizedPnl.className = 'value ' + (Number(data.unrealized_pnl) >= 0 ? 'good' : 'bad');
+            }
             const posCount = (data.positions || []).length;
             els.position.textContent = posCount;
 
@@ -3641,6 +3656,7 @@
             backtester: $('pane-backtester'),
             optimizer: $('pane-optimizer'),
             walkforward: $('pane-walkforward'),
+            validation: $('pane-validation'),
             learning: $('pane-learning'),
         };
         analysisTabs.forEach(btn => {
