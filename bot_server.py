@@ -6591,12 +6591,6 @@ class PaperBot:
                     stop_price,
                     {"error": error_text},
                 )
-                try:
-                    emergency = coinbase_market_order(
-                        product_id=product_id,
-                        side="BUY" if self.state.is_short else "SELL",
-                        base_size=base_size,
-                    )
 
                 try:
                     # Re-check the exchange before attempting an emergency exit.
