@@ -6221,18 +6221,39 @@ class PaperBot:
         is_short: bool = False,
     ) -> None:
         settings = dict(self.state.settings)
+
+        # Build the Coinbase product ID first because we need it
+        # to determine the permitted quantity precision.
+        product_id = f"{symbol}-{settings['quote_currency']}"
+
         base_available = coinbase_available_balance(symbol)
+
         desired_size = (
             quantity_override
             if quantity_override is not None
             else abs(self.state.coin)
         )
+
         base_size = min(base_available, desired_size)
+
+        # Coinbase requires base_size to conform to the
+        # product's base_increment.
+        base_size = self.coinbase_round_size(
+            base_size,
+            product_id,
+        )
 
         if base_size <= 0:
             with self.lock:
-                self.state.last_signal = f"LIVE SELL blocked: no {symbol} balance available"
-                self.journal(symbol, "BLOCK", self.state.last_signal, price)
+                self.state.last_signal = (
+                    f"LIVE SELL blocked: no sellable {symbol} balance available"
+                )
+                self.journal(
+                    symbol,
+                    "BLOCK",
+                    self.state.last_signal,
+                    price,
+                )
             return
 
         if self.state.active_stop_order_id:
@@ -6253,7 +6274,6 @@ class PaperBot:
                     self.journal(symbol, "BLOCK", self.state.last_signal, price)
                 return
 
-        product_id = f"{symbol}-{settings['quote_currency']}"
         order_type = str(settings.get("live_order_type", "market"))
 
         if order_type == "limit":
