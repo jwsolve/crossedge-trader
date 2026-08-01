@@ -6597,6 +6597,59 @@ class PaperBot:
                         side="BUY" if self.state.is_short else "SELL",
                         base_size=base_size,
                     )
+
+                try:
+                    # Re-check the exchange before attempting an emergency exit.
+                    #
+                    # An earlier order may have succeeded at Coinbase even if Auxo
+                    # subsequently failed to process/reconcile the response. Never
+                    # blindly submit a second exit based only on local state.
+                    if not self.state.is_short:
+                        exchange_available = coinbase_available_balance(entry_order.symbol)
+
+                        emergency_size = min(
+                            abs(self.state.coin),
+                            exchange_available,
+                        )
+
+                        emergency_size = self.coinbase_round_size(
+                            emergency_size,
+                            product_id,
+                        )
+
+                        if emergency_size <= 0:
+                            logger.warning(
+                                "Emergency exit skipped for %s: Coinbase reports no "
+                                "available balance. Position may already be closed.",
+                                entry_order.symbol,
+                            )
+
+                            self.journal(
+                                entry_order.symbol,
+                                "WARNING",
+                                "Emergency exit skipped: Coinbase balance is zero; "
+                                "position may already be closed",
+                                stop_price,
+                                {
+                                    "local_coin": self.state.coin,
+                                    "exchange_available": exchange_available,
+                                    "native_stop_error": error_text,
+                                },
+                            )
+
+                            return
+
+                    else:
+                        # Coinbase spot positions should normally be long-only.
+                        # Keep the existing size handling for any short-capable
+                        # exchange path until that path has its own reconciliation.
+                        emergency_size = base_size
+
+                        emergency = coinbase_market_order(
+                        product_id=product_id,
+                        side="BUY" if self.state.is_short else "SELL",
+                        base_size=emergency_size,
+                    )
                     emergency_id = coinbase_order_id(emergency)
                     fill = coinbase_reconcile_order(emergency_id)
                     filled_size = float(fill.get("filled_size") or 0.0)
