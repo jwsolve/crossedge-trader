@@ -5183,7 +5183,7 @@ class PaperBot:
             current_highest = max(highest_price or price, price)
             stop_price, target_price, exit_mode = exit_prices(
                 entry_price=entry_price,
-                candles=active_candles,
+                candles=candles,
                 settings=settings,
             )
 
@@ -6222,7 +6222,11 @@ class PaperBot:
     ) -> None:
         settings = dict(self.state.settings)
         base_available = coinbase_available_balance(symbol)
-        desired_size = quantity_override or self.state.coin
+        desired_size = (
+            quantity_override
+            if quantity_override is not None
+            else abs(self.state.coin)
+        )
         base_size = min(base_available, desired_size)
 
         if base_size <= 0:
@@ -6267,7 +6271,37 @@ class PaperBot:
                 side="SELL" if not is_short else "BUY",
                 base_size=base_size,
             )
-        order_id = coinbase_order_id(order)
+
+        try:
+            order_id = coinbase_order_id(order)
+        except Exception as exc:
+            with self.lock:
+                self.state.last_signal = (
+                    f"LIVE SELL order submission failed for {symbol}: {exc}"
+                )
+
+                self.journal(
+                    symbol,
+                    "ERROR",
+                    self.state.last_signal,
+                    price,
+                    {
+                        "product_id": product_id,
+                        "base_size": base_size,
+                        "order_type": order_type,
+                        "reason": reason,
+                        "coinbase_response": order,
+                    },
+                )
+
+            logger.error(
+                "LIVE SELL order submission failed for %s: %s",
+                symbol,
+                exc,
+            )
+
+            return
+
         managed = self.track_order(
             order_id,
             symbol,
@@ -7378,13 +7412,59 @@ def coinbase_cancel_orders(order_ids: list[str]) -> dict[str, Any]:
     return coinbase_api_request("POST", "/api/v3/brokerage/orders/batch_cancel", {"order_ids": order_ids})
 
 def coinbase_order_id(response: dict[str, Any]) -> str:
-    if response.get("order_id"):
-        return str(response["order_id"])
-    if response.get("success_response", {}).get("order_id"):
-        return str(response["success_response"]["order_id"])
-    if response.get("order", {}).get("order_id"):
-        return str(response["order"]["order_id"])
-    raise RuntimeError(f"Coinbase order response did not include an order id: {response}")
+    """
+    Extract an order ID from a Coinbase Advanced Trade order response.
+
+    Raises a useful exception when Coinbase explicitly rejects the order,
+    rather than reporting the rejection as a missing order ID.
+    """
+    if not isinstance(response, dict):
+        raise RuntimeError(
+            f"Unexpected Coinbase order response type: {type(response).__name__}: {response!r}"
+        )
+
+    # Common successful response shapes.
+    order_id = response.get("order_id")
+    if order_id:
+        return str(order_id)
+
+    success_response = response.get("success_response")
+    if isinstance(success_response, dict):
+        order_id = success_response.get("order_id")
+        if order_id:
+            return str(order_id)
+
+    order_data = response.get("order")
+    if isinstance(order_data, dict):
+        order_id = order_data.get("order_id")
+        if order_id:
+            return str(order_id)
+
+    # Coinbase Advanced Trade rejected the order.
+    error_response = response.get("error_response")
+    if isinstance(error_response, dict):
+        error = error_response.get("error", "UNKNOWN_ERROR")
+        message = error_response.get("message", "")
+        details = error_response.get("error_details", "")
+        preview_failure = error_response.get("preview_failure_reason", "")
+
+        raise RuntimeError(
+            "Coinbase rejected order: "
+            f"error={error}; "
+            f"message={message}; "
+            f"details={details}; "
+            f"preview_failure_reason={preview_failure}"
+        )
+
+    # Some responses expose success=False without error_response.
+    if response.get("success") is False:
+        raise RuntimeError(
+            f"Coinbase rejected order: {response}"
+        )
+
+    raise RuntimeError(
+        f"Coinbase returned an unexpected order response: {response}"
+    )
 
 def coinbase_reconcile_order(order_id: str) -> dict[str, Any]:
     order_data: dict[str, Any] = {}
