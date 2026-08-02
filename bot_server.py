@@ -6164,19 +6164,41 @@ class PaperBot:
                 order = coinbase_limit_order(product_id, side, base_size, limit_price)
 
             else:
-                if side == "BUY":
-                    order = connector.market_buy(symbol, quote_size)
+                # For Coinbase, submit through Auxo's native order helper so the
+                # client_order_id survives and uncertain submissions can be
+                # recovered before any retry is considered.
+                if active_exchange == "coinbase":
+                    if side == "BUY":
+                        order = coinbase_market_order(
+                            product_id=product_id,
+                            side=side,
+                            quote_size=quote_size,
+                        )
+                    else:
+                        best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
+                        base_size = quote_size / best_price if best_price > 0 else 0.0
+                        base_size = self.coinbase_round_size(base_size, product_id)
+                        order = coinbase_market_order(
+                            product_id=product_id,
+                            side=side,
+                            base_size=base_size,
+                        )
                 else:
-                    best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
-                    base_size = quote_size / best_price if best_price > 0 else 0.0
-                    base_size = self.coinbase_round_size(base_size, product_id)
-                    order = connector.market_sell(symbol, base_size)
+                    # Preserve the existing connector path for non-Coinbase
+                    # exchanges. These connectors have their own order IDs.
+                    if side == "BUY":
+                        raw_order = connector.market_buy(symbol, quote_size)
+                    else:
+                        best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
+                        base_size = quote_size / best_price if best_price > 0 else 0.0
+                        base_size = self.coinbase_round_size(base_size, product_id)
+                        raw_order = connector.market_sell(symbol, base_size)
 
-                try:
-                    order_id = order.get("order_id") or order.get("orderId") or str(order.get("id"))
-                except Exception:
-                    order_id = str(uuid.uuid4())
-                order = {"order_id": order_id, "raw": order}
+                    try:
+                        order_id = raw_order.get("order_id") or raw_order.get("orderId") or str(raw_order.get("id"))
+                    except Exception:
+                        order_id = str(uuid.uuid4())
+                    order = {"order_id": order_id, "raw": raw_order}
 
             order_id = coinbase_order_id(order)
             managed = self.track_order(
@@ -7448,14 +7470,108 @@ def coinbase_stop_limit_order(
         }
     }
 
-    body = {
-        "client_order_id": str(uuid.uuid4()),
-        "product_id": product_id,
-        "side": side.upper(),
-        "order_configuration": order_configuration,
-    }
+    # Route stop orders through the same submission/recovery path as market
+    # and limit orders so client_order_id is retained and ambiguous network
+    # failures can be recovered safely.
+    return coinbase_create_order(product_id, side, order_configuration)
 
-    return coinbase_api_request("POST", "/api/v3/brokerage/orders", body)
+def coinbase_find_order_by_client_id(
+    client_order_id: str,
+    product_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Find a Coinbase order using Auxo's client_order_id.
+
+    Coinbase's List Orders endpoint returns client_order_id on each order,
+    although it does not currently expose client_order_id as a list filter.
+    Keep the search deliberately narrow (product + recent pages) because this
+    function is only used immediately after an ambiguous submission.
+    """
+    cursor = ""
+    pages_checked = 0
+
+    while pages_checked < 5:
+        params: list[tuple[str, str]] = [("limit", "100")]
+        if product_id:
+            params.append(("product_ids", product_id))
+        if cursor:
+            params.append(("cursor", cursor))
+
+        query = urllib.parse.urlencode(params)
+        data = coinbase_api_request(
+            "GET",
+            f"/api/v3/brokerage/orders/historical/batch?{query}",
+        )
+
+        for order in data.get("orders", []):
+            if str(order.get("client_order_id") or "") == client_order_id:
+                return order
+
+        pages_checked += 1
+        if not data.get("has_next"):
+            break
+        cursor = str(data.get("cursor") or "")
+        if not cursor:
+            break
+
+    return None
+
+def coinbase_recover_submitted_order(
+    client_order_id: str,
+    product_id: str,
+    attempts: int = 4,
+    delay_seconds: float = 0.75,
+) -> dict[str, Any] | None:
+    """Recover an order whose POST result was ambiguous.
+
+    Never submits another order. It only asks Coinbase whether the original
+    client_order_id already exists.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(attempts):
+        try:
+            recovered = coinbase_find_order_by_client_id(
+                client_order_id,
+                product_id=product_id,
+            )
+            if recovered:
+                order_id = str(recovered.get("order_id") or "")
+                if order_id:
+                    logger.warning(
+                        "Recovered uncertain Coinbase order %s using client_order_id %s",
+                        order_id,
+                        client_order_id,
+                    )
+                    return {
+                        "success": True,
+                        "success_response": {
+                            "order_id": order_id,
+                            "client_order_id": client_order_id,
+                        },
+                        "order": recovered,
+                        "client_order_id": client_order_id,
+                        "recovered_after_submission_error": True,
+                    }
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Coinbase client-order recovery attempt %d/%d failed for %s: %s",
+                attempt + 1,
+                attempts,
+                client_order_id,
+                exc,
+            )
+
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+
+    if last_error:
+        logger.warning(
+            "Could not confirm Coinbase order for client_order_id %s: %s",
+            client_order_id,
+            last_error,
+        )
+    return None
 
 def coinbase_create_order(
     product_id: str,
@@ -7476,11 +7592,34 @@ def coinbase_create_order(
         "order_configuration": order_configuration,
     }
 
-    response = coinbase_api_request(
-        "POST",
-        "/api/v3/brokerage/orders",
-        body,
-    )
+    try:
+        response = coinbase_api_request(
+            "POST",
+            "/api/v3/brokerage/orders",
+            body,
+        )
+    except Exception as submit_error:
+        # A transport/response failure does NOT prove Coinbase failed to create
+        # the order. Before the caller can retry, look up the exact client ID.
+        # This prevents duplicate BUY/SELL orders after timeouts or lost replies.
+        logger.error(
+            "Coinbase order submission outcome uncertain for client_order_id %s: %s",
+            client_order_id,
+            submit_error,
+        )
+
+        recovered = coinbase_recover_submitted_order(
+            client_order_id=client_order_id,
+            product_id=product_id,
+        )
+        if recovered is not None:
+            return recovered
+
+        raise RuntimeError(
+            "Coinbase order submission outcome is uncertain and recovery could "
+            f"not find client_order_id={client_order_id}. Do not blindly retry "
+            "this order; reconcile Coinbase orders/balances first."
+        ) from submit_error
 
     # Retain Auxo's client order ID even if Coinbase's response
     # doesn't echo it back.
