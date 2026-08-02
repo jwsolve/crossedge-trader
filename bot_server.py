@@ -3602,11 +3602,20 @@ class PaperBot:
                 logger.debug("Live trading not enabled, skipping balance sync")
                 return
 
+            # This synchroniser is Coinbase-specific. Do not overwrite cash for
+            # another live exchange/account type.
+            if settings.get("asset_class", "crypto") != "crypto" or settings.get("exchange") != "coinbase":
+                logger.debug("Not a live Coinbase crypto account, skipping Coinbase balance sync")
+                return
+
             quote_currency = settings.get("quote_currency", "GBP")
             actual_balance = coinbase_available_balance(quote_currency)
 
-            if actual_balance <= 0:
-                logger.warning(f"Coinbase balance is 0 or unavailable: {actual_balance}")
+            # Zero is a valid available balance (for example after deploying all
+            # quote cash into a position), so it must be synchronised rather than
+            # treated as an error. Only reject an impossible negative value.
+            if actual_balance < 0:
+                logger.warning(f"Coinbase balance is invalid: {actual_balance}")
                 return
 
             with self.lock:
@@ -6530,6 +6539,21 @@ class PaperBot:
         order.status = "FILLED"
         order.updated_at = now_iso()
         self.audit("ORDER_FILLED_APPLIED", order=asdict(order), fill=fill)
+
+        # paper_buy()/paper_sell() are also used to apply confirmed LIVE fills so
+        # that Auxo keeps its trade history, realised P/L, fees and position state.
+        # Their local cash arithmetic is authoritative in paper mode, but not in
+        # Coinbase live mode. After every confirmed live Coinbase fill, replace
+        # local quote cash with Coinbase's actual available quote balance. This
+        # keeps Equity/Total P&L anchored to the immutable starting_cash baseline
+        # and prevents local fill accounting from drifting away from the exchange.
+        if (
+            self.state.settings.get("live_trading_enabled")
+            and self.state.settings.get("asset_class", "crypto") == "crypto"
+            and self.state.settings.get("exchange") == "coinbase"
+        ):
+            self.sync_live_balance_always()
+
         return True
 
     def expire_order(self, order: ManagedOrder) -> None:
