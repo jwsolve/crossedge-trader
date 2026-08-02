@@ -2232,6 +2232,7 @@
         let priceSeries = null;
         let horizontalSeries = {};
         let indicatorMarkers = null;
+        let volumeSeries = null;
 
         function initChart() {
             if (chart) {
@@ -2240,6 +2241,7 @@
                 priceSeries = null;
                 horizontalSeries = {};
                 indicatorMarkers = null;
+                volumeSeries = null;
             }
 
             const container = els.chartContainer;
@@ -2384,6 +2386,7 @@
                 Object.keys(horizontalSeries).forEach(key => { chart.removeSeries(horizontalSeries[key]); });
                 horizontalSeries = {};
                 if (indicatorMarkers) { chart.removeSeries(indicatorMarkers); indicatorMarkers = null; }
+                if (volumeSeries) { chart.removeSeries(volumeSeries); volumeSeries = null; }
                 return;
             } else {
                 chart.applyOptions({ watermark: { visible: false } });
@@ -2393,6 +2396,7 @@
             Object.keys(horizontalSeries).forEach(key => { chart.removeSeries(horizontalSeries[key]); });
             horizontalSeries = {};
             if (indicatorMarkers) { chart.removeSeries(indicatorMarkers); indicatorMarkers = null; }
+            if (volumeSeries) { chart.removeSeries(volumeSeries); volumeSeries = null; }
 
             const candleMode = chartMode === 'candles' && sourceCandles.length >= 2;
 
@@ -2428,6 +2432,30 @@
                     },
                 });
                 priceSeries.setData(lineData);
+            }
+
+            // ── Volume histogram ──
+            // Show real volume bars in the lower part of the chart.  Spike bars are
+            // deliberately brighter so they are visible without relying on markers.
+            if (indicatorState.volume && sourceCandles.length > 0) {
+                const spikes = detectVolumeSpikes(sourceCandles, 2);
+                const spikeIndexes = new Set(spikes.map(s => s.index));
+                volumeSeries = chart.addHistogramSeries({
+                    priceScaleId: 'volume',
+                    priceFormat: { type: 'volume' },
+                    priceLineVisible: false,
+                    lastValueVisible: false,
+                });
+                chart.priceScale('volume').applyOptions({
+                    scaleMargins: { top: 0.80, bottom: 0 },
+                });
+                volumeSeries.setData(sourceCandles.map((c, i) => ({
+                    time: c.time,
+                    value: Number(c.volume || 0),
+                    color: spikeIndexes.has(i)
+                        ? '#a855f7'
+                        : (c.close >= c.open ? 'rgba(11,126,74,0.32)' : 'rgba(185,28,28,0.32)'),
+                })));
             }
 
             // ── Horizontal levels ──
@@ -2500,7 +2528,7 @@
                         position: isBuy ? 'belowBar' : 'aboveBar',
                         color: isBuy ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
                         shape: isBuy ? 'arrowUp' : 'arrowDown',
-                        text: t.side,
+                        text: `${t.side} ${priceText(price, lastChartSymbol)}`,
                     });
                 });
             }
@@ -2516,7 +2544,7 @@
                         position: isBullish ? 'belowBar' : 'aboveBar',
                         color: isBullish ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
                         shape: 'circle',
-                        text: 'ENG',
+                        text: isBullish ? 'BULL ENG' : 'BEAR ENG',
                     });
                 });
             }
@@ -2529,7 +2557,7 @@
                     const isBull = b.type === 'resistance_breakout';
                     markerData.push({
                         time: candle.time,
-                        position: 'aboveBar',
+                        position: isBull ? 'belowBar' : 'aboveBar',
                         color: '#f59e0b',
                         shape: 'circle',
                         text: isBull ? 'BRK↑' : 'BRK↓',
@@ -2554,7 +2582,7 @@
                         position: isBullish ? 'belowBar' : 'aboveBar',
                         color: isBullish ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
                         shape: 'circle',
-                        text: isBullish ? '↑TR' : '↓TR',
+                        text: isBullish ? 'TREND ↑' : 'TREND ↓',
                     });
                 });
             }
@@ -2564,78 +2592,71 @@
                 const lastTime = lastCandle.time;
 
                 if (indicatorState.macd) {
-                    const macdData = macd(
-                        sourceCandles.length ? sourceCandles.map(c => c.close) : prices,
-                        12, 26, 9
-                    );
-                    if (macdData && macdData.signal !== null) {
-                        const isBuy = macdData.macd > macdData.signal;
-                        markerData.push({
-                            time: lastTime,
-                            position: 'aboveBar',
-                            color: isBuy ? '#06b6d4' : '#ec4899',
-                            shape: 'circle',
-                            text: isBuy ? 'MACD↑' : 'MACD↓',
-                        });
+                    // Mark MACD signal-line crosses across the visible history instead
+                    // of showing only the current MACD state on the last candle.
+                    let previousSide = null;
+                    for (let i = 35; i < sourceCandles.length; i++) {
+                        const values = sourceCandles.slice(0, i + 1).map(c => c.close);
+                        const m = macd(values, 12, 26, 9);
+                        if (!m || m.signal === null) continue;
+                        const side = m.macd >= m.signal ? 'bull' : 'bear';
+                        if (previousSide && side !== previousSide) {
+                            markerData.push({
+                                time: sourceCandles[i].time,
+                                position: side === 'bull' ? 'belowBar' : 'aboveBar',
+                                color: side === 'bull' ? '#06b6d4' : '#ec4899',
+                                shape: side === 'bull' ? 'arrowUp' : 'arrowDown',
+                                text: side === 'bull' ? 'MACD BUY' : 'MACD SELL',
+                            });
+                        }
+                        previousSide = side;
                     }
                 }
 
                 if (indicatorState.rsi) {
-                    const rsiVal = rsi(
-                        sourceCandles.length ? sourceCandles.map(c => c.close) : prices,
-                        14
-                    );
-                    if (rsiVal !== null) {
-                        if (rsiVal >= 70) {
+                    // Mark every entry into overbought/oversold territory in the
+                    // visible history. This avoids a silent RSI checkbox when the
+                    // latest candle happens to be between 30 and 70.
+                    let previousZone = 'neutral';
+                    for (let i = 14; i < sourceCandles.length; i++) {
+                        const value = rsi(sourceCandles.slice(0, i + 1).map(c => c.close), 14);
+                        if (value === null) continue;
+                        const zone = value >= 70 ? 'overbought' : (value <= 30 ? 'oversold' : 'neutral');
+                        if (zone !== 'neutral' && zone !== previousZone) {
                             markerData.push({
-                                time: lastTime,
-                                position: 'aboveBar',
-                                color: cssVar('--bad') || '#b91c1c',
+                                time: sourceCandles[i].time,
+                                position: zone === 'oversold' ? 'belowBar' : 'aboveBar',
+                                color: zone === 'oversold' ? (cssVar('--good') || '#0b7e4a') : (cssVar('--bad') || '#b91c1c'),
                                 shape: 'circle',
-                                text: `RSI ${Math.round(rsiVal)}`,
-                            });
-                        } else if (rsiVal <= 30) {
-                            markerData.push({
-                                time: lastTime,
-                                position: 'belowBar',
-                                color: cssVar('--good') || '#0b7e4a',
-                                shape: 'circle',
-                                text: `RSI ${Math.round(rsiVal)}`,
+                                text: `RSI ${Math.round(value)} ${zone === 'oversold' ? 'OS' : 'OB'}`,
                             });
                         }
+                        previousZone = zone;
                     }
                 }
 
                 if (indicatorState.volume) {
-                    const spikes = detectVolumeSpikes(sourceCandles, 2);
-                    if (spikes.length > 0) {
-                        const lastSpike = spikes[spikes.length - 1];
-                        const candle = sourceCandles[lastSpike.index];
-                        if (candle) {
-                            markerData.push({
-                                time: candle.time,
-                                position: 'aboveBar',
-                                color: '#a855f7',
-                                shape: 'circle',
-                                text: `VOL ${Math.round(lastSpike.volume / lastSpike.avg)}x`,
-                            });
-                        }
-                    }
+                    // Label every detected spike, not just the most recent one.
+                    detectVolumeSpikes(sourceCandles, 2).forEach(spike => {
+                        const candle = sourceCandles[spike.index];
+                        if (!candle) return;
+                        markerData.push({
+                            time: candle.time,
+                            position: 'aboveBar',
+                            color: '#a855f7',
+                            shape: 'circle',
+                            text: `VOL ${(spike.volume / spike.avg).toFixed(1)}x`,
+                        });
+                    });
                 }
             }
 
-            if (markerData.length > 0) {
-                const dummySeries = chart.addLineSeries({
-                    color: 'transparent',
-                    lineWidth: 0,
-                    priceLineVisible: false,
-                    lastValueVisible: false,
-                    crosshairMarkerVisible: false,
-                });
-                const firstTime = sourceCandles.length ? sourceCandles[0].time : 0;
-                dummySeries.setData([{ time: firstTime, value: 0 }]);
-                dummySeries.setMarkers(markerData);
-                indicatorMarkers = dummySeries;
+            // Attach event markers directly to the visible price series.  This
+            // keeps arrows/circles anchored to their candle instead of a hidden
+            // zero-value dummy series. Lightweight Charts requires sorted markers.
+            markerData.sort((a, b) => Number(a.time) - Number(b.time));
+            if (priceSeries && typeof priceSeries.setMarkers === 'function') {
+                priceSeries.setMarkers(markerData);
             }
 
             updateChartTimeRange(sourceCandles);
