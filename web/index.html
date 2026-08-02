@@ -2011,6 +2011,26 @@
             return `${displayCurrency || 'GBP'} ${num.toFixed(precision)}`;
         };
 
+        // Open-trade TP/SL levels need more precision than the general UI.
+        // In particular, prices around £1 must not collapse distinct entry/current/stop
+        // values (e.g. 1.26984 and 1.26620) into the same displayed £1.27.
+        const tradePriceText = (v, sym) => {
+            if (v === null || v === undefined) return '—';
+            const value = Number(v);
+            if (!Number.isFinite(value)) return '—';
+            if (displayAssetClass === 'forex') {
+                const dp = String(sym || '').toUpperCase().endsWith('JPY') ? 3 : 5;
+                return value.toFixed(dp);
+            }
+            const absPrice = Math.abs(value);
+            let precision;
+            if (absPrice >= 1000) precision = 2;
+            else if (absPrice >= 1) precision = 5;
+            else if (absPrice >= 0.01) precision = 6;
+            else precision = 8;
+            return `${displayCurrency || 'GBP'} ${value.toFixed(precision)}`;
+        };
+
         function getTimeframeLabel(seconds) {
             const labels = {
                 60: '1m',
@@ -3394,7 +3414,7 @@
                 let stopClass = '';
                 if (stop) {
                     const stopDist = row.stop_distance_pct || 0;
-                    stopDisplay = priceText(stop, sym);
+                    stopDisplay = tradePriceText(stop, sym);
                     if (Math.abs(stopDist) < 1.5) {
                         stopClass = 'tpsl-near-stop';
                         stopDisplay += ' 🔴';
@@ -3409,7 +3429,7 @@
                 let targetClass = '';
                 if (target) {
                     const targetDist = row.target_distance_pct || 0;
-                    targetDisplay = priceText(target, sym);
+                    targetDisplay = tradePriceText(target, sym);
                     if (Math.abs(targetDist) < 1.5) {
                         targetClass = 'tpsl-near-target';
                         targetDisplay += ' 🟢';
@@ -3446,8 +3466,8 @@
                         <span class="pl ${cls}">${pnl !== null && pnl !== undefined ? money(pnl) : '-'}${pnlPct !== undefined && pnlPct !== null ? ` (${Number(pnlPct).toFixed(2)}%)` : ''}</span>
                     </div>
                     <div class="detail"><span class="label">Side</span><span class="${sideClass}">${sideText}</span></div>
-                    <div class="detail"><span class="label">Entry</span><span>${entry ? priceText(entry, sym) : '-'}</span></div>
-                    <div class="detail"><span class="label">Current</span><span><strong>${current ? priceText(current, sym) : '-'}</strong></span></div>
+                    <div class="detail"><span class="label">Entry</span><span>${entry ? tradePriceText(entry, sym) : '-'}</span></div>
+                    <div class="detail"><span class="label">Current</span><span><strong>${current ? tradePriceText(current, sym) : '-'}</strong></span></div>
                     <div class="detail"><span class="label">Stop Loss</span><span class="${stopClass}">${stopDisplay}</span></div>
                     <div class="detail"><span class="label">Take Profit</span><span class="${targetClass}">${targetDisplay}</span></div>
                     ${hasLevels ? `

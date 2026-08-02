@@ -5181,13 +5181,43 @@ class PaperBot:
             signal_candle_set = signal_candles(closes_to_candles(history), settings)
             signal_history = [candle.close for candle in signal_candle_set] or history
             current_highest = max(highest_price or price, price)
-            stop_price, target_price, exit_mode = exit_prices(
-                entry_price=entry_price,
-                candles=candles,
-                settings=settings,
-            )
 
             position = positions.get(symbol, {})
+
+            # Use the protective levels captured when this position was opened.
+            # Recalculating ATR exits on every decision cycle can widen the stop as
+            # volatility changes, while the UI continues to show the original stop.
+            # Only fall back to a fresh calculation for legacy positions that do not
+            # already have stored TP/SL levels.
+            stored_stop = (
+                position.get("stop_price") or
+                position.get("stop") or
+                position.get("stop_loss") or
+                position.get("stop_loss_price")
+            )
+            stored_target = (
+                position.get("target_price") or
+                position.get("target") or
+                position.get("take_profit") or
+                position.get("take_profit_price")
+            )
+            stop_price = float(stored_stop) if stored_stop is not None else None
+            target_price = float(stored_target) if stored_target is not None else None
+            exit_mode = str(position.get("exit_mode") or self.state.exit_mode or "stored")
+
+            if stop_price is None or target_price is None:
+                calculated_stop, calculated_target, calculated_mode = exit_prices(
+                    entry_price=entry_price,
+                    candles=candles,
+                    settings=settings,
+                )
+                if stop_price is None:
+                    stop_price = calculated_stop
+                if target_price is None:
+                    target_price = calculated_target
+                if not position.get("exit_mode"):
+                    exit_mode = calculated_mode
+
             position_side = "SHORT" if position.get('is_short', False) else "LONG"
             entry_time = position.get('entry_time', time.time())
 
@@ -5220,10 +5250,16 @@ class PaperBot:
             if trailing_stop and price <= trailing_stop:
                 return f"SELL {symbol} trailing stop"
 
-            if price <= stop_price:
-                return f"SELL {symbol} {exit_mode} stop"
-            if price >= target_price:
-                return f"SELL {symbol} {exit_mode} target"
+            if position_side == "SHORT":
+                if price >= stop_price:
+                    return f"SELL {symbol} {exit_mode} stop"
+                if price <= target_price:
+                    return f"SELL {symbol} {exit_mode} target"
+            else:
+                if price <= stop_price:
+                    return f"SELL {symbol} {exit_mode} stop"
+                if price >= target_price:
+                    return f"SELL {symbol} {exit_mode} target"
 
             if settings.get("strategy") == "ewo_offset":
                 signal = ewo_offset_signal(signal_candle_set, settings)
