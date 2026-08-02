@@ -6190,6 +6190,7 @@ class PaperBot:
                 base_size=base_size if order_type != "market" else None,
                 quote_size=quote_size,
                 reason=f"{reason} | size {spend_reason}",
+                client_order_id=order.get("client_order_id"),
                 details={
                     "native_stop_requested": bool(settings.get("native_stop_enabled")) or order_type in {"bracket", "native_stop_scaffold"},
                     "stop_price": stop_price,
@@ -6332,6 +6333,7 @@ class PaperBot:
             price=price,
             base_size=base_size,
             reason=reason,
+            client_order_id=order.get("client_order_id"),
         )
         fill = coinbase_reconcile_order(order_id)
         if self.apply_reconciled_order(managed, fill):
@@ -6373,6 +6375,7 @@ class PaperBot:
         quote_size: float | None = None,
         reason: str = "",
         details: dict[str, Any] | None = None,
+        client_order_id: str | None = None,
     ) -> ManagedOrder:
         now_text = now_iso()
         order = ManagedOrder(
@@ -6391,6 +6394,7 @@ class PaperBot:
             quote_size=quote_size,
             reason=reason,
             details=details or {},
+            client_order_id=client_order_id,
         )
         self.state.open_orders.append(order)
         self.state.open_orders = self.state.open_orders[-120:]
@@ -6519,6 +6523,7 @@ class PaperBot:
                 quote_size=order.quote_size,
                 reason=order.reason,
                 details=order.details,
+                client_order_id=replacement.get("client_order_id"),
             )
             new_order.retry_count = order.retry_count + 1
             self.audit("ORDER_REPLACED", old_order_id=order.order_id, new_order_id=replacement_id)
@@ -6566,6 +6571,7 @@ class PaperBot:
                 base_size=base_size,
                 reason=f"{exit_mode} native stop",
                 details={"entry_order_id": entry_order.order_id},
+                client_order_id=stop_order.get("client_order_id"),
             )
             self.journal(
                 entry_order.symbol,
@@ -6639,7 +6645,7 @@ class PaperBot:
                         # exchange path until that path has its own reconciliation.
                         emergency_size = base_size
 
-                        emergency = coinbase_market_order(
+                    emergency = coinbase_market_order(
                         product_id=product_id,
                         side="BUY" if self.state.is_short else "SELL",
                         base_size=emergency_size,
@@ -7457,16 +7463,31 @@ def coinbase_create_order(
     order_configuration: dict[str, Any],
 ) -> dict[str, Any]:
     side = side.upper()
+
     if side not in {"BUY", "SELL"}:
         raise RuntimeError("Coinbase order side must be BUY or SELL")
 
+    client_order_id = str(uuid.uuid4())
+
     body = {
-        "client_order_id": str(uuid.uuid4()),
+        "client_order_id": client_order_id,
         "product_id": product_id,
         "side": side,
         "order_configuration": order_configuration,
     }
-    return coinbase_api_request("POST", "/api/v3/brokerage/orders", body)
+
+    response = coinbase_api_request(
+        "POST",
+        "/api/v3/brokerage/orders",
+        body,
+    )
+
+    # Retain Auxo's client order ID even if Coinbase's response
+    # doesn't echo it back.
+    if isinstance(response, dict):
+        response.setdefault("client_order_id", client_order_id)
+
+    return response
 
 def coinbase_get_order(order_id: str) -> dict[str, Any]:
     return coinbase_api_request("GET", f"/api/v3/brokerage/orders/historical/{urllib.parse.quote(order_id)}")
