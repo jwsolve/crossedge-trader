@@ -147,6 +147,7 @@ class ManagedOrder:
     quote_size: float | None = None
     reason: str = ""
     details: dict[str, Any] = field(default_factory=dict)
+    client_order_id: str | None = None
 
 
 @dataclass
