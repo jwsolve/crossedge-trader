@@ -3592,8 +3592,73 @@ class PaperBot:
             and coinbase_live_is_armed()
         )
 
+    def coinbase_live_account_snapshot(self) -> dict[str, Any]:
+        """Value the real Coinbase brokerage account in the selected quote currency.
+
+        This is authoritative for LIVE Coinbase Cash/Equity/Total P&L.  Local
+        positions remain the strategy/trade ledger, but they no longer determine
+        how much money actually exists at the exchange.
+        """
+        with self.lock:
+            quote = str(self.state.settings.get("quote_currency", "GBP")).upper()
+            local_prices = {
+                str(symbol).upper(): float(history[-1])
+                for symbol, history in self.state.price_history.items()
+                if history
+            }
+
+        balances = coinbase_account_balances()
+        quote_row = balances.get(quote, {})
+        available_cash = float(quote_row.get("available", 0.0) or 0.0)
+        quote_total = float(quote_row.get("total", available_cash) or 0.0)
+        holdings: list[dict[str, Any]] = []
+        holdings_value = 0.0
+        unpriced: list[str] = []
+
+        for currency, row in balances.items():
+            if currency == quote:
+                continue
+            quantity = float(row.get("total", 0.0) or 0.0)
+            if quantity <= 0:
+                continue
+
+            price = local_prices.get(currency)
+            if price is None:
+                try:
+                    ticker = fetch_coinbase_ticker(currency, quote)
+                    price = float(ticker.get("price", 0.0) or 0.0)
+                except Exception:
+                    # Some tiny/reward assets do not have a direct market in the
+                    # selected quote currency.  Do not invent a value for them.
+                    unpriced.append(currency)
+                    continue
+
+            value = quantity * price
+            # Ignore only truly negligible dust while retaining real holdings.
+            if value < 0.000001:
+                continue
+            holdings_value += value
+            holdings.append({
+                "currency": currency,
+                "quantity": quantity,
+                "price": price,
+                "value": value,
+            })
+
+        return {
+            "ok": True,
+            "quote_currency": quote,
+            "available_cash": available_cash,
+            "quote_total": quote_total,
+            "holdings_value": holdings_value,
+            "equity": quote_total + holdings_value,
+            "holdings": holdings,
+            "unpriced": unpriced,
+            "time": now_iso(),
+        }
+
     def sync_live_balance_always(self) -> None:
-        """Sync Coinbase balance even if there are open positions."""
+        """Sync authoritative Coinbase cash/equity even if positions are open."""
         try:
             with self.lock:
                 settings = dict(self.state.settings)
@@ -3609,7 +3674,8 @@ class PaperBot:
                 return
 
             quote_currency = settings.get("quote_currency", "GBP")
-            actual_balance = coinbase_available_balance(quote_currency)
+            account_snapshot = self.coinbase_live_account_snapshot()
+            actual_balance = float(account_snapshot.get("available_cash", 0.0))
 
             # Zero is a valid available balance (for example after deploying all
             # quote cash into a position), so it must be synchronised rather than
@@ -3623,6 +3689,7 @@ class PaperBot:
                 # Automatic exchange balance sync must only update live available cash;
                 # otherwise every trade silently moves the P/L baseline.
                 self.state.cash = actual_balance
+                self._coinbase_account_snapshot = account_snapshot
 
                 current_day = today_key()
                 if self.state.day_start_date != current_day:
@@ -4300,6 +4367,7 @@ class PaperBot:
             total_pnl = 0.0
             unrealized_pnl = 0.0
             oanda_positions = []
+            coinbase_data = {}
 
             if self.should_oanda_demo_trade():
                 try:
@@ -4346,7 +4414,32 @@ class PaperBot:
             set_position_rows_bot(self)
 
             if not self.should_oanda_demo_trade():
-                equity = self._calculate_equity_local(price)
+                is_live_coinbase = (
+                    bool(self.state.settings.get("live_trading_enabled"))
+                    and self.state.settings.get("asset_class", "crypto") == "crypto"
+                    and self.state.settings.get("exchange") == "coinbase"
+                    and coinbase_live_is_armed()
+                )
+                if is_live_coinbase:
+                    # Use the most recently reconciled exchange snapshot.  Refresh
+                    # if one is not available yet.  This prevents stale/missing local
+                    # positions from appearing as a large account loss.
+                    coinbase_data = getattr(self, "_coinbase_account_snapshot", {}) or {}
+                    if not coinbase_data.get("ok"):
+                        try:
+                            coinbase_data = self.coinbase_live_account_snapshot()
+                            self._coinbase_account_snapshot = coinbase_data
+                        except Exception as exc:
+                            logger.warning(f"Failed to value Coinbase account for snapshot: {exc}")
+                            coinbase_data = {}
+                    if coinbase_data.get("ok"):
+                        cash = float(coinbase_data.get("available_cash", self.state.cash))
+                        self.state.cash = cash
+                        equity = float(coinbase_data.get("equity", cash))
+                    else:
+                        equity = self._calculate_equity_local(price)
+                else:
+                    equity = self._calculate_equity_local(price)
                 total_pnl = equity - float(self.state.settings.get("starting_cash", 0))
 
             # Account accounting: starting_cash is the fixed baseline; cash is the
@@ -4358,8 +4451,16 @@ class PaperBot:
                 unrealized_pnl = float(oanda_data.get("unrealized_pnl", unrealized_pnl) or 0.0)
             else:
                 unrealized_pnl = 0.0
+                live_holding_qty = {
+                    str(item.get("currency", "")).upper(): float(item.get("quantity", 0.0) or 0.0)
+                    for item in coinbase_data.get("holdings", [])
+                } if coinbase_data.get("ok") else {}
                 for symbol, position in self.state.positions.items():
                     quantity = float(position.get("quantity", 0.0))
+                    if live_holding_qty:
+                        # Local positions are the entry-price ledger, but never claim
+                        # more live quantity than Coinbase actually holds.
+                        quantity = min(max(quantity, 0.0), live_holding_qty.get(str(symbol).upper(), 0.0))
                     entry = position.get("entry_price")
                     history = self.state.price_history.get(symbol, [])
                     current = history[-1] if history else price
@@ -7445,9 +7546,14 @@ def coinbase_api_request(
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Coinbase API error {exc.code}: {detail}") from exc
 
-def coinbase_available_balance(currency: str) -> float:
+def coinbase_account_balances() -> dict[str, dict[str, float]]:
+    """Return Coinbase brokerage balances keyed by currency.
+
+    Coinbase separates funds into available and held balances.  Equity must use
+    both; the Cash box intentionally uses only the available quote balance.
+    """
     cursor = ""
-    currency = currency.upper()
+    balances: dict[str, dict[str, float]] = {}
 
     while True:
         query = "?limit=250"
@@ -7456,13 +7562,25 @@ def coinbase_available_balance(currency: str) -> float:
         data = coinbase_api_request("GET", f"/api/v3/brokerage/accounts{query}")
 
         for account in data.get("accounts", []):
-            if account.get("currency") == currency:
-                balance = account.get("available_balance", {})
-                return float(balance.get("value", 0.0))
+            currency = str(account.get("currency", "")).upper()
+            if not currency:
+                continue
+            available = float((account.get("available_balance") or {}).get("value", 0.0) or 0.0)
+            hold = float((account.get("hold") or {}).get("value", 0.0) or 0.0)
+            row = balances.setdefault(currency, {"available": 0.0, "hold": 0.0, "total": 0.0})
+            row["available"] += available
+            row["hold"] += hold
+            row["total"] += available + hold
 
         if not data.get("has_next"):
-            return 0.0
+            break
         cursor = data.get("cursor", "")
+
+    return balances
+
+def coinbase_available_balance(currency: str) -> float:
+    currency = currency.upper()
+    return float(coinbase_account_balances().get(currency, {}).get("available", 0.0))
 
 def coinbase_market_order(
     product_id: str,
