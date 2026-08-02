@@ -19,6 +19,7 @@ Enhanced with:
 from __future__ import annotations
 
 import json
+import random
 import math
 import os
 import base64
@@ -8106,6 +8107,9 @@ def run_backtest_for_symbol(
     entry_price: float | None = None
     highest_price: float | None = None
     partial_done = False
+    locked_stop: float | None = None
+    locked_target: float | None = None
+    locked_exit_mode: str = "fixed"
     trade_fee = float(settings["trade_fee"])
     slippage = float(settings.get("backtest_slippage_pct", 0.0)) / 100
     short_window = int(settings["short_window"])
@@ -8144,23 +8148,22 @@ def run_backtest_for_symbol(
 
         if can_trade and coin > 0 and entry_price:
             reason = None
-            highest_price = max(highest_price or price, price)
-            stop_price, target_price, exit_mode = exit_prices(
-                entry_price=entry_price,
-                candles=active_candles,
-                settings=settings,
-            )
+            highest_price = max(highest_price or price, candle.high)
+            stop_price = locked_stop if locked_stop is not None else entry_price * (1 - float(settings["stop_loss_pct"]) / 100)
+            target_price = locked_target if locked_target is not None else entry_price * (1 + float(settings["take_profit_pct"]) / 100)
+            exit_mode = locked_exit_mode
             partial_quantity = 0.0
-            if partial_take_profit_ready(price, entry_price, target_price, settings, partial_done):
+            partial_trigger = entry_price + ((target_price - entry_price) * (float(settings.get("partial_take_profit_at_target_pct", 50.0)) / 100))
+            trail = trailing_stop_price(entry_price, highest_price, settings)
+            intrabar_reason, intrabar_fill = backtest_intrabar_long_exit(candle, stop_price, target_price, trail)
+            if settings.get("partial_take_profit_enabled") and not partial_done and candle.high >= partial_trigger and not intrabar_reason:
                 reason = f"partial {exit_mode} target"
                 partial_done = True
                 partial_quantity = coin * (float(settings.get("partial_take_profit_pct", 50.0)) / 100)
-            elif trailing_stop_price(entry_price, highest_price, settings) and price <= trailing_stop_price(entry_price, highest_price, settings):
-                reason = "trailing stop"
-            elif price <= stop_price:
-                reason = f"{exit_mode} stop"
-            elif price >= target_price:
-                reason = f"{exit_mode} target"
+                price = max(candle.open, partial_trigger)
+            elif intrabar_reason:
+                reason = "trailing stop" if intrabar_reason == "trailing stop" else f"{exit_mode} {intrabar_reason}"
+                price = float(intrabar_fill)
             elif short_prev >= long_prev and short_now < long_now:
                 reason = "trend turned down"
 
@@ -8184,6 +8187,7 @@ def run_backtest_for_symbol(
                 if coin <= 0.0000000001:
                     coin = 0.0
                     entry_price = None
+                    locked_stop = locked_target = None
                     highest_price = None
                     partial_done = False
 
@@ -8204,6 +8208,7 @@ def run_backtest_for_symbol(
                 coin = (spend - fee_paid) / fill_price
                 cash -= spend
                 entry_price = fill_price
+                locked_stop, locked_target, locked_exit_mode = exit_prices(entry_price, active_candles, settings)
                 highest_price = fill_price
                 partial_done = False
                 trades.append({
@@ -8240,6 +8245,8 @@ def run_backtest_for_symbol(
         else:
             losses += 1
 
+    metrics = backtest_metrics(trades, starting_cash, equity_curve)
+
     return {
         "symbol": symbol,
         "candles": len(candles),
@@ -8250,8 +8257,18 @@ def run_backtest_for_symbol(
         "total_pnl_pct": total_pnl_pct,
         "max_drawdown_pct": round(max_drawdown_pct, 4),
         "trades_count": len(trades),
-        "closed_trades": len(sells),
-        "win_rate": round((wins / len(sells)) * 100, 2) if sells else 0.0,
+        "closed_trades": metrics["closed_trades"],
+        "win_rate": metrics["win_rate"],
+        "profit_factor": metrics["profit_factor"],
+        "expectancy": metrics["expectancy"],
+        "expectancy_pct_starting_cash": metrics["expectancy_pct_starting_cash"],
+        "average_winner": metrics["average_winner"],
+        "average_loser": metrics["average_loser"],
+        "payoff_ratio": metrics["payoff_ratio"],
+        "total_fees": metrics["total_fees"],
+        "sharpe_like": metrics["sharpe_like"],
+        "sortino_like": metrics["sortino_like"],
+        "_trade_pnls": metrics["trade_pnls"],
         "slippage_pct": float(settings.get("backtest_slippage_pct", 0.0)),
         "open_position": coin > 0,
         "trades": trades[-80:][::-1],
@@ -8330,7 +8347,7 @@ def run_opening_range_backtest(
                     "fee_paid": fee,
                 })
             else:
-                cash += gross - fee
+                cash -= gross + fee
                 trades.append({
                     "time": day_candles[-1].time,
                     "side": "BUY",
@@ -8347,7 +8364,7 @@ def run_opening_range_backtest(
         if manipulation:
             if is_green:
                 for candle in day_candles[1:]:
-                    if candle.close > trigger:
+                    if candle.high >= trigger:
                         entry = trigger
                         stop = entry - (atr * stop_loss_mult)
                         target = entry + (atr * take_profit_mult)
@@ -8376,8 +8393,10 @@ def run_opening_range_backtest(
                     })
 
                     for candle in day_candles:
-                        price = candle.close
-                        if price <= stop and stop > 0:
+                        reason, level_fill = backtest_intrabar_long_exit(candle, stop, target)
+                        price = float(level_fill) if level_fill is not None else candle.close
+                        if reason == "stop":
+                            price = apply_slippage(price, "SELL", slippage)
                             gross = coin * price
                             fee = gross * trade_fee
                             cash += gross - fee
@@ -8394,7 +8413,8 @@ def run_opening_range_backtest(
                             coin = 0.0
                             entry_price = None
                             break
-                        elif price >= target and target > 0:
+                        elif reason == "target":
+                            price = apply_slippage(price, "SELL", slippage)
                             gross = coin * price
                             fee = gross * trade_fee
                             cash += gross - fee
@@ -8414,7 +8434,7 @@ def run_opening_range_backtest(
 
             elif allow_short:
                 for candle in day_candles[1:]:
-                    if candle.close < trigger:
+                    if candle.low <= trigger:
                         entry = trigger
                         stop = entry + (atr * stop_loss_mult)
                         target = entry - (atr * take_profit_mult)
@@ -8427,8 +8447,8 @@ def run_opening_range_backtest(
                 if spend >= float(settings.get("min_order_value", 1.0)):
                     fill_price = apply_slippage(entry, "SELL", slippage)
                     fee_paid = spend * trade_fee
-                    coin = -(spend - fee_paid) / fill_price
-                    cash += spend
+                    coin = -spend / fill_price
+                    cash += spend - fee_paid
                     entry_price = fill_price
                     highest_price = fill_price
                     trades.append({
@@ -8443,11 +8463,13 @@ def run_opening_range_backtest(
                     })
 
                     for candle in day_candles:
-                        price = candle.close
-                        if price >= stop and stop > 0:
+                        reason, level_fill = backtest_intrabar_short_exit(candle, stop, target)
+                        price = float(level_fill) if level_fill is not None else candle.close
+                        if reason == "stop":
+                            price = apply_slippage(price, "BUY", slippage)
                             gross = abs(coin) * price
                             fee = gross * trade_fee
-                            cash += gross - fee
+                            cash -= gross + fee
                             trades.append({
                                 "time": candle.time,
                                 "side": "BUY",
@@ -8461,10 +8483,11 @@ def run_opening_range_backtest(
                             coin = 0.0
                             entry_price = None
                             break
-                        elif price <= target and target > 0:
+                        elif reason == "target":
+                            price = apply_slippage(price, "BUY", slippage)
                             gross = abs(coin) * price
                             fee = gross * trade_fee
-                            cash += gross - fee
+                            cash -= gross + fee
                             trades.append({
                                 "time": candle.time,
                                 "side": "BUY",
@@ -8511,8 +8534,10 @@ def run_opening_range_backtest(
                     })
 
                     for candle in day_candles:
-                        price = candle.close
-                        if price <= stop and stop > 0:
+                        reason, level_fill = backtest_intrabar_long_exit(candle, stop, target)
+                        price = float(level_fill) if level_fill is not None else candle.close
+                        if reason == "stop":
+                            price = apply_slippage(price, "SELL", slippage)
                             gross = coin * price
                             fee = gross * trade_fee
                             cash += gross - fee
@@ -8529,7 +8554,8 @@ def run_opening_range_backtest(
                             coin = 0.0
                             entry_price = None
                             break
-                        elif price >= target and target > 0:
+                        elif reason == "target":
+                            price = apply_slippage(price, "SELL", slippage)
                             gross = coin * price
                             fee = gross * trade_fee
                             cash += gross - fee
@@ -8575,6 +8601,8 @@ def run_opening_range_backtest(
             else:
                 losses += 1
 
+    metrics = backtest_metrics(trades, starting_cash, equity_curve)
+
     return {
         "symbol": symbol,
         "candles": len(candles),
@@ -8585,8 +8613,18 @@ def run_opening_range_backtest(
         "total_pnl_pct": total_pnl_pct,
         "max_drawdown_pct": round(max_drawdown_pct, 4),
         "trades_count": len(trades),
-        "closed_trades": len([t for t in trades if t["side"] in ["SELL", "BUY"]]),
-        "win_rate": round((wins / (wins + losses)) * 100, 2) if (wins + losses) > 0 else 0.0,
+        "closed_trades": metrics["closed_trades"],
+        "win_rate": metrics["win_rate"],
+        "profit_factor": metrics["profit_factor"],
+        "expectancy": metrics["expectancy"],
+        "expectancy_pct_starting_cash": metrics["expectancy_pct_starting_cash"],
+        "average_winner": metrics["average_winner"],
+        "average_loser": metrics["average_loser"],
+        "payoff_ratio": metrics["payoff_ratio"],
+        "total_fees": metrics["total_fees"],
+        "sharpe_like": metrics["sharpe_like"],
+        "sortino_like": metrics["sortino_like"],
+        "_trade_pnls": metrics["trade_pnls"],
         "slippage_pct": float(settings.get("backtest_slippage_pct", 0.0)),
         "open_position": coin != 0,
         "trades": trades[-80:][::-1],
@@ -8604,6 +8642,9 @@ def run_ewo_offset_backtest_for_symbol(
     entry_price: float | None = None
     highest_price: float | None = None
     partial_done = False
+    locked_stop: float | None = None
+    locked_target: float | None = None
+    locked_exit_mode: str = "fixed"
     trade_fee = float(settings["trade_fee"])
     slippage = float(settings.get("backtest_slippage_pct", 0.0)) / 100
     trade_start_time = int(settings.get("trade_start_time", 0))
@@ -8631,23 +8672,22 @@ def run_ewo_offset_backtest_for_symbol(
 
         if can_trade and coin > 0 and entry_price:
             reason = None
-            highest_price = max(highest_price or price, price)
-            stop_price, target_price, exit_mode = exit_prices(
-                entry_price=entry_price,
-                candles=active_candles,
-                settings=settings,
-            )
+            highest_price = max(highest_price or price, candle.high)
+            stop_price = locked_stop if locked_stop is not None else entry_price * (1 - float(settings["stop_loss_pct"]) / 100)
+            target_price = locked_target if locked_target is not None else entry_price * (1 + float(settings["take_profit_pct"]) / 100)
+            exit_mode = locked_exit_mode
             partial_quantity = 0.0
-            if partial_take_profit_ready(price, entry_price, target_price, settings, partial_done):
+            partial_trigger = entry_price + ((target_price - entry_price) * (float(settings.get("partial_take_profit_at_target_pct", 50.0)) / 100))
+            trail = trailing_stop_price(entry_price, highest_price, settings)
+            intrabar_reason, intrabar_fill = backtest_intrabar_long_exit(candle, stop_price, target_price, trail)
+            if settings.get("partial_take_profit_enabled") and not partial_done and candle.high >= partial_trigger and not intrabar_reason:
                 reason = f"partial {exit_mode} target"
                 partial_done = True
                 partial_quantity = coin * (float(settings.get("partial_take_profit_pct", 50.0)) / 100)
-            elif trailing_stop_price(entry_price, highest_price, settings) and price <= trailing_stop_price(entry_price, highest_price, settings):
-                reason = "trailing stop"
-            elif price <= stop_price:
-                reason = f"{exit_mode} stop"
-            elif price >= target_price:
-                reason = f"{exit_mode} target"
+                price = max(candle.open, partial_trigger)
+            elif intrabar_reason:
+                reason = "trailing stop" if intrabar_reason == "trailing stop" else f"{exit_mode} {intrabar_reason}"
+                price = float(intrabar_fill)
             elif signal["sell"]:
                 reason = "EWO offset sell"
 
@@ -8671,6 +8711,7 @@ def run_ewo_offset_backtest_for_symbol(
                 if coin <= 0.0000000001:
                     coin = 0.0
                     entry_price = None
+                    locked_stop = locked_target = None
                     highest_price = None
                     partial_done = False
 
@@ -8691,6 +8732,7 @@ def run_ewo_offset_backtest_for_symbol(
                 coin = (spend - fee_paid) / fill_price
                 cash -= spend
                 entry_price = fill_price
+                locked_stop, locked_target, locked_exit_mode = exit_prices(entry_price, active_candles, settings)
                 highest_price = fill_price
                 partial_done = False
                 trades.append({
@@ -8727,6 +8769,8 @@ def run_ewo_offset_backtest_for_symbol(
         else:
             losses += 1
 
+    metrics = backtest_metrics(trades, starting_cash, equity_curve)
+
     return {
         "symbol": symbol,
         "candles": len(candles),
@@ -8737,8 +8781,18 @@ def run_ewo_offset_backtest_for_symbol(
         "total_pnl_pct": total_pnl_pct,
         "max_drawdown_pct": round(max_drawdown_pct, 4),
         "trades_count": len(trades),
-        "closed_trades": len(sells),
-        "win_rate": round((wins / len(sells)) * 100, 2) if sells else 0.0,
+        "closed_trades": metrics["closed_trades"],
+        "win_rate": metrics["win_rate"],
+        "profit_factor": metrics["profit_factor"],
+        "expectancy": metrics["expectancy"],
+        "expectancy_pct_starting_cash": metrics["expectancy_pct_starting_cash"],
+        "average_winner": metrics["average_winner"],
+        "average_loser": metrics["average_loser"],
+        "payoff_ratio": metrics["payoff_ratio"],
+        "total_fees": metrics["total_fees"],
+        "sharpe_like": metrics["sharpe_like"],
+        "sortino_like": metrics["sortino_like"],
+        "_trade_pnls": metrics["trade_pnls"],
         "slippage_pct": float(settings.get("backtest_slippage_pct", 0.0)),
         "open_position": coin > 0,
         "trades": trades[-80:][::-1],
@@ -8756,6 +8810,9 @@ def run_ema_golden_cross_backtest(
     entry_price: float | None = None
     highest_price: float | None = None
     partial_done = False
+    locked_stop: float | None = None
+    locked_target: float | None = None
+    locked_exit_mode: str = "fixed"
     trade_fee = float(settings["trade_fee"])
     slippage = float(settings.get("backtest_slippage_pct", 0.0)) / 100
     ema_short = int(settings.get("ema_short", 50))
@@ -8811,19 +8868,20 @@ def run_ema_golden_cross_backtest(
                 })
                 coin = 0.0
                 entry_price = None
+                locked_stop = locked_target = None
                 highest_price = None
                 continue
 
-            stop_price, target_price, exit_mode = exit_prices(
-                entry_price=entry_price,
-                candles=active_candles,
-                settings=settings,
-            )
-            highest_price = max(highest_price or price, price)
+            stop_price = locked_stop if locked_stop is not None else entry_price * (1 - float(settings["stop_loss_pct"]) / 100)
+            target_price = locked_target if locked_target is not None else entry_price * (1 + float(settings["take_profit_pct"]) / 100)
+            exit_mode = locked_exit_mode
+            highest_price = max(highest_price or price, candle.high)
+            trail = trailing_stop_price(entry_price, highest_price, settings)
+            intrabar_reason, intrabar_fill = backtest_intrabar_long_exit(candle, stop_price, target_price, trail)
 
-            if price <= stop_price:
+            if intrabar_reason in {"stop", "trailing stop"}:
                 sold_quantity = coin
-                fill_price = apply_slippage(price, "SELL", slippage)
+                fill_price = apply_slippage(float(intrabar_fill), "SELL", slippage)
                 gross = sold_quantity * fill_price
                 fee_paid = gross * trade_fee
                 cash += gross - fee_paid
@@ -8834,16 +8892,17 @@ def run_ema_golden_cross_backtest(
                     "price": fill_price,
                     "quantity": sold_quantity,
                     "cash_after": cash,
-                    "reason": f"Stop loss hit ({exit_mode})",
+                    "reason": ("Trailing stop hit" if intrabar_reason == "trailing stop" else f"Stop loss hit ({exit_mode})"),
                     "fee_paid": fee_paid,
                 })
                 coin = 0.0
                 entry_price = None
+                locked_stop = locked_target = None
                 highest_price = None
                 continue
-            elif price >= target_price:
+            elif intrabar_reason == "target":
                 sold_quantity = coin
-                fill_price = apply_slippage(price, "SELL", slippage)
+                fill_price = apply_slippage(float(intrabar_fill), "SELL", slippage)
                 gross = sold_quantity * fill_price
                 fee_paid = gross * trade_fee
                 cash += gross - fee_paid
@@ -8859,6 +8918,7 @@ def run_ema_golden_cross_backtest(
                 })
                 coin = 0.0
                 entry_price = None
+                locked_stop = locked_target = None
                 highest_price = None
                 continue
 
@@ -8872,6 +8932,7 @@ def run_ema_golden_cross_backtest(
                     coin = (spend - fee_paid) / fill_price
                     cash -= spend
                     entry_price = fill_price
+                    locked_stop, locked_target, locked_exit_mode = exit_prices(entry_price, active_candles, settings)
                     highest_price = fill_price
                     partial_done = False
                     trades.append({
@@ -8908,6 +8969,8 @@ def run_ema_golden_cross_backtest(
         else:
             losses += 1
 
+    metrics = backtest_metrics(trades, starting_cash, equity_curve)
+
     return {
         "symbol": symbol,
         "candles": len(candles),
@@ -8918,8 +8981,18 @@ def run_ema_golden_cross_backtest(
         "total_pnl_pct": total_pnl_pct,
         "max_drawdown_pct": round(max_drawdown_pct, 4),
         "trades_count": len(trades),
-        "closed_trades": len(sells),
-        "win_rate": round((wins / len(sells)) * 100, 2) if sells else 0.0,
+        "closed_trades": metrics["closed_trades"],
+        "win_rate": metrics["win_rate"],
+        "profit_factor": metrics["profit_factor"],
+        "expectancy": metrics["expectancy"],
+        "expectancy_pct_starting_cash": metrics["expectancy_pct_starting_cash"],
+        "average_winner": metrics["average_winner"],
+        "average_loser": metrics["average_loser"],
+        "payoff_ratio": metrics["payoff_ratio"],
+        "total_fees": metrics["total_fees"],
+        "sharpe_like": metrics["sharpe_like"],
+        "sortino_like": metrics["sortino_like"],
+        "_trade_pnls": metrics["trade_pnls"],
         "slippage_pct": float(settings.get("backtest_slippage_pct", 0.0)),
         "open_position": coin > 0,
         "trades": trades[-80:][::-1],
@@ -9202,6 +9275,12 @@ def optimizer_candidate_settings(settings: dict[str, Any]) -> list[dict[str, Any
     return candidates
 
 def run_walk_forward(settings: dict[str, Any]) -> dict[str, Any]:
+    """Rolling/expanding walk-forward validation.
+
+    Each fold optimises only on candles available before that fold, then evaluates
+    the selected settings on the immediately following unseen test window.  Test
+    windows never overlap.  This is materially stronger than a single 70/30 holdout.
+    """
     settings = backtest_runtime_settings(settings)
     watchlist = parse_watchlist(settings.get("watchlist", "BTC"))
     if not watchlist:
@@ -9209,8 +9288,8 @@ def run_walk_forward(settings: dict[str, Any]) -> dict[str, Any]:
 
     granularity = int(settings.get("granularity", 3600))
     candle_count = int(settings.get("candle_count", 300))
-    train_pct = float(settings.get("train_pct", 0.7))
-    train_pct = min(0.85, max(0.5, train_pct))
+    initial_train_pct = min(0.75, max(0.45, float(settings.get("walk_forward_train_pct", 0.60))))
+    requested_folds = min(8, max(2, int(settings.get("walk_forward_folds", 4))))
 
     strategy = settings.get("strategy", "sma_cross")
     if strategy == "ewo_offset":
@@ -9227,91 +9306,163 @@ def run_walk_forward(settings: dict[str, Any]) -> dict[str, Any]:
     for symbol in watchlist:
         try:
             candles = fetch_candles(
-                exchange=str(settings["exchange"]),
-                symbol=symbol,
-                quote_currency=str(settings["quote_currency"]),
-                granularity=granularity,
-                candle_count=candle_count,
-                asset_class=str(settings.get("asset_class", "crypto")),
+                exchange=str(settings["exchange"]), symbol=symbol,
+                quote_currency=str(settings["quote_currency"]), granularity=granularity,
+                candle_count=candle_count, asset_class=str(settings.get("asset_class", "crypto")),
             )
-            split_index = int(len(candles) * train_pct)
-            train_candles = candles[:split_index]
-            test_candles = candles[split_index:]
+            minimum = max(20, strategy_minimum_candles(settings))
+            initial_train = max(minimum, int(len(candles) * initial_train_pct))
+            remaining = len(candles) - initial_train
+            if remaining < 20:
+                raise RuntimeError("Not enough candles for rolling walk-forward test windows")
+            folds = min(requested_folds, max(2, remaining // 20))
+            test_size = remaining // folds
+            if test_size < 20:
+                raise RuntimeError("Walk-forward test windows are too small")
 
-            if len(train_candles) < 61 or len(test_candles) < 20:
-                raise RuntimeError("Not enough candles for train/test split")
+            fold_rows: list[dict[str, Any]] = []
+            oos_pnls: list[float] = []
+            oos_trade_pnls: list[float] = []
+            oos_closed = oos_wins = 0
+            worst_dd = 0.0
+            total_fees = 0.0
+            last_best_settings: dict[str, Any] | None = None
 
-            best_train: dict[str, Any] | None = None
-            best_settings: dict[str, Any] | None = None
-
-            for candidate_settings in candidates:
-                if len(train_candles) < strategy_minimum_candles(candidate_settings):
+            for fold in range(folds):
+                train_end = initial_train + fold * test_size
+                test_end = len(candles) if fold == folds - 1 else min(len(candles), train_end + test_size)
+                train_candles = candles[:train_end]
+                test_candles = candles[train_end:test_end]
+                if len(test_candles) < 5:
                     continue
-                train_result = run_backtest_for_symbol(
-                    symbol=symbol,
-                    candles=train_candles,
-                    settings=candidate_settings,
+
+                best_train = None
+                best_settings = None
+                for candidate_settings in candidates:
+                    if len(train_candles) < strategy_minimum_candles(candidate_settings):
+                        continue
+                    train_result = run_backtest_for_symbol(symbol, train_candles, candidate_settings)
+                    combinations_tested += 1
+                    if train_result["trades_count"] == 0:
+                        continue
+                    score = optimizer_score(train_result)
+                    if best_train is None or score > best_train["score"]:
+                        best_train = {**train_result, "score": round(score, 4)}
+                        best_settings = candidate_settings
+
+                if best_train is None or best_settings is None:
+                    continue
+
+                seed_count = strategy_minimum_candles(best_settings)
+                seeded = train_candles[-seed_count:] + test_candles
+                test_result = run_backtest_for_symbol(
+                    symbol, seeded,
+                    {**best_settings, "trade_start_time": test_candles[0].time},
                 )
-                combinations_tested += 1
-                if train_result["trades_count"] == 0:
-                    continue
+                last_best_settings = best_settings
+                pnls = [float(x) for x in test_result.get("_trade_pnls", [])]
+                oos_trade_pnls.extend(pnls)
+                oos_pnls.append(float(test_result["total_pnl"]))
+                oos_closed += int(test_result.get("closed_trades", 0))
+                oos_wins += sum(1 for x in pnls if x > 0)
+                worst_dd = max(worst_dd, abs(float(test_result.get("max_drawdown_pct", 0))))
+                total_fees += float(test_result.get("total_fees", 0))
+                fold_rows.append({
+                    "fold": fold + 1,
+                    "train_candles": len(train_candles), "test_candles": len(test_candles),
+                    "train_pnl_pct": best_train["total_pnl_pct"], "train_score": best_train["score"],
+                    "test_pnl": test_result["total_pnl"], "test_pnl_pct": test_result["total_pnl_pct"],
+                    "test_drawdown_pct": test_result["max_drawdown_pct"],
+                    "test_trades": test_result["trades_count"], "test_closed_trades": test_result.get("closed_trades", 0),
+                    "test_profit_factor": test_result.get("profit_factor", 0),
+                    "test_expectancy": test_result.get("expectancy", 0),
+                    "settings": result_settings_summary(symbol, best_settings),
+                })
 
-                train_score = optimizer_score(train_result)
-                if not best_train or train_score > best_train["score"]:
-                    best_train = {
-                        **train_result,
-                        "score": round(train_score, 4),
-                    }
-                    best_settings = candidate_settings
+            if not fold_rows or last_best_settings is None:
+                raise RuntimeError("No valid walk-forward folds produced trades")
 
-            if not best_train or not best_settings:
-                raise RuntimeError(no_train_trades_message(settings))
-
-            seed_count = strategy_minimum_candles(best_settings)
-            test_seed_candles = train_candles[-seed_count:] + test_candles
-            test_result = run_backtest_for_symbol(
-                symbol=symbol,
-                candles=test_seed_candles,
-                settings={
-                    **best_settings,
-                    "trade_start_time": test_candles[0].time,
-                },
-            )
-            test_score = optimizer_score(test_result)
-            settings_summary = result_settings_summary(symbol, best_settings)
-
+            gross_profit = sum(x for x in oos_trade_pnls if x > 0)
+            gross_loss = abs(sum(x for x in oos_trade_pnls if x < 0))
+            pf = gross_profit / gross_loss if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+            expectancy = sum(oos_trade_pnls) / len(oos_trade_pnls) if oos_trade_pnls else 0.0
+            total_pnl = sum(oos_pnls)
+            starting_cash = float(settings.get("starting_cash", 1000.0))
+            capital_basis = starting_cash * len(fold_rows)
+            total_pct = total_pnl / capital_basis * 100 if capital_basis else 0.0
+            summary = result_settings_summary(symbol, last_best_settings)
             results.append({
-                **settings_summary,
-                "train_score": best_train["score"],
-                "train_pnl_pct": best_train["total_pnl_pct"],
-                "train_drawdown_pct": best_train["max_drawdown_pct"],
-                "train_trades": best_train["trades_count"],
-                "test_score": round(test_score, 4),
-                "test_final_equity": test_result["final_equity"],
-                "test_total_pnl": test_result["total_pnl"],
-                "test_total_pnl_pct": test_result["total_pnl_pct"],
-                "test_drawdown_pct": test_result["max_drawdown_pct"],
-                "test_trades": test_result["trades_count"],
-                "test_win_rate": test_result["win_rate"],
-                "test_open_position": test_result["open_position"],
-                "train_candles": len(train_candles),
-                "test_candles": len(test_candles),
+                **summary,
+                "folds": len(fold_rows), "fold_results": fold_rows,
+                "test_total_pnl": round(total_pnl, 8), "test_total_pnl_pct": round(total_pct, 4),
+                "test_drawdown_pct": round(worst_dd, 4), "test_trades": sum(x["test_trades"] for x in fold_rows),
+                "test_closed_trades": oos_closed,
+                "test_win_rate": round(oos_wins / len(oos_trade_pnls) * 100, 2) if oos_trade_pnls else 0.0,
+                "test_profit_factor": round(pf, 4), "test_expectancy": round(expectancy, 8),
+                "test_total_fees": round(total_fees, 8),
+                "test_score": round(total_pct - worst_dd * 0.75, 4),
+                "train_pnl_pct": round(sum(x["train_pnl_pct"] for x in fold_rows) / len(fold_rows), 4),
+                "train_score": round(sum(x["train_score"] for x in fold_rows) / len(fold_rows), 4),
+                "train_trades": 0, "test_open_position": False,
             })
         except Exception as exc:
             errors.append(f"{symbol}: {exc}")
 
     results.sort(key=lambda item: item["test_score"], reverse=True)
     return {
-        "ok": True,
-        "exchange": settings["exchange"],
-        "quote_currency": settings["quote_currency"],
-        "granularity": granularity,
-        "candle_count": candle_count,
-        "train_pct": train_pct,
-        "combinations_tested": combinations_tested,
-        "results": results[:20],
-        "best": results[0] if results else None,
-        "errors": errors,
+        "ok": True, "mode": "rolling_walk_forward", "exchange": settings["exchange"],
+        "quote_currency": settings["quote_currency"], "granularity": granularity,
+        "candle_count": candle_count, "initial_train_pct": initial_train_pct,
+        "requested_folds": requested_folds, "combinations_tested": combinations_tested,
+        "results": results[:20], "best": results[0] if results else None, "errors": errors,
+    }
+
+
+def run_monte_carlo(settings: dict[str, Any]) -> dict[str, Any]:
+    """Bootstrap closed-trade P/L from the current strategy backtest."""
+    settings = backtest_runtime_settings(settings)
+    simulations = min(10000, max(250, int(settings.get("monte_carlo_simulations", 2000))))
+    seed = int(settings.get("monte_carlo_seed", 42))
+    base = run_backtest(settings)
+    trade_pnls: list[float] = []
+    for result in base.get("results", []):
+        trade_pnls.extend(float(x) for x in result.get("_trade_pnls", []))
+    if len(trade_pnls) < 5:
+        return {"ok": False, "error": f"Need at least 5 closed trades for Monte Carlo; found {len(trade_pnls)}", "trades": len(trade_pnls)}
+
+    rng = random.Random(seed)
+    starting_cash = float(settings.get("starting_cash", 1000.0))
+    paths = []
+    dds = []
+    ruin = 0
+    for _ in range(simulations):
+        equity = starting_cash
+        peak = starting_cash
+        max_dd = 0.0
+        for _ in range(len(trade_pnls)):
+            equity += rng.choice(trade_pnls)
+            peak = max(peak, equity)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - equity) / peak * 100)
+            if equity <= 0:
+                ruin += 1
+                equity = 0.0
+                break
+        paths.append((equity - starting_cash) / starting_cash * 100 if starting_cash else 0.0)
+        dds.append(max_dd)
+    paths.sort(); dds.sort()
+    def q(values, pct):
+        idx = min(len(values)-1, max(0, int(round((len(values)-1)*pct))))
+        return values[idx]
+    return {
+        "ok": True, "simulations": simulations, "closed_trades": len(trade_pnls),
+        "median_return_pct": round(q(paths, .50), 2), "p05_return_pct": round(q(paths, .05), 2),
+        "p95_return_pct": round(q(paths, .95), 2), "median_max_drawdown_pct": round(q(dds, .50), 2),
+        "p95_max_drawdown_pct": round(q(dds, .95), 2),
+        "probability_positive_pct": round(sum(x > 0 for x in paths) / len(paths) * 100, 2),
+        "probability_loss_pct": round(sum(x < 0 for x in paths) / len(paths) * 100, 2),
+        "probability_ruin_pct": round(ruin / simulations * 100, 2),
+        "base_backtest": {"symbols": len(base.get("results", [])), "errors": base.get("errors", [])},
     }
 
 def opening_range_candidate_settings(settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -9401,6 +9552,114 @@ def no_train_trades_message(settings: dict[str, Any]) -> str:
             "and clear breakouts. Try more candles or a smaller timeframe."
         )
     return "No train-window trades found; try more candles or a faster signal window"
+
+def backtest_intrabar_long_exit(
+    candle: Candle,
+    stop_price: float,
+    target_price: float,
+    trailing_price: float | None = None,
+) -> tuple[str | None, float | None]:
+    """Resolve protective exits from OHLC data, conservatively if both levels hit."""
+    effective_stop = max(stop_price, trailing_price) if trailing_price is not None else stop_price
+    stop_hit = effective_stop > 0 and candle.low <= effective_stop
+    target_hit = target_price > 0 and candle.high >= target_price
+    if stop_hit:
+        # Gap through a stop fills no better than the candle open; otherwise at the stop.
+        return ("trailing stop" if trailing_price is not None and effective_stop == trailing_price else "stop",
+                min(candle.open, effective_stop))
+    if target_hit:
+        # A favourable gap may fill at the open; otherwise at the target.
+        return "target", max(candle.open, target_price)
+    return None, None
+
+
+def backtest_intrabar_short_exit(
+    candle: Candle,
+    stop_price: float,
+    target_price: float,
+) -> tuple[str | None, float | None]:
+    """Resolve short protective exits from OHLC data; stop wins ambiguous same-bar hits."""
+    stop_hit = stop_price > 0 and candle.high >= stop_price
+    target_hit = target_price > 0 and candle.low <= target_price
+    if stop_hit:
+        return "stop", max(candle.open, stop_price)
+    if target_hit:
+        return "target", min(candle.open, target_price)
+    return None, None
+
+
+def backtest_metrics(trades: list[dict[str, Any]], starting_cash: float, equity_curve: list[float]) -> dict[str, Any]:
+    """Trade-level analytics using FIFO long lots and explicit SHORT lots."""
+    long_qty = long_cost = 0.0
+    short_qty = short_proceeds = 0.0
+    pnls: list[float] = []
+    fees = sum(float(t.get("fee_paid", 0.0) or 0.0) for t in trades)
+    for t in trades:
+        side = str(t.get("side", "")).upper()
+        qty = abs(float(t.get("quantity", 0.0) or 0.0))
+        price = float(t.get("price", 0.0) or 0.0)
+        fee = float(t.get("fee_paid", 0.0) or 0.0)
+        if qty <= 0 or price <= 0:
+            continue
+        if side == "SHORT":
+            short_qty += qty
+            short_proceeds += qty * price - fee
+        elif side == "BUY" and short_qty > 1e-12:
+            close_qty = min(qty, short_qty)
+            basis = short_proceeds * (close_qty / short_qty)
+            pnls.append(basis - (close_qty * price + fee * (close_qty / qty)))
+            short_proceeds -= basis
+            short_qty -= close_qty
+        elif side == "BUY":
+            long_qty += qty
+            long_cost += qty * price + fee
+        elif side == "SELL" and long_qty > 1e-12:
+            close_qty = min(qty, long_qty)
+            basis = long_cost * (close_qty / long_qty)
+            pnls.append(close_qty * price - fee * (close_qty / qty) - basis)
+            long_cost -= basis
+            long_qty -= close_qty
+
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    avg_win = gross_profit / len(wins) if wins else 0.0
+    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+    expectancy = sum(pnls) / len(pnls) if pnls else 0.0
+    returns = []
+    for a, b in zip(equity_curve, equity_curve[1:]):
+        if a > 0:
+            returns.append((b - a) / a)
+    sharpe = 0.0
+    sortino = 0.0
+    if len(returns) > 1:
+        mean_r = sum(returns) / len(returns)
+        variance = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)
+        sd = math.sqrt(variance)
+        if sd > 0:
+            sharpe = mean_r / sd * math.sqrt(len(returns))
+        downside = [min(r, 0.0) for r in returns]
+        downside_dev = math.sqrt(sum(r * r for r in downside) / len(downside)) if downside else 0.0
+        if downside_dev > 0:
+            sortino = mean_r / downside_dev * math.sqrt(len(returns))
+    return {
+        "closed_trades": len(pnls),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(len(wins) / len(pnls) * 100, 2) if pnls else 0.0,
+        "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0),
+        "expectancy": round(expectancy, 8),
+        "expectancy_pct_starting_cash": round(expectancy / starting_cash * 100, 4) if starting_cash else 0.0,
+        "average_winner": round(avg_win, 8),
+        "average_loser": round(avg_loss, 8),
+        "payoff_ratio": round(avg_win / avg_loss, 4) if avg_loss > 0 else (999.0 if avg_win > 0 else 0.0),
+        "total_fees": round(fees, 8),
+        "sharpe_like": round(sharpe, 4),
+        "sortino_like": round(sortino, 4),
+        "trade_pnls": [round(x, 10) for x in pnls],
+    }
+
 
 def apply_slippage(price: float, side: str, slippage_fraction: float) -> float:
     if side.upper() == "BUY":
@@ -10335,6 +10594,12 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 payload = parse_json_body(self)
                 settings = {**self.bot.snapshot()["settings"], **payload}
                 self.send_json(run_walk_forward(settings))
+                return
+
+            if self.path == "/api/monte-carlo":
+                payload = parse_json_body(self)
+                settings = {**self.bot.snapshot()["settings"], **payload}
+                self.send_json(run_monte_carlo(settings))
                 return
 
             if self.path == "/api/validation":

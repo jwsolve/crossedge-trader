@@ -1605,6 +1605,7 @@
                     <button data-tab="backtester">Backtester</button>
                     <button data-tab="optimizer">Optimizer</button>
                     <button data-tab="walkforward">Walk-Forward</button>
+                    <button data-tab="montecarlo">Monte Carlo</button>
                     <button data-tab="validation">Validation Lab</button>
                     <button data-tab="learning">Setup Learning</button>
                 </div>
@@ -1685,6 +1686,7 @@
                             <button class="primary" id="backtestBtn">Run</button>
                             <button id="optimizerBtn">Optimize</button>
                             <button id="walkForwardBtn">Walk-Forward</button>
+                            <button id="monteCarloBtn">Monte Carlo</button>
                             <button id="applyOptimizerBtn" disabled>Apply Best</button>
                         </div>
                         <span class="status" id="backtestStatus">Ready</span>
@@ -1727,12 +1729,38 @@
 
                 <!-- Walk-Forward -->
                 <div class="analysis-pane" id="pane-walkforward">
+                    <div class="backtest-metrics" style="margin-bottom:8px;">
+                        <span><span class="muted">Mode:</span> <strong>Rolling / expanding out-of-sample</strong></span>
+                        <span><span class="muted">Default folds:</span> <strong>4</strong></span>
+                        <span><span class="muted">Rule:</span> <strong>Optimise train → trade unseen next window</strong></span>
+                    </div>
                     <div class="table-wrap">
                         <table>
                             <thead><tr><th>Rank</th><th>Symbol</th><th>Settings</th><th>Train P/L</th><th>Test P/L</th><th>Test Drawdown</th><th>Test Trades</th><th>Test Score</th></tr></thead>
                             <tbody id="walkForwardBody"><tr><td colspan="8" class="muted" style="text-align:center;padding:16px 0;">No walk-forward run.</td></tr></tbody>
                         </table>
                     </div>
+                </div>
+
+                <!-- Monte Carlo -->
+                <div class="analysis-pane" id="pane-montecarlo">
+                    <div class="backtest-row">
+                        <label>Simulations <input id="mcSimulations" type="number" value="2000" min="250" max="10000" step="250" style="width:100px;" /></label>
+                        <div class="actions"><button class="primary" id="mcRunBtn">Run Monte Carlo</button></div>
+                        <span class="status" id="mcStatus">Bootstraps realised backtest trades; not a profitability guarantee.</span>
+                    </div>
+                    <div class="message-box" id="mcErrorBox"></div>
+                    <div class="backtest-metrics">
+                        <span><span class="muted">Closed trades:</span> <strong id="mcTrades">—</strong></span>
+                        <span><span class="muted">Positive paths:</span> <strong id="mcPositive">—</strong></span>
+                        <span><span class="muted">Median return:</span> <strong id="mcMedian">—</strong></span>
+                        <span><span class="muted">5th percentile:</span> <strong id="mcP05">—</strong></span>
+                        <span><span class="muted">95th percentile:</span> <strong id="mcP95">—</strong></span>
+                        <span><span class="muted">Median max DD:</span> <strong id="mcMedianDD">—</strong></span>
+                        <span><span class="muted">95th pct max DD:</span> <strong id="mcP95DD">—</strong></span>
+                        <span><span class="muted">Ruin probability:</span> <strong id="mcRuin">—</strong></span>
+                    </div>
+                    <div class="muted" style="margin-top:10px;">Monte Carlo resamples the strategy's realised closed-trade P/L to stress trade ordering and outcome variability. It does not invent better fills or optimise parameters.</div>
                 </div>
 
                 <!-- Validation Lab -->
@@ -1879,6 +1907,8 @@
             backtestTradesBody: $('backtestTradesBody'),
             optimizerBody: $('optimizerBody'),
             walkForwardBody: $('walkForwardBody'),
+            monteCarloBtn: $('monteCarloBtn'), mcRunBtn: $('mcRunBtn'), mcSimulations: $('mcSimulations'), mcStatus: $('mcStatus'), mcErrorBox: $('mcErrorBox'),
+            mcTrades: $('mcTrades'), mcPositive: $('mcPositive'), mcMedian: $('mcMedian'), mcP05: $('mcP05'), mcP95: $('mcP95'), mcMedianDD: $('mcMedianDD'), mcP95DD: $('mcP95DD'), mcRuin: $('mcRuin'),
             validationBtn: $('validationBtn'),
             validationStatus: $('validationStatus'),
             validationErrorBox: $('validationErrorBox'),
@@ -3665,8 +3695,40 @@
                 const settings = r.strategy === 'ewo_offset' ?
                     `EWO ${r.base_nb_candles_buy}/${r.base_nb_candles_sell}` :
                     `SMA ${r.short_window}/${r.long_window}`;
-                return `<tr><td>${i+1}</td><td><strong>${r.symbol}</strong></td><td>${settings}</td><td>${Number(r.train_pnl_pct||0).toFixed(2)}%</td><td class="${cls}">${money(r.test_total_pnl)} (${Number(r.test_total_pnl_pct||0).toFixed(2)}%)</td><td class="bad">${Number(r.test_drawdown_pct||0).toFixed(2)}%</td><td>${r.test_trades}</td><td>${Number(r.test_score||0).toFixed(4)}</td></tr>`;
+                const robust = `${settings}<br><span class="muted">${r.folds||1} folds · PF ${Number(r.test_profit_factor||0).toFixed(2)} · Exp ${money(r.test_expectancy||0)}</span>`;
+                return `<tr><td>${i+1}</td><td><strong>${r.symbol}</strong></td><td>${robust}</td><td>${Number(r.train_pnl_pct||0).toFixed(2)}%</td><td class="${cls}">${money(r.test_total_pnl)} (${Number(r.test_total_pnl_pct||0).toFixed(2)}%)</td><td class="bad">${Number(r.test_drawdown_pct||0).toFixed(2)}%</td><td>${r.test_trades}</td><td>${Number(r.test_score||0).toFixed(4)}</td></tr>`;
             }).join('');
+        }
+
+        function renderMonteCarlo(r) {
+            els.mcTrades.textContent = r.closed_trades ?? '—';
+            els.mcPositive.textContent = Number(r.probability_positive_pct || 0).toFixed(2) + '%';
+            els.mcMedian.textContent = Number(r.median_return_pct || 0).toFixed(2) + '%';
+            els.mcP05.textContent = Number(r.p05_return_pct || 0).toFixed(2) + '%';
+            els.mcP95.textContent = Number(r.p95_return_pct || 0).toFixed(2) + '%';
+            els.mcMedianDD.textContent = Number(r.median_max_drawdown_pct || 0).toFixed(2) + '%';
+            els.mcP95DD.textContent = Number(r.p95_max_drawdown_pct || 0).toFixed(2) + '%';
+            els.mcRuin.textContent = Number(r.probability_ruin_pct || 0).toFixed(2) + '%';
+            els.mcPositive.className = Number(r.probability_positive_pct || 0) >= 60 ? 'good' : 'bad';
+            els.mcP05.className = Number(r.p05_return_pct || 0) >= 0 ? 'good' : 'bad';
+            els.mcRuin.className = Number(r.probability_ruin_pct || 0) <= 1 ? 'good' : 'bad';
+        }
+
+        async function runMonteCarlo() {
+            const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
+            const bt = { granularity: els.btGranularity.value, candle_count: els.btCandles.value, monte_carlo_simulations: els.mcSimulations.value };
+            els.mcRunBtn.disabled = true; els.monteCarloBtn.disabled = true;
+            els.mcStatus.textContent = 'Running Monte Carlo…';
+            els.mcErrorBox.style.display = 'none';
+            try {
+                const r = await post('/api/monte-carlo', { ...settings, ...bt });
+                if (!r.ok) throw new Error(r.error || 'Monte Carlo failed');
+                renderMonteCarlo(r);
+                els.mcStatus.textContent = `Completed ${r.simulations} simulations from ${r.closed_trades} closed trades.`;
+                qsa('#analysisTabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'montecarlo'));
+                Object.entries(analysisPanes).forEach(([k, el]) => el.classList.toggle('active', k === 'montecarlo'));
+            } catch (e) { els.mcErrorBox.style.display='block'; els.mcErrorBox.textContent=e.message; els.mcStatus.textContent='Monte Carlo failed.'; }
+            finally { els.mcRunBtn.disabled=false; els.monteCarloBtn.disabled=false; }
         }
 
         // ---- event bindings ----
@@ -3697,6 +3759,7 @@
             backtester: $('pane-backtester'),
             optimizer: $('pane-optimizer'),
             walkforward: $('pane-walkforward'),
+            montecarlo: $('pane-montecarlo'),
             validation: $('pane-validation'),
             learning: $('pane-learning'),
         };
@@ -4000,6 +4063,9 @@
                 els.validationBtn.disabled = false;
             }
         });
+
+        els.monteCarloBtn.addEventListener('click', runMonteCarlo);
+        els.mcRunBtn.addEventListener('click', runMonteCarlo);
 
         els.optimizerBtn.addEventListener('click', async () => {
             const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
