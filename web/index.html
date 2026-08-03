@@ -243,7 +243,7 @@
         /* ─── Metrics ─── */
         .metrics {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            grid-template-columns: repeat(5, minmax(0, 1fr));
             gap: 10px;
             margin-bottom: 14px;
         }
@@ -1070,6 +1070,10 @@
                 margin-bottom: 20px; /* extra spacing for mobile */
             }
         }
+        @media (min-width: 769px) and (max-width: 1100px) {
+            .metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+        }
+
         @media (max-width: 420px) {
             body { padding: 6px 8px 20px; }
             .metrics { grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -1267,27 +1271,23 @@
                     <div class="metric-note">Gross wins ÷ gross losses</div>
                 </div>
                 <div class="metric-card">
-                    <div class="label">Average Win</div>
-                    <div class="value" id="dashboardAvgWin">—</div>
-                </div>
-                <div class="metric-card">
-                    <div class="label">Average Loss</div>
-                    <div class="value" id="dashboardAvgLoss">—</div>
+                    <div class="label">Avg Win / Loss</div>
+                    <div class="value metric-compact"><span id="dashboardAvgWin">—</span> / <span id="dashboardAvgLoss">—</span></div>
                 </div>
                 <div class="metric-card">
                     <div class="label">Closed Trades</div>
                     <div class="value" id="dashboardClosedTrades">0</div>
                 </div>
-                <div class="metric-card">
-                    <div class="label">Market / Strategy</div>
-                    <div class="value metric-compact" id="dashboardRegime">—</div>
-                    <div class="metric-note" id="dashboardStrategy">—</div>
-                </div>
+
             </div>
 
             <!-- Chart -->
             <section class="chart-section">
                 <div class="chart-toolbar">
+                    <div class="group" style="margin-right:auto;">
+                        <span class="muted">Market:</span> <strong id="dashboardRegime">—</strong>
+                        <span class="muted" style="margin-left:8px;">Strategy:</span> <strong id="dashboardStrategy">—</strong>
+                    </div>
                     <div class="group">
                         <select id="chartSymbolSelect"></select>
                         <select id="chartTimeframeSelect">
