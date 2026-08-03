@@ -2122,6 +2122,67 @@ class PaperBot:
         target = entry_price * (1 + float(settings["take_profit_pct"]) / 100)
         return stop, target, "fixed"
 
+    def live_net_exit_prices(
+        self,
+        symbol: str,
+        entry_price: float,
+        quantity: float,
+        entry_value: float,
+        entry_fee: float,
+        raw_stop: float,
+        raw_target: float,
+        settings: dict[str, Any],
+    ) -> tuple[float, float, dict[str, float]]:
+        """Convert strategy exit distances into estimated NET Coinbase exits.
+
+        The strategy's raw stop/target distance is treated as the desired net P/L
+        distance.  Entry fee is known from the confirmed Coinbase fill; exit fee is
+        estimated from trade_fee; and the currently observed bid/ask spread is used
+        as a conservative market-exit haircut.
+        """
+        if entry_price <= 0 or quantity <= 0:
+            return raw_stop, raw_target, {}
+
+        desired_loss = max(0.0, (entry_price - raw_stop) / entry_price)
+        desired_profit = max(0.0, (raw_target - entry_price) / entry_price)
+        entry_cost = max(0.0, entry_value) + max(0.0, entry_fee)
+        if entry_cost <= 0:
+            entry_cost = (quantity * entry_price) + max(0.0, entry_fee)
+
+        exit_fee_rate = max(0.0, float(settings.get("trade_fee", 0.0)))
+        spread_fraction = 0.0
+        try:
+            ticker = fetch_coinbase_ticker(symbol, str(settings.get("quote_currency", "GBP")))
+            bid = float(ticker.get("bid") or 0.0)
+            ask = float(ticker.get("ask") or 0.0)
+            midpoint = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+            if midpoint > 0 and ask >= bid:
+                spread_fraction = (ask - bid) / midpoint
+        except Exception as exc:
+            logger.warning(f"Could not sample live spread for {symbol} exit pricing: {exc}")
+
+        # A future market SELL is conservatively assumed to lose the observed full
+        # spread versus the reference price, then pay the estimated exit fee.
+        execution_factor = max(1e-9, (1.0 - exit_fee_rate) * (1.0 - spread_fraction))
+        target_net_value = entry_cost * (1.0 + desired_profit)
+        stop_net_value = entry_cost * max(0.0, 1.0 - desired_loss)
+        target = target_net_value / (quantity * execution_factor)
+        stop = stop_net_value / (quantity * execution_factor)
+
+        # Never invert the long-position exits because unusually high costs should
+        # not turn a stop into a target or vice versa.
+        stop = min(stop, entry_price * (1.0 - 1e-9))
+        target = max(target, entry_price * (1.0 + 1e-9))
+        details = {
+            "desired_net_profit_pct": desired_profit * 100.0,
+            "desired_net_loss_pct": desired_loss * 100.0,
+            "entry_fee": max(0.0, entry_fee),
+            "estimated_exit_fee_pct": exit_fee_rate * 100.0,
+            "observed_spread_pct": spread_fraction * 100.0,
+            "entry_cost": entry_cost,
+        }
+        return stop, target, details
+
     # ─── ENHANCED EXIT STRATEGIES ────────────────────────────────────
 
     def check_rsi_exit(self, candles: list[Candle], position_side: str) -> tuple[bool, str]:
@@ -5641,6 +5702,7 @@ class PaperBot:
         exchange_average_filled_price: float | None = None,
         stop_override: float | None = None,
         target_override: float | None = None,
+        exit_mode_override: str | None = None,
         is_short: bool = False,
     ) -> None:
         with self.lock:
@@ -5694,7 +5756,7 @@ class PaperBot:
             if stop_override is not None and target_override is not None:
                 stop_price = stop_override
                 target_price = target_override
-                exit_mode = "opening_range"
+                exit_mode = exit_mode_override or "opening_range"
             else:
                 stop_price, target_price, exit_mode = self.exit_prices(
                     entry_price=price,
@@ -6930,20 +6992,52 @@ class PaperBot:
         is_short = order.details.get("is_short", False)
 
         if order.role == "ENTRY":
-            filled_quote = (fill["filled_value"] or order.quote_size or 0.0) + fill["total_fee"]
+            filled_value = float(fill["filled_value"] or 0.0)
+            entry_fee = float(fill["total_fee"] or 0.0)
+            filled_quote = (filled_value or order.quote_size or 0.0) + entry_fee
             self.state.live_daily_spend += min(order.quote_size or filled_quote, filled_quote)
+
+            # Recalculate exits from the CONFIRMED Coinbase fill, not the earlier
+            # signal/submission price. This removes entry slippage from the TP/SL
+            # error before we account for trading costs.
+            candles = closes_to_candles(self.state.price_history.get(order.symbol, []))
+            raw_stop, raw_target, exit_mode = self.exit_prices(
+                entry_price=filled_price,
+                candles=candles,
+                settings=self.state.settings,
+            )
+            stop_price, target_price, cost_details = self.live_net_exit_prices(
+                symbol=order.symbol,
+                entry_price=filled_price,
+                quantity=float(fill["filled_size"]),
+                entry_value=filled_value,
+                entry_fee=entry_fee,
+                raw_stop=raw_stop,
+                raw_target=raw_target,
+                settings=self.state.settings,
+            )
+            self.journal(order.symbol, "INFO", "LIVE exits recalculated from confirmed fill and estimated net costs", filled_price, {
+                **cost_details,
+                "raw_stop": raw_stop,
+                "raw_target": raw_target,
+                "net_stop": stop_price,
+                "net_target": target_price,
+                "exit_mode": exit_mode,
+            })
+
             self.paper_buy(
                 order.symbol,
                 filled_price,
                 f"LIVE {order.order_type.upper()} BUY filled {order.order_id} | {order.reason}",
                 spend_override=filled_quote,
-                fee_override=fill["total_fee"],
+                fee_override=entry_fee,
                 quantity_override=fill["filled_size"],
                 exchange_order_id=order.order_id,
                 exchange_order_status=order.status,
                 exchange_average_filled_price=filled_price,
-                stop_override=order.details.get("stop_price"),
-                target_override=order.details.get("target_price"),
+                stop_override=stop_price,
+                target_override=target_price,
+                exit_mode_override=f"{exit_mode} net-cost-adjusted",
                 is_short=is_short,
             )
             if order.details.get("native_stop_requested"):
