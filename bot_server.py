@@ -215,7 +215,8 @@ DEFAULT_SETTINGS = {
     "live_limit_offset_pct": 0.05,
     "native_stop_enabled": False,
     "max_live_order_gbp": 5.0,
-    "max_daily_live_loss_gbp": 2.0,
+    "max_daily_live_loss_gbp": 25.0,  # legacy key: now means max DAILY P/L loss in quote currency
+    "max_daily_live_spend_quote": 250.0,
     "max_live_spread_pct": 0.35,
     "min_live_quote_volume": 1000.0,
     "backtest_slippage_pct": 0.10,
@@ -4129,7 +4130,7 @@ class PaperBot:
             "min_sr_range_pct", "min_reward_risk", "support_stop_buffer_pct",
             "resistance_target_buffer_pct", "partial_take_profit_pct",
             "partial_take_profit_at_target_pct", "trailing_stop_pct", "trailing_activation_pct",
-            "live_limit_offset_pct", "max_live_order_gbp", "max_daily_live_loss_gbp",
+            "live_limit_offset_pct", "max_live_order_gbp", "max_daily_live_loss_gbp", "max_daily_live_spend_quote",
             "max_live_spread_pct", "min_live_quote_volume", "backtest_slippage_pct",
             "sr_zone_tolerance_pct", "sr_min_touches", "weak_pair_min_trades",
             "weak_pair_expectancy_limit_pct", "weak_pair_win_rate_limit_pct",
@@ -4283,6 +4284,7 @@ class PaperBot:
             self.state.settings["trailing_activation_pct"] = max(0.0, float(self.state.settings["trailing_activation_pct"]))
             self.state.settings["max_live_order_gbp"] = max(1, float(self.state.settings["max_live_order_gbp"]))
             self.state.settings["max_daily_live_loss_gbp"] = max(1, float(self.state.settings["max_daily_live_loss_gbp"]))
+            self.state.settings["max_daily_live_spend_quote"] = max(1, float(self.state.settings.get("max_daily_live_spend_quote", 250.0)))
             self.state.settings["max_live_spread_pct"] = max(0.01, float(self.state.settings["max_live_spread_pct"]))
             self.state.settings["min_live_quote_volume"] = max(0.0, float(self.state.settings["min_live_quote_volume"]))
             self.state.settings["live_limit_offset_pct"] = max(0.0, float(self.state.settings["live_limit_offset_pct"]))
@@ -4477,6 +4479,7 @@ class PaperBot:
             realized_pnl = total_pnl - unrealized_pnl
 
             day_pnl = equity - self.state.day_start_equity
+            live_risk = self.daily_live_risk_metrics()
 
             expectancy_summary = self.expectancy.summary() if hasattr(self, 'expectancy') else {}
 
@@ -4529,6 +4532,12 @@ class PaperBot:
                 "total_pnl_pct": pct(total_pnl, float(self.state.settings.get("starting_cash", 0))),
                 "day_pnl": round(day_pnl, 2),
                 "day_pnl_pct": pct(day_pnl, self.state.day_start_equity),
+                "daily_realized_pnl": round(live_risk["realized"], 2),
+                "daily_unrealized_pnl": round(live_risk["unrealized"], 2),
+                "daily_risk_pnl": round(live_risk["risk_pnl"], 2),
+                "live_daily_spend": round(self.state.live_daily_spend, 2),
+                "max_daily_live_spend_quote": float(self.state.settings.get("max_daily_live_spend_quote", 250.0)),
+                "max_daily_live_loss_quote": float(self.state.settings.get("max_daily_live_loss_gbp", 25.0)),
                 "last_signal": self.state.last_signal,
                 "last_error": self.state.last_error,
                 "price_count": len(chart_prices),
@@ -6195,6 +6204,59 @@ class PaperBot:
                 "account_type_label": "Crypto",
             }
 
+    def daily_live_risk_metrics(self) -> dict[str, float]:
+        """Return today's live-trading risk figures in quote currency.
+
+        Realised P/L comes from setup records whose latest exit happened today.
+        SetupRecord.realized_pnl is net of the recorded entry cost and exit fees.
+        Unrealised P/L is calculated only from currently open local positions.
+        The daily loss guard uses realised + unrealised P/L and NEVER blocks exits.
+        """
+        today = datetime.now().astimezone().date()
+
+        def is_today(value: Any) -> bool:
+            if not value:
+                return False
+            try:
+                text = str(value).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                return dt.astimezone().date() == today
+            except Exception:
+                return str(value)[:10] == today.isoformat()
+
+        with self.lock:
+            setup_records = list(self.state.setup_records)
+            positions = {k: dict(v) for k, v in self.state.positions.items()}
+            price_history = {k: list(v) for k, v in self.state.price_history.items()}
+            last_price = self.state.last_price
+
+        realised = sum(
+            float(record.realized_pnl or 0.0)
+            for record in setup_records
+            if is_today(record.exit_time)
+        )
+
+        unrealised = 0.0
+        for symbol, position in positions.items():
+            quantity = float(position.get("quantity", 0.0) or 0.0)
+            entry = float(position.get("entry_price", 0.0) or 0.0)
+            history = price_history.get(symbol, [])
+            current = float(history[-1]) if history else float(last_price or 0.0)
+            if not entry or not current or not quantity:
+                continue
+            if bool(position.get("is_short", False)) or quantity < 0:
+                unrealised += (entry - current) * abs(quantity)
+            else:
+                unrealised += (current - entry) * abs(quantity)
+
+        return {
+            "realized": realised,
+            "unrealized": unrealised,
+            "risk_pnl": realised + unrealised,
+        }
+
     def live_buy(
         self,
         symbol: str,
@@ -6211,7 +6273,8 @@ class PaperBot:
             positions = dict(self.state.positions)
 
         max_order = float(settings["max_live_order_gbp"])
-        max_daily = float(settings["max_daily_live_loss_gbp"])
+        max_daily_loss = float(settings["max_daily_live_loss_gbp"])
+        max_daily_spend = float(settings.get("max_daily_live_spend_quote", 250.0))
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
         if candles is None:
@@ -6254,10 +6317,37 @@ class PaperBot:
                 self.journal(symbol, "BLOCK", self.state.last_signal, price, {"quote_size": quote_size})
             return
 
-        if live_daily_spend + quote_size > max_daily:
+        # Two independent live-entry guards:
+        # 1) spend cap limits gross capital committed today;
+        # 2) loss cap limits today's realised + current unrealised P/L.
+        # Neither guard is used by SELL/STOP/emergency-exit paths.
+        if live_daily_spend + quote_size > max_daily_spend:
             with self.lock:
-                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: daily live cap reached"
-                self.journal(symbol, "BLOCK", self.state.last_signal, price, {"quote_size": quote_size})
+                self.state.last_signal = (
+                    f"LIVE {'SHORT' if is_short else 'BUY'} blocked: daily live spend cap reached "
+                    f"({live_daily_spend:.2f} + {quote_size:.2f} > {max_daily_spend:.2f} {settings['quote_currency']})"
+                )
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {
+                    "quote_size": quote_size,
+                    "daily_spend": live_daily_spend,
+                    "max_daily_spend": max_daily_spend,
+                })
+            return
+
+        risk = self.daily_live_risk_metrics()
+        if risk["risk_pnl"] <= -max_daily_loss:
+            with self.lock:
+                self.state.last_signal = (
+                    f"LIVE {'SHORT' if is_short else 'BUY'} blocked: daily loss limit reached "
+                    f"({risk['risk_pnl']:.2f} <= -{max_daily_loss:.2f} {settings['quote_currency']}; "
+                    f"realised {risk['realized']:.2f}, unrealised {risk['unrealized']:.2f})"
+                )
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {
+                    "daily_realized_pnl": risk["realized"],
+                    "daily_unrealized_pnl": risk["unrealized"],
+                    "daily_risk_pnl": risk["risk_pnl"],
+                    "max_daily_loss": max_daily_loss,
+                })
             return
 
         guard = live_market_guard(
