@@ -306,6 +306,11 @@ DEFAULT_SETTINGS = {
     "regime_ranging_strategy": "opening_range",
     "regime_breakout_strategy": "opening_range",
     "regime_volatile_strategy": "sma_cross",   # fallback, but risk adjustment will handle sizing
+    # ─── Strategy switching validation / anti-whipsaw ────────────────
+    "strategy_switch_min_confidence": 0.60,
+    "strategy_switch_persistence_candles": 3,
+    "strategy_switch_min_hold_candles": 20,
+    "strategy_switch_validation_folds": 4,
 }
 
 FOREX_BASE_RATES = {
@@ -9560,6 +9565,210 @@ def run_walk_forward(settings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def run_strategy_switch_validation(settings: dict[str, Any]) -> dict[str, Any]:
+    """Out-of-sample test of regime-driven strategy switching versus fixed strategies.
+
+    The selected strategy for each test fold is decided using TRAINING candles only.
+    A regime must persist for several consecutive observations and clear the configured
+    confidence threshold.  The selected strategy is then held for the whole unseen test
+    fold, preventing candle-by-candle strategy whipsaw and look-ahead bias.
+    """
+    settings = backtest_runtime_settings(settings)
+    watchlist = parse_watchlist(settings.get("watchlist", "BTC"))
+    if not watchlist:
+        raise RuntimeError("Strategy-switch validation watchlist is empty")
+
+    granularity = int(settings.get("granularity", 3600))
+    candle_count = int(settings.get("candle_count", 300))
+    folds_requested = min(8, max(2, int(settings.get("strategy_switch_validation_folds", 4))))
+    train_pct = min(0.75, max(0.45, float(settings.get("walk_forward_train_pct", 0.60))))
+    min_conf = min(1.0, max(0.0, float(settings.get("strategy_switch_min_confidence", 0.60))))
+    persistence = min(12, max(1, int(settings.get("strategy_switch_persistence_candles", 3))))
+    min_hold = max(5, int(settings.get("strategy_switch_min_hold_candles", 20)))
+
+    configured = str(settings.get("strategy", "sma_cross"))
+    strategies = ["sma_cross", "ema_golden_cross", "opening_range", "ewo_offset"]
+    if configured not in strategies:
+        strategies.insert(0, configured)
+    strategies = list(dict.fromkeys(strategies))
+
+    detector = RegimeDetector(lookback=100)
+    all_results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    def persistent_regime(train: list[Candle]) -> tuple[str | None, float, list[str]]:
+        observations: list[RegimeResult] = []
+        # Evaluate consecutive endings using only information available at each ending.
+        for offset in range(persistence - 1, -1, -1):
+            end = len(train) - offset
+            if end < 30:
+                continue
+            try:
+                observations.append(detector.detect(train[:end]))
+            except Exception:
+                pass
+        names = [str(x.regime) for x in observations]
+        if len(observations) < persistence:
+            return None, 0.0, names
+        last = observations[-1]
+        if any(x.regime != last.regime for x in observations):
+            return None, float(last.confidence), names
+        if float(last.confidence) < min_conf:
+            return None, float(last.confidence), names
+        return str(last.regime), float(last.confidence), names
+
+    def mapped_strategy(regime: str | None) -> str | None:
+        if not regime:
+            return None
+        mapping = {
+            "trending": settings.get("regime_trend_strategy", "ema_golden_cross"),
+            "trending_up": settings.get("regime_trend_strategy", "ema_golden_cross"),
+            "trending_down": settings.get("regime_trend_strategy", "ema_golden_cross"),
+            "ranging": settings.get("regime_ranging_strategy", "opening_range"),
+            "breakout": settings.get("regime_breakout_strategy", "opening_range"),
+            "volatile": settings.get("regime_volatile_strategy", "sma_cross"),
+        }
+        return str(mapping.get(regime)) if mapping.get(regime) else None
+
+    for symbol in watchlist:
+        try:
+            candles = fetch_candles(
+                exchange=str(settings["exchange"]), symbol=symbol,
+                quote_currency=str(settings["quote_currency"]), granularity=granularity,
+                candle_count=candle_count, asset_class=str(settings.get("asset_class", "crypto")),
+            )
+            initial_train = max(210, int(len(candles) * train_pct))
+            remaining = len(candles) - initial_train
+            folds = min(folds_requested, max(2, remaining // min_hold))
+            test_size = remaining // folds if folds else 0
+            if test_size < min_hold:
+                raise RuntimeError("Not enough candles for strategy-switch validation windows")
+
+            fold_rows = []
+            switched_pnls: list[float] = []
+            fixed_totals = {name: 0.0 for name in strategies}
+            fixed_trades = {name: 0 for name in strategies}
+            previous_selected = configured
+
+            for fold in range(folds):
+                train_end = initial_train + fold * test_size
+                test_end = len(candles) if fold == folds - 1 else min(len(candles), train_end + test_size)
+                train = candles[:train_end]
+                test = candles[train_end:test_end]
+                if len(test) < min_hold:
+                    continue
+
+                regime, confidence, regime_history = persistent_regime(train)
+                recommended = mapped_strategy(regime)
+                # If the regime is not persistent/confident, retain the previous strategy.
+                selected = recommended if recommended in strategies else previous_selected
+                previous_selected = selected
+
+                strategy_results: dict[str, dict[str, Any]] = {}
+                for strategy_name in strategies:
+                    candidate = {**settings, "strategy": strategy_name}
+                    seed_count = max(strategy_minimum_candles(candidate), 30)
+                    seeded = train[-seed_count:] + test
+                    if len(seeded) < strategy_minimum_candles(candidate):
+                        continue
+                    result = run_backtest_for_symbol(
+                        symbol, seeded,
+                        {**candidate, "trade_start_time": test[0].time},
+                    )
+                    strategy_results[strategy_name] = result
+                    fixed_totals[strategy_name] += float(result.get("total_pnl", 0.0))
+                    fixed_trades[strategy_name] += int(result.get("closed_trades", 0))
+
+                selected_result = strategy_results.get(selected)
+                if selected_result is None:
+                    selected = configured if configured in strategy_results else next(iter(strategy_results), None)
+                    selected_result = strategy_results.get(selected) if selected else None
+                if selected_result is None:
+                    continue
+
+                switched_pnls.append(float(selected_result.get("total_pnl", 0.0)))
+                fold_rows.append({
+                    "fold": fold + 1,
+                    "train_candles": len(train),
+                    "test_candles": len(test),
+                    "regime": regime,
+                    "regime_confidence": round(confidence, 4),
+                    "regime_history": regime_history,
+                    "recommended_strategy": recommended,
+                    "active_strategy": selected,
+                    "configured_strategy": configured,
+                    "switch_applied": bool(recommended and selected == recommended),
+                    "active_pnl": round(float(selected_result.get("total_pnl", 0.0)), 8),
+                    "active_pnl_pct": float(selected_result.get("total_pnl_pct", 0.0)),
+                    "active_closed_trades": int(selected_result.get("closed_trades", 0)),
+                    "active_fees": float(selected_result.get("total_fees", 0.0)),
+                    "fixed": {
+                        name: {
+                            "pnl": round(float(res.get("total_pnl", 0.0)), 8),
+                            "pnl_pct": float(res.get("total_pnl_pct", 0.0)),
+                            "closed_trades": int(res.get("closed_trades", 0)),
+                            "fees": float(res.get("total_fees", 0.0)),
+                        } for name, res in strategy_results.items()
+                    },
+                })
+
+            if not fold_rows:
+                raise RuntimeError("No valid strategy-switch validation folds")
+
+            switched_total = sum(switched_pnls)
+            best_fixed_name = max(fixed_totals, key=fixed_totals.get)
+            best_fixed_total = fixed_totals[best_fixed_name]
+            improvement = switched_total - best_fixed_total
+            all_results.append({
+                "symbol": symbol,
+                "configured_strategy": configured,
+                "folds": len(fold_rows),
+                "switching_total_pnl": round(switched_total, 8),
+                "best_fixed_strategy": best_fixed_name,
+                "best_fixed_total_pnl": round(best_fixed_total, 8),
+                "switching_vs_best_fixed": round(improvement, 8),
+                "switching_beats_best_fixed": improvement > 0,
+                "fixed_strategy_totals": {k: round(v, 8) for k, v in fixed_totals.items()},
+                "fixed_strategy_closed_trades": fixed_trades,
+                "fold_results": fold_rows,
+            })
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+
+    switching_total = sum(float(x["switching_total_pnl"]) for x in all_results)
+    best_fixed_portfolio = None
+    if all_results:
+        portfolio_fixed = {name: sum(float(r["fixed_strategy_totals"].get(name, 0.0)) for r in all_results) for name in strategies}
+        best_fixed_portfolio = max(portfolio_fixed, key=portfolio_fixed.get)
+        best_fixed_value = portfolio_fixed[best_fixed_portfolio]
+    else:
+        portfolio_fixed, best_fixed_value = {}, 0.0
+
+    return {
+        "ok": True,
+        "mode": "out_of_sample_strategy_switch_validation",
+        "exchange": settings.get("exchange"),
+        "quote_currency": settings.get("quote_currency"),
+        "granularity": granularity,
+        "candle_count": candle_count,
+        "min_regime_confidence": min_conf,
+        "persistence_candles": persistence,
+        "min_strategy_hold_candles": min_hold,
+        "configured_strategy": configured,
+        "strategies_compared": strategies,
+        "results": all_results,
+        "portfolio_switching_total_pnl": round(switching_total, 8),
+        "portfolio_fixed_totals": {k: round(v, 8) for k, v in portfolio_fixed.items()},
+        "portfolio_best_fixed_strategy": best_fixed_portfolio,
+        "portfolio_best_fixed_total_pnl": round(best_fixed_value, 8),
+        "portfolio_switching_vs_best_fixed": round(switching_total - best_fixed_value, 8),
+        "portfolio_switching_beats_best_fixed": switching_total > best_fixed_value,
+        "errors": errors,
+        "note": "All strategy choices are made from prior candles only; test windows include configured fees and slippage.",
+    }
+
+
 def run_monte_carlo(settings: dict[str, Any]) -> dict[str, Any]:
     """Bootstrap closed-trade P/L from the current strategy backtest."""
     settings = backtest_runtime_settings(settings)
@@ -10736,6 +10945,12 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 payload = parse_json_body(self)
                 settings = {**self.bot.snapshot()["settings"], **payload}
                 self.send_json(run_walk_forward(settings))
+                return
+
+            if self.path == "/api/strategy-switch-validation":
+                payload = parse_json_body(self)
+                settings = {**self.bot.snapshot()["settings"], **payload}
+                self.send_json(run_strategy_switch_validation(settings))
                 return
 
             if self.path == "/api/monte-carlo":
