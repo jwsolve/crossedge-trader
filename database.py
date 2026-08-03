@@ -72,6 +72,10 @@ class Trade:
     exit_reason: str | None = None
     regime: str | None = None
     learning_context: dict[str, Any] = field(default_factory=dict)
+    user_id: int = 1
+    account_id: int = 1
+    exchange: str | None = None
+    engine_version: str | None = None
 
 
 @dataclass
@@ -245,6 +249,26 @@ class BotDatabase:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
+            # Multi-user foundation; user/account 1 preserve the current installation.
+            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, display_name TEXT,
+                password_hash TEXT, status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS trading_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                exchange TEXT NOT NULL DEFAULT 'coinbase', account_label TEXT NOT NULL DEFAULT 'Primary',
+                encrypted_credentials TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS user_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+                settings_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, account_id)
+            )''')
+            cursor.execute("INSERT OR IGNORE INTO users (id, display_name, status) VALUES (1, 'Auxo Owner', 'active')")
+            cursor.execute("INSERT OR IGNORE INTO trading_accounts (id, user_id, exchange, account_label, enabled) VALUES (1, 1, 'coinbase', 'Primary Coinbase', 1)")
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -270,6 +294,10 @@ class BotDatabase:
                     exit_reason TEXT,
                     regime TEXT,
                     learning_context TEXT,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    account_id INTEGER NOT NULL DEFAULT 1,
+                    exchange TEXT,
+                    engine_version TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -283,10 +311,19 @@ class BotDatabase:
                 ('take_profit_price', 'REAL'),
                 ('exit_mode', 'TEXT'),
                 ('learning_context', 'TEXT'),
+                ('user_id', 'INTEGER NOT NULL DEFAULT 1'),
+                ('account_id', 'INTEGER NOT NULL DEFAULT 1'),
+                ('exchange', 'TEXT'),
+                ('engine_version', 'TEXT'),
             ]:
                 if col not in columns:
                     cursor.execute(f'ALTER TABLE trades ADD COLUMN {col} {col_type}')
                     logger.info(f"Added {col} column to trades table")
+
+            cursor.execute("UPDATE trades SET user_id=1 WHERE user_id IS NULL")
+            cursor.execute("UPDATE trades SET account_id=1 WHERE account_id IS NULL")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_account_time ON trades(user_id, account_id, time DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_user ON trading_accounts(user_id)")
 
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS journal (
@@ -435,8 +472,9 @@ class BotDatabase:
                     cash_after, coin_after, reason, fee_paid,
                     pnl, pnl_pct, entry_price, exit_price,
                     exchange_order_id, exchange_order_status,
-                    stop_loss_price, take_profit_price, exit_mode, exit_reason, regime, learning_context
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stop_loss_price, take_profit_price, exit_mode, exit_reason, regime, learning_context,
+                    user_id, account_id, exchange, engine_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_id,
                 trade.time,
@@ -460,6 +498,10 @@ class BotDatabase:
                 getattr(trade, 'exit_reason', None),
                 getattr(trade, 'regime', None),
                 json.dumps(getattr(trade, 'learning_context', {}) or {}, separators=(',', ':'), default=str),
+                int(getattr(trade, 'user_id', 1) or 1),
+                int(getattr(trade, 'account_id', 1) or 1),
+                getattr(trade, 'exchange', None),
+                getattr(trade, 'engine_version', None),
             ))
 
             return cursor.lastrowid
