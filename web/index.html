@@ -1607,6 +1607,7 @@
                     <button data-tab="walkforward">Walk-Forward</button>
                     <button data-tab="montecarlo">Monte Carlo</button>
                     <button data-tab="validation">Validation Lab</button>
+                    <button data-tab="strategyswitch">Strategy Switching</button>
                     <button data-tab="learning">Setup Learning</button>
                 </div>
 
@@ -1818,6 +1819,53 @@
                     </details>
                 </div>
 
+                <!-- Strategy Switching Validation -->
+                <div class="analysis-pane" id="pane-strategyswitch">
+                    <div class="backtest-row">
+                        <label>Timeframe <select id="strategySwitchGranularity"><option value="900">15m</option><option value="3600" selected>1h</option><option value="21600">6h</option><option value="86400">1d</option></select></label>
+                        <label>Candles <input id="strategySwitchCandles" type="number" value="300" step="1" min="250" max="3000" style="width:90px;" /></label>
+                        <div class="actions"><button class="primary" id="strategySwitchBtn">Run Strategy Switching Validation</button></div>
+                        <span class="status" id="strategySwitchStatus">Compares regime switching with every fixed strategy out-of-sample.</span>
+                    </div>
+                    <div class="message-box" id="strategySwitchErrorBox"></div>
+                    <div class="backtest-metrics">
+                        <span><span class="muted">Result:</span> <strong id="strategySwitchVerdict">—</strong></span>
+                        <span><span class="muted">Auto switching P/L:</span> <strong id="strategySwitchPnl">—</strong></span>
+                        <span><span class="muted">Best fixed:</span> <strong id="strategySwitchBestFixed">—</strong></span>
+                        <span><span class="muted">Best fixed P/L:</span> <strong id="strategySwitchBestFixedPnl">—</strong></span>
+                        <span><span class="muted">Difference:</span> <strong id="strategySwitchDifference">—</strong></span>
+                    </div>
+                    <div class="backtest-metrics">
+                        <span><span class="muted">Configured:</span> <strong id="strategySwitchConfigured">—</strong></span>
+                        <span><span class="muted">Confidence:</span> <strong id="strategySwitchConfidence">—</strong></span>
+                        <span><span class="muted">Persistence:</span> <strong id="strategySwitchPersistence">—</strong></span>
+                        <span><span class="muted">Min hold:</span> <strong id="strategySwitchHold">—</strong></span>
+                    </div>
+                    <div class="message-box" id="strategySwitchRecommendation" style="display:block;"></div>
+                    <details class="settings-group" open>
+                        <summary>Portfolio comparison</summary>
+                        <div class="table-wrap"><table>
+                            <thead><tr><th>Strategy</th><th>Out-of-sample P/L</th><th>Result</th></tr></thead>
+                            <tbody id="strategySwitchPortfolioBody"><tr><td colspan="3" class="muted" style="text-align:center;padding:16px 0;">No strategy-switch validation run.</td></tr></tbody>
+                        </table></div>
+                    </details>
+                    <details class="settings-group">
+                        <summary>Per-symbol comparison</summary>
+                        <div class="table-wrap"><table>
+                            <thead><tr><th>Symbol</th><th>Auto P/L</th><th>Best Fixed</th><th>Fixed P/L</th><th>Difference</th><th>Folds</th><th>Winner</th></tr></thead>
+                            <tbody id="strategySwitchSymbolsBody"><tr><td colspan="7" class="muted" style="text-align:center;padding:16px 0;">No strategy-switch validation run.</td></tr></tbody>
+                        </table></div>
+                    </details>
+                    <details class="settings-group">
+                        <summary>Fold decisions</summary>
+                        <div class="table-wrap"><table>
+                            <thead><tr><th>Symbol</th><th>Fold</th><th>Regime</th><th>Confidence</th><th>Recommended</th><th>Active</th><th>Switched</th><th>P/L</th><th>Trades</th></tr></thead>
+                            <tbody id="strategySwitchFoldsBody"><tr><td colspan="9" class="muted" style="text-align:center;padding:16px 0;">No strategy-switch validation run.</td></tr></tbody>
+                        </table></div>
+                    </details>
+                    <div class="muted" id="strategySwitchNote" style="margin-top:10px;">Strategy choices use prior candles only; test windows include configured fees and slippage.</div>
+                </div>
+
                 <!-- Setup Learning -->
                 <div class="analysis-pane" id="pane-learning">
                     <div class="table-wrap">
@@ -1909,6 +1957,11 @@
             walkForwardBody: $('walkForwardBody'),
             monteCarloBtn: $('monteCarloBtn'), mcRunBtn: $('mcRunBtn'), mcSimulations: $('mcSimulations'), mcStatus: $('mcStatus'), mcErrorBox: $('mcErrorBox'),
             mcTrades: $('mcTrades'), mcPositive: $('mcPositive'), mcMedian: $('mcMedian'), mcP05: $('mcP05'), mcP95: $('mcP95'), mcMedianDD: $('mcMedianDD'), mcP95DD: $('mcP95DD'), mcRuin: $('mcRuin'),
+            strategySwitchBtn: $('strategySwitchBtn'), strategySwitchGranularity: $('strategySwitchGranularity'), strategySwitchCandles: $('strategySwitchCandles'),
+            strategySwitchStatus: $('strategySwitchStatus'), strategySwitchErrorBox: $('strategySwitchErrorBox'), strategySwitchVerdict: $('strategySwitchVerdict'),
+            strategySwitchPnl: $('strategySwitchPnl'), strategySwitchBestFixed: $('strategySwitchBestFixed'), strategySwitchBestFixedPnl: $('strategySwitchBestFixedPnl'), strategySwitchDifference: $('strategySwitchDifference'),
+            strategySwitchConfigured: $('strategySwitchConfigured'), strategySwitchConfidence: $('strategySwitchConfidence'), strategySwitchPersistence: $('strategySwitchPersistence'), strategySwitchHold: $('strategySwitchHold'),
+            strategySwitchRecommendation: $('strategySwitchRecommendation'), strategySwitchPortfolioBody: $('strategySwitchPortfolioBody'), strategySwitchSymbolsBody: $('strategySwitchSymbolsBody'), strategySwitchFoldsBody: $('strategySwitchFoldsBody'), strategySwitchNote: $('strategySwitchNote'),
             validationBtn: $('validationBtn'),
             validationStatus: $('validationStatus'),
             validationErrorBox: $('validationErrorBox'),
@@ -3761,6 +3814,7 @@
             walkforward: $('pane-walkforward'),
             montecarlo: $('pane-montecarlo'),
             validation: $('pane-validation'),
+            strategyswitch: $('pane-strategyswitch'),
             learning: $('pane-learning'),
         };
         analysisTabs.forEach(btn => {
@@ -3999,6 +4053,73 @@
                 els.backtestErrorBox.textContent = e.message;
                 els.backtestStatus.textContent = 'Failed.'; } finally { els.backtestBtn.disabled = false; }
         });
+        els.strategySwitchBtn.addEventListener('click', async () => {
+            const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
+            const payload = {
+                ...settings,
+                granularity: els.strategySwitchGranularity.value,
+                candle_count: els.strategySwitchCandles.value,
+            };
+            els.strategySwitchBtn.disabled = true;
+            els.strategySwitchStatus.textContent = 'Running out-of-sample strategy comparison…';
+            els.strategySwitchErrorBox.style.display = 'none';
+            try {
+                const r = await post('/api/strategy-switch-validation', payload);
+                if (!r.ok) throw new Error(r.error || 'Strategy-switch validation failed');
+                const switching = Number(r.portfolio_switching_total_pnl || 0);
+                const fixed = Number(r.portfolio_best_fixed_total_pnl || 0);
+                const diff = Number(r.portfolio_switching_vs_best_fixed || 0);
+                const wins = !!r.portfolio_switching_beats_best_fixed;
+                els.strategySwitchVerdict.textContent = wins ? '✓ AUTO SWITCHING OUTPERFORMED' : '✗ FIXED STRATEGY PERFORMED BETTER';
+                els.strategySwitchVerdict.className = wins ? 'good' : 'bad';
+                els.strategySwitchPnl.textContent = money(switching);
+                els.strategySwitchPnl.className = switching >= 0 ? 'good' : 'bad';
+                els.strategySwitchBestFixed.textContent = (r.portfolio_best_fixed_strategy || '—').replaceAll('_', ' ');
+                els.strategySwitchBestFixedPnl.textContent = money(fixed);
+                els.strategySwitchBestFixedPnl.className = fixed >= 0 ? 'good' : 'bad';
+                els.strategySwitchDifference.textContent = `${diff >= 0 ? '+' : ''}${money(diff)}`;
+                els.strategySwitchDifference.className = diff >= 0 ? 'good' : 'bad';
+                els.strategySwitchConfigured.textContent = (r.configured_strategy || '—').replaceAll('_', ' ');
+                els.strategySwitchConfidence.textContent = `${(Number(r.min_regime_confidence || 0) * 100).toFixed(0)}%`;
+                els.strategySwitchPersistence.textContent = `${r.persistence_candles ?? '—'} observations`;
+                els.strategySwitchHold.textContent = `${r.min_strategy_hold_candles ?? '—'} candles`;
+                els.strategySwitchRecommendation.style.display = 'block';
+                els.strategySwitchRecommendation.className = `message-box ${wins ? 'good' : 'bad'}`;
+                els.strategySwitchRecommendation.textContent = wins
+                    ? 'Automatic switching beat the best fixed strategy in these unseen test windows. Treat this as supporting evidence, not proof of future profitability.'
+                    : 'Automatic switching did not beat the best fixed strategy in these unseen test windows. Do not enable automatic switching solely on the basis of the current configuration.';
+                const totals = r.portfolio_fixed_totals || {};
+                const portfolioRows = [
+                    `<tr><td><strong>Automatic switching</strong></td><td class="${switching >= 0 ? 'good' : 'bad'}">${money(switching)}</td><td>${wins ? '<span class="good">Winner</span>' : '—'}</td></tr>`,
+                    ...Object.entries(totals).sort((a,b) => Number(b[1])-Number(a[1])).map(([name, pnl]) => {
+                        const n = Number(pnl || 0);
+                        const best = name === r.portfolio_best_fixed_strategy;
+                        return `<tr><td>${name.replaceAll('_',' ')}${best ? ' <span class="muted">(best fixed)</span>' : ''}</td><td class="${n >= 0 ? 'good' : 'bad'}">${money(n)}</td><td>${!wins && best ? '<span class="good">Winner</span>' : '—'}</td></tr>`;
+                    })
+                ];
+                els.strategySwitchPortfolioBody.innerHTML = portfolioRows.join('');
+                const results = r.results || [];
+                els.strategySwitchSymbolsBody.innerHTML = results.length ? results.map(x => {
+                    const d = Number(x.switching_vs_best_fixed || 0);
+                    return `<tr><td><strong>${x.symbol}</strong></td><td class="${Number(x.switching_total_pnl||0)>=0?'good':'bad'}">${money(x.switching_total_pnl)}</td><td>${String(x.best_fixed_strategy||'—').replaceAll('_',' ')}</td><td>${money(x.best_fixed_total_pnl)}</td><td class="${d>=0?'good':'bad'}">${d>=0?'+':''}${money(d)}</td><td>${x.folds ?? '—'}</td><td class="${x.switching_beats_best_fixed?'good':'bad'}">${x.switching_beats_best_fixed?'Auto':'Fixed'}</td></tr>`;
+                }).join('') : '<tr><td colspan="7" class="muted">No symbol results.</td></tr>';
+                const folds = results.flatMap(x => (x.fold_results || []).map(f => ({...f, symbol:x.symbol})));
+                els.strategySwitchFoldsBody.innerHTML = folds.length ? folds.map(f => `<tr><td>${f.symbol}</td><td>${f.fold}</td><td>${f.regime || '—'}</td><td>${(Number(f.regime_confidence||0)*100).toFixed(1)}%</td><td>${String(f.recommended_strategy||'—').replaceAll('_',' ')}</td><td><strong>${String(f.active_strategy||'—').replaceAll('_',' ')}</strong></td><td>${f.switch_applied?'Yes':'No'}</td><td class="${Number(f.active_pnl||0)>=0?'good':'bad'}">${money(f.active_pnl)}</td><td>${f.active_closed_trades ?? 0}</td></tr>`).join('') : '<tr><td colspan="9" class="muted">No fold results.</td></tr>';
+                els.strategySwitchNote.textContent = r.note || 'Strategy choices use prior candles only; test windows include configured fees and slippage.';
+                if (r.errors?.length) {
+                    els.strategySwitchErrorBox.style.display = 'block';
+                    els.strategySwitchErrorBox.textContent = `Skipped: ${r.errors.join(' | ')}`;
+                }
+                els.strategySwitchStatus.textContent = `Compared ${r.strategies_compared?.length || 0} fixed strategies across ${results.length} symbol(s).`;
+            } catch (e) {
+                els.strategySwitchErrorBox.style.display = 'block';
+                els.strategySwitchErrorBox.textContent = e.message;
+                els.strategySwitchStatus.textContent = 'Failed.';
+            } finally {
+                els.strategySwitchBtn.disabled = false;
+            }
+        });
+
         els.validationBtn.addEventListener('click', async () => {
             const settings = Object.fromEntries(new FormData(els.settingsForm).entries());
             const payload = {
