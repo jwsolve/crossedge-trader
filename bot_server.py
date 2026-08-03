@@ -1858,21 +1858,29 @@ class PaperBot:
         return price
 
     def coinbase_round_size(self, size: float, product_id: str) -> float:
-        """Round size down to the nearest multiple of base_increment."""
+        """Round size DOWN to Coinbase base_increment without inflating dust.
+
+        IMPORTANT: this function must never increase a requested size to
+        base_min_size. Doing that can submit more base currency than is
+        actually available and can turn an unsellable dust remainder into an
+        invalid/insufficient-funds order. Callers should check the returned
+        value against coinbase_min_order_size() explicitly.
+        """
         details = self.get_product_details(product_id)
         base_increment = details.get('base_increment', '0.00000001')
         try:
             increment = float(base_increment)
-        except:
+        except (TypeError, ValueError):
             increment = 0.00000001
+
+        size = max(0.0, float(size or 0.0))
         if increment > 0:
-            rounded = math.floor(size / increment) * increment
+            # Small epsilon protects against binary-float values such as
+            # 0.29999999999999999 falling one increment too far.
+            rounded = math.floor((size + increment * 1e-9) / increment) * increment
         else:
             rounded = size
-        min_size = self.coinbase_min_order_size(product_id)
-        if rounded < min_size:
-            rounded = min_size
-        return rounded
+        return max(0.0, rounded)
 
     # ─── ENHANCED RISK MANAGEMENT ────────────────────────────────────
 
@@ -6411,24 +6419,41 @@ class PaperBot:
 
         base_size = min(base_available, desired_size)
 
-        # Coinbase requires base_size to conform to the
-        # product's base_increment.
-        base_size = self.coinbase_round_size(
-            base_size,
-            product_id,
-        )
+        # Coinbase requires base_size to conform to base_increment. Always
+        # round DOWN so we never attempt to sell more than Coinbase reports
+        # as available. Do NOT promote a dust balance up to base_min_size.
+        base_size = self.coinbase_round_size(base_size, product_id)
+        min_size = self.coinbase_min_order_size(product_id)
 
         if base_size <= 0:
             with self.lock:
                 self.state.last_signal = (
                     f"LIVE SELL blocked: no sellable {symbol} balance available"
                 )
+                self.journal(symbol, "BLOCK", self.state.last_signal, price)
+            return
+
+        if base_size < min_size:
+            with self.lock:
+                self.state.last_signal = (
+                    f"LIVE SELL skipped for {symbol}: remaining {base_size:.12g} {symbol} "
+                    f"is below Coinbase minimum {min_size:.12g} (dust)"
+                )
                 self.journal(
                     symbol,
-                    "BLOCK",
+                    "INFO",
                     self.state.last_signal,
                     price,
+                    {
+                        "product_id": product_id,
+                        "available_balance": base_available,
+                        "desired_size": desired_size,
+                        "rounded_size": base_size,
+                        "base_min_size": min_size,
+                        "reason": reason,
+                    },
                 )
+            logger.info(self.state.last_signal)
             return
 
         if self.state.active_stop_order_id:
