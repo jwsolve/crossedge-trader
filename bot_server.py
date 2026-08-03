@@ -4334,72 +4334,140 @@ class PaperBot:
     # ─── Snapshot ────────────────────────────────────────────────────
 
     def live_trade_performance_stats(self) -> dict[str, Any]:
-        """Return dashboard performance from completed LIVE trades in trades.db only.
+        """Return completed LIVE-trade performance from trades.db, net of fees.
 
-        A live close is identified by a SELL row with an exchange_order_id.  This
-        excludes paper/manual-local closes while retaining Coinbase manual closes.
-        pnl_pct is used for win/loss classification because older rows may have a
-        zero pnl field even when entry_price/exit_price contain the realised result.
+        Coinbase LIVE rows are identified by exchange_order_id plus Coinbase-specific
+        trade metadata. OANDA/forex rows are explicitly excluded. BUY lots are matched FIFO to
+        SELL quantities per symbol. Entry fees are allocated pro-rata when a BUY is
+        closed in more than one SELL; each SELL fee is also deducted. This makes
+        win/loss, win rate, profit factor and average P/L all use the same net result.
         """
         try:
             rows = self.db.get_trades(limit=999999)
         except Exception as exc:
             logger.warning(f"Could not read live performance from trades.db: {exc}")
             return {
-                "source": "trades.db", "scope": "live_only", "closed_trades": 0,
+                "source": "trades.db", "scope": "coinbase_live_only_net_fees", "closed_trades": 0,
                 "winning_trades": 0, "losing_trades": 0, "breakeven_trades": 0,
                 "win_rate": None, "profit_factor": None, "average_win": None,
-                "average_loss": None,
+                "average_loss": None, "gross_profit": 0.0, "gross_loss": 0.0,
+                "net_realised_pnl": 0.0, "total_fees": 0.0,
             }
 
-        closed = []
+        # get_trades may return newest-first. FIFO matching requires chronological order.
+        rows = sorted(rows, key=lambda r: str(r.get("created_at") or r.get("time") or ""))
+        open_lots: dict[str, list[dict[str, float]]] = {}
+        closed: list[dict[str, float]] = []
+
         for row in rows:
-            if str(row.get("side") or "").upper() != "SELL":
-                continue
             if not row.get("exchange_order_id"):
                 continue
 
-            pnl_pct = float(row.get("pnl_pct") or 0.0)
-            qty = abs(float(row.get("quantity") or 0.0))
-            entry = row.get("entry_price")
-            exit_price = row.get("exit_price") or row.get("price")
-            fee = float(row.get("fee_paid") or 0.0)
+            # Performance cards are deliberately Coinbase-only. OANDA also records
+            # exchange_order_id values, so that field alone is NOT enough to identify
+            # a Coinbase live trade. Coinbase-generated trade reasons contain either
+            # the LIVE fill marker or an explicit Coinbase manual-close marker.
+            reason_text = str(row.get("reason") or "")
+            reason_upper = reason_text.upper()
+            is_coinbase_live = (
+                "LIVE " in reason_upper
+                or "COINBASE" in reason_upper
+                or "EMERGENCY MARKET EXIT" in reason_upper
+            )
+            if "OANDA" in reason_upper or not is_coinbase_live:
+                continue
 
-            # Reconstruct quote-currency P/L when possible; the historical pnl
-            # column is not authoritative in older database rows.
-            pnl_quote = None
-            if entry is not None and exit_price is not None and qty > 0:
-                pnl_quote = (float(exit_price) - float(entry)) * qty - fee
-            else:
-                stored = row.get("pnl")
-                if stored is not None:
-                    pnl_quote = float(stored)
+            side = str(row.get("side") or "").upper()
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol or side not in {"BUY", "SELL"}:
+                continue
 
-            closed.append((pnl_pct, pnl_quote))
+            qty = abs(float(row.get("quantity") or row.get("exchange_filled_size") or 0.0))
+            price = float(row.get("exit_price") or row.get("entry_price") or row.get("price") or 0.0)
+            fee = max(0.0, float(row.get("fee_paid") or 0.0))
+            if qty <= 0 or price <= 0:
+                continue
 
-        wins = [x for x in closed if x[0] > 0]
-        losses = [x for x in closed if x[0] < 0]
-        breakeven = [x for x in closed if x[0] == 0]
+            if side == "BUY":
+                open_lots.setdefault(symbol, []).append({
+                    "remaining_qty": qty,
+                    "entry_price": price,
+                    "remaining_fee": fee,
+                })
+                continue
+
+            lots = open_lots.get(symbol, [])
+            remaining_sell = qty
+            sell_fee_remaining = fee
+            matched_qty = 0.0
+            gross_move = 0.0
+            entry_fees = 0.0
+            exit_fees = 0.0
+            entry_notional = 0.0
+
+            while remaining_sell > 1e-15 and lots:
+                lot = lots[0]
+                lot_qty_before = lot["remaining_qty"]
+                take = min(remaining_sell, lot_qty_before)
+                fraction = take / lot_qty_before if lot_qty_before > 0 else 0.0
+                allocated_entry_fee = lot["remaining_fee"] * fraction
+                allocated_exit_fee = fee * (take / qty) if qty > 0 else 0.0
+
+                gross_move += (price - lot["entry_price"]) * take
+                entry_notional += lot["entry_price"] * take
+                entry_fees += allocated_entry_fee
+                exit_fees += allocated_exit_fee
+                matched_qty += take
+
+                lot["remaining_qty"] -= take
+                lot["remaining_fee"] -= allocated_entry_fee
+                remaining_sell -= take
+                sell_fee_remaining -= allocated_exit_fee
+
+                if lot["remaining_qty"] <= 1e-15:
+                    lots.pop(0)
+
+            if matched_qty <= 0:
+                # Do not invent performance for an unmatched historical SELL.
+                logger.debug(f"Skipping unmatched Coinbase LIVE SELL in performance stats: {symbol} qty={qty}")
+                continue
+
+            net_pnl = gross_move - entry_fees - exit_fees
+            net_cost = entry_notional + entry_fees
+            net_pnl_pct = (net_pnl / net_cost * 100.0) if net_cost > 0 else 0.0
+            closed.append({
+                "pnl": net_pnl,
+                "pnl_pct": net_pnl_pct,
+                "entry_fees": entry_fees,
+                "exit_fees": exit_fees,
+                "fees": entry_fees + exit_fees,
+            })
+
+        eps = 1e-12
+        wins = [x for x in closed if x["pnl"] > eps]
+        losses = [x for x in closed if x["pnl"] < -eps]
+        breakeven = [x for x in closed if abs(x["pnl"]) <= eps]
         decided = len(wins) + len(losses)
-
-        win_values = [x[1] for x in wins if x[1] is not None and x[1] > 0]
-        loss_values = [x[1] for x in losses if x[1] is not None and x[1] < 0]
-        gross_profit = sum(win_values)
-        gross_loss = abs(sum(loss_values))
+        gross_profit = sum(x["pnl"] for x in wins)
+        gross_loss = abs(sum(x["pnl"] for x in losses))
+        total_fees = sum(x["fees"] for x in closed)
+        net_realised = sum(x["pnl"] for x in closed)
 
         return {
             "source": "trades.db",
-            "scope": "live_only",
+            "scope": "coinbase_live_only_net_fees",
             "closed_trades": len(closed),
             "winning_trades": len(wins),
             "losing_trades": len(losses),
             "breakeven_trades": len(breakeven),
             "win_rate": round((len(wins) / decided) * 100, 2) if decided else None,
             "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else (None if gross_profit <= 0 else "inf"),
-            "average_win": round(gross_profit / len(win_values), 8) if win_values else None,
-            "average_loss": round(sum(loss_values) / len(loss_values), 8) if loss_values else None,
+            "average_win": round(gross_profit / len(wins), 8) if wins else None,
+            "average_loss": round(-gross_loss / len(losses), 8) if losses else None,
             "gross_profit": round(gross_profit, 8),
             "gross_loss": round(gross_loss, 8),
+            "net_realised_pnl": round(net_realised, 8),
+            "total_fees": round(total_fees, 8),
         }
 
     def snapshot(self) -> dict[str, Any]:
