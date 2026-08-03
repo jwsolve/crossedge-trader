@@ -23,9 +23,6 @@ import random
 import math
 import os
 import base64
-import hashlib
-import hmac
-import secrets
 import threading
 import time
 import urllib.error
@@ -1861,29 +1858,24 @@ class PaperBot:
         return price
 
     def coinbase_round_size(self, size: float, product_id: str) -> float:
-        """Round size DOWN to Coinbase base_increment without inflating dust.
+        """Round size DOWN to Coinbase's base_increment.
 
-        IMPORTANT: this function must never increase a requested size to
-        base_min_size. Doing that can submit more base currency than is
-        actually available and can turn an unsellable dust remainder into an
-        invalid/insufficient-funds order. Callers should check the returned
-        value against coinbase_min_order_size() explicitly.
+        Never round a small balance UP to base_min_size: doing so can submit more
+        base currency than is actually available and cause INSUFFICIENT_FUND.
+        Callers that submit orders must separately check base_min_size.
         """
         details = self.get_product_details(product_id)
         base_increment = details.get('base_increment', '0.00000001')
         try:
             increment = float(base_increment)
-        except (TypeError, ValueError):
+        except Exception:
             increment = 0.00000001
-
         size = max(0.0, float(size or 0.0))
         if increment > 0:
-            # Small epsilon protects against binary-float values such as
-            # 0.29999999999999999 falling one increment too far.
-            rounded = math.floor((size + increment * 1e-9) / increment) * increment
-        else:
-            rounded = size
-        return max(0.0, rounded)
+            # Tiny epsilon protects against binary-float values such as
+            # 0.009999999999 being floored one increment too far.
+            return max(0.0, math.floor((size + increment * 1e-9) / increment) * increment)
+        return size
 
     # ─── ENHANCED RISK MANAGEMENT ────────────────────────────────────
 
@@ -6422,41 +6414,24 @@ class PaperBot:
 
         base_size = min(base_available, desired_size)
 
-        # Coinbase requires base_size to conform to base_increment. Always
-        # round DOWN so we never attempt to sell more than Coinbase reports
-        # as available. Do NOT promote a dust balance up to base_min_size.
-        base_size = self.coinbase_round_size(base_size, product_id)
-        min_size = self.coinbase_min_order_size(product_id)
+        # Coinbase requires base_size to conform to the
+        # product's base_increment.
+        base_size = self.coinbase_round_size(
+            base_size,
+            product_id,
+        )
 
         if base_size <= 0:
             with self.lock:
                 self.state.last_signal = (
                     f"LIVE SELL blocked: no sellable {symbol} balance available"
                 )
-                self.journal(symbol, "BLOCK", self.state.last_signal, price)
-            return
-
-        if base_size < min_size:
-            with self.lock:
-                self.state.last_signal = (
-                    f"LIVE SELL skipped for {symbol}: remaining {base_size:.12g} {symbol} "
-                    f"is below Coinbase minimum {min_size:.12g} (dust)"
-                )
                 self.journal(
                     symbol,
-                    "INFO",
+                    "BLOCK",
                     self.state.last_signal,
                     price,
-                    {
-                        "product_id": product_id,
-                        "available_balance": base_available,
-                        "desired_size": desired_size,
-                        "rounded_size": base_size,
-                        "base_min_size": min_size,
-                        "reason": reason,
-                    },
                 )
-            logger.info(self.state.last_signal)
             return
 
         if self.state.active_stop_order_id:
@@ -6750,24 +6725,70 @@ class PaperBot:
             logger.warning(f"Order replace failed: {exc}")
 
     def submit_native_stop_for_position(self, entry_order: ManagedOrder, entry_price: float) -> None:
-        if abs(self.state.coin) <= 0:
+        if not self.state.settings.get("native_stop_enabled", False):
             return
 
-        if not self.state.settings.get("native_stop_enabled", False):
+        symbol = entry_order.symbol
+        position = self.state.positions.get(symbol, {})
+        desired_size = abs(float(position.get("quantity") or entry_order.base_size or 0.0))
+
+        # Fall back to the legacy single-position value only when this really is
+        # the active symbol.  Never use the aggregate self.state.coin value for
+        # a different symbol in a multi-position Coinbase account.
+        if desired_size <= 0 and self.state.active_symbol == symbol:
+            desired_size = abs(float(self.state.coin or 0.0))
+        if desired_size <= 0:
+            logger.warning("Native stop skipped for %s: no local position quantity", symbol)
             return
 
         stop_price = float(entry_order.details.get("stop_price") or 0.0)
         exit_mode = str(entry_order.details.get("exit_mode") or "fixed")
         if stop_price <= 0:
-            candles = closes_to_candles(self.state.price_history.get(entry_order.symbol, []))
+            candles = closes_to_candles(self.state.price_history.get(symbol, []))
             stop_price, _, exit_mode = self.exit_prices(entry_price, candles, self.state.settings)
 
         product_id = entry_order.product_id
         limit_price = self.coinbase_round_price(stop_price * 0.995, product_id)
         stop_price = self.coinbase_round_price(stop_price, product_id)
-        base_size = self.coinbase_round_size(abs(self.state.coin), product_id)
+        min_size = self.coinbase_min_order_size(product_id)
 
         try:
+            # A newly filled Coinbase BUY can take a short time to appear in the
+            # available balance.  Retry the exchange balance before declaring the
+            # native stop impossible.  The exchange remains authoritative for size.
+            available_size = 0.0
+            base_size = 0.0
+            balance_error = None
+            for attempt in range(4):
+                try:
+                    available_size = float(coinbase_available_balance(symbol) or 0.0)
+                    base_size = self.coinbase_round_size(
+                        min(desired_size, available_size),
+                        product_id,
+                    )
+                    balance_error = None
+                except Exception as exc:
+                    balance_error = exc
+                    available_size = 0.0
+                    base_size = 0.0
+
+                if base_size >= min_size and base_size > 0:
+                    break
+                if attempt < 3:
+                    time.sleep(0.75)
+
+            if balance_error is not None:
+                raise RuntimeError(
+                    f"Could not verify Coinbase {symbol} balance for native stop: {balance_error}"
+                ) from balance_error
+
+            if base_size <= 0 or base_size < min_size:
+                raise RuntimeError(
+                    f"Native stop size unavailable/too small for {product_id}: "
+                    f"desired={desired_size:.12f}, available={available_size:.12f}, "
+                    f"rounded={base_size:.12f}, minimum={min_size:.12f}"
+                )
+
             stop_order = coinbase_stop_limit_order(
                 product_id=product_id,
                 side="SELL" if not self.state.is_short else "BUY",
@@ -6779,7 +6800,7 @@ class PaperBot:
             self.state.active_stop_order_id = stop_order_id
             self.track_order(
                 stop_order_id,
-                entry_order.symbol,
+                symbol,
                 product_id,
                 "SELL" if not self.state.is_short else "BUY",
                 "STOP",
@@ -6787,17 +6808,30 @@ class PaperBot:
                 price=stop_price,
                 base_size=base_size,
                 reason=f"{exit_mode} native stop",
-                details={"entry_order_id": entry_order.order_id},
+                details={
+                    "entry_order_id": entry_order.order_id,
+                    "desired_size": desired_size,
+                    "exchange_available_at_submit": available_size,
+                },
                 client_order_id=stop_order.get("client_order_id"),
             )
             self.journal(
-                entry_order.symbol,
+                symbol,
                 "INFO",
                 f"Native stop-limit submitted {stop_order_id} via {exit_mode} stop",
                 stop_price,
-                {"entry_order_id": entry_order.order_id, "stop_order": stop_order},
+                {
+                    "entry_order_id": entry_order.order_id,
+                    "desired_size": desired_size,
+                    "exchange_available": available_size,
+                    "submitted_size": base_size,
+                    "stop_order": stop_order,
+                },
             )
-            logger.info(f"Native stop submitted: {stop_order_id} at {stop_price:.6f}")
+            logger.info(
+                "Native stop submitted: %s at %.6f size=%.12f available=%.12f",
+                stop_order_id, stop_price, base_size, available_size,
+            )
         except Exception as e:
             error_text = str(e)
             if self.should_live_trade():
@@ -6808,7 +6842,7 @@ class PaperBot:
                     "Attempting emergency market exit."
                 )
                 self.journal(
-                    entry_order.symbol,
+                    symbol,
                     "CRITICAL",
                     "LIVE native stop failed; attempting emergency market exit",
                     stop_price,
@@ -6816,51 +6850,40 @@ class PaperBot:
                 )
 
                 try:
-                    # Re-check the exchange before attempting an emergency exit.
-                    #
-                    # An earlier order may have succeeded at Coinbase even if Auxo
-                    # subsequently failed to process/reconcile the response. Never
-                    # blindly submit a second exit based only on local state.
                     if not self.state.is_short:
-                        exchange_available = coinbase_available_balance(entry_order.symbol)
-
-                        emergency_size = min(
-                            abs(self.state.coin),
-                            exchange_available,
-                        )
-
+                        exchange_available = float(coinbase_available_balance(symbol) or 0.0)
                         emergency_size = self.coinbase_round_size(
-                            emergency_size,
+                            min(desired_size, exchange_available),
                             product_id,
                         )
 
-                        if emergency_size <= 0:
+                        if emergency_size <= 0 or emergency_size < min_size:
                             logger.warning(
-                                "Emergency exit skipped for %s: Coinbase reports no "
-                                "available balance. Position may already be closed.",
-                                entry_order.symbol,
+                                "Emergency exit skipped for %s: available %.12f rounds to %.12f, "
+                                "below Coinbase minimum %.12f. Position may already be closed or dust.",
+                                symbol, exchange_available, emergency_size, min_size,
                             )
-
                             self.journal(
-                                entry_order.symbol,
+                                symbol,
                                 "WARNING",
-                                "Emergency exit skipped: Coinbase balance is zero; "
+                                "Emergency exit skipped: Coinbase balance is zero/dust; "
                                 "position may already be closed",
                                 stop_price,
                                 {
-                                    "local_coin": self.state.coin,
+                                    "desired_size": desired_size,
                                     "exchange_available": exchange_available,
+                                    "rounded_size": emergency_size,
+                                    "minimum_size": min_size,
                                     "native_stop_error": error_text,
                                 },
                             )
-
                             return
-
                     else:
-                        # Coinbase spot positions should normally be long-only.
-                        # Keep the existing size handling for any short-capable
-                        # exchange path until that path has its own reconciliation.
-                        emergency_size = base_size
+                        emergency_size = self.coinbase_round_size(desired_size, product_id)
+                        if emergency_size <= 0 or emergency_size < min_size:
+                            raise RuntimeError(
+                                f"Emergency exit size {emergency_size} is below minimum {min_size}"
+                            )
 
                     emergency = coinbase_market_order(
                         product_id=product_id,
@@ -6873,9 +6896,9 @@ class PaperBot:
                     filled_price = float(fill.get("average_price") or stop_price or 0.0)
                     if filled_size > 0:
                         self.paper_sell(
-                            entry_order.symbol,
+                            symbol,
                             filled_price,
-                            f"EMERGENCY MARKET EXIT after native stop failure",
+                            "EMERGENCY MARKET EXIT after native stop failure",
                             quantity_override=filled_size,
                             fee_override=float(fill.get("total_fee") or 0.0),
                             exchange_order_id=emergency_id,
@@ -6896,7 +6919,7 @@ class PaperBot:
                 except Exception as emergency_error:
                     self.state.stop_price = None
                     self.journal(
-                        entry_order.symbol,
+                        symbol,
                         "CRITICAL",
                         "LIVE position may be unprotected: emergency market exit failed",
                         stop_price,
@@ -6917,7 +6940,7 @@ class PaperBot:
                 )
                 self.state.stop_price = stop_price
                 self.journal(
-                    entry_order.symbol,
+                    symbol,
                     "WARNING",
                     f"Native stop failed, using simulated stop at {stop_price:.6f}",
                     stop_price,
@@ -10576,77 +10599,6 @@ def migrate_to_database():
 
     logger.info(f"Migration complete: {migrated} trades migrated")
 
-# ─── MILESTONE A: SINGLE-USER WEB AUTHENTICATION ────────────────────
-# Configure with AUXO_AUTH_USERNAME, AUXO_AUTH_PASSWORD_HASH and
-# AUXO_SESSION_SECRET. Password hashes use PBKDF2-HMAC-SHA256.
-AUTH_COOKIE_NAME = "auxo_session"
-AUTH_SESSION_SECONDS = int(os.environ.get("AUXO_SESSION_SECONDS", "43200"))
-AUTH_MAX_FAILURES = int(os.environ.get("AUXO_AUTH_MAX_FAILURES", "5"))
-AUTH_LOCKOUT_SECONDS = int(os.environ.get("AUXO_AUTH_LOCKOUT_SECONDS", "300"))
-_AUTH_FAILURES: dict[str, list[float]] = {}
-_AUTH_FAILURES_LOCK = threading.Lock()
-
-def auth_enabled() -> bool:
-    return bool(
-        os.environ.get("AUXO_AUTH_USERNAME", "").strip()
-        and os.environ.get("AUXO_AUTH_PASSWORD_HASH", "").strip()
-        and os.environ.get("AUXO_SESSION_SECRET", "").strip()
-    )
-
-def verify_auth_password(password: str) -> bool:
-    stored = os.environ.get("AUXO_AUTH_PASSWORD_HASH", "").strip()
-    try:
-        scheme, iterations_text, salt_hex, digest_hex = stored.split("$", 3)
-        if scheme != "pbkdf2_sha256":
-            return False
-        candidate = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations_text)
-        ).hex()
-        return hmac.compare_digest(candidate, digest_hex)
-    except Exception:
-        return False
-
-def _auth_signature(payload: str) -> str:
-    secret = os.environ.get("AUXO_SESSION_SECRET", "").encode("utf-8")
-    return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def create_auth_session(username: str) -> str:
-    expires = int(time.time()) + AUTH_SESSION_SECONDS
-    nonce = secrets.token_urlsafe(18)
-    payload = f"{username}|{expires}|{nonce}"
-    encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
-    return f"{encoded}.{_auth_signature(encoded)}"
-
-def validate_auth_session(token: str) -> bool:
-    try:
-        encoded, signature = token.rsplit(".", 1)
-        if not hmac.compare_digest(signature, _auth_signature(encoded)):
-            return False
-        padded = encoded + "=" * (-len(encoded) % 4)
-        payload = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-        username, expires_text, _nonce = payload.split("|", 2)
-        return (
-            hmac.compare_digest(username, os.environ.get("AUXO_AUTH_USERNAME", ""))
-            and int(expires_text) >= int(time.time())
-        )
-    except Exception:
-        return False
-
-def auth_client_locked(client_ip: str) -> bool:
-    now = time.time()
-    with _AUTH_FAILURES_LOCK:
-        recent = [t for t in _AUTH_FAILURES.get(client_ip, []) if now - t < AUTH_LOCKOUT_SECONDS]
-        _AUTH_FAILURES[client_ip] = recent
-        return len(recent) >= AUTH_MAX_FAILURES
-
-def record_auth_failure(client_ip: str) -> None:
-    with _AUTH_FAILURES_LOCK:
-        _AUTH_FAILURES.setdefault(client_ip, []).append(time.time())
-
-def clear_auth_failures(client_ip: str) -> None:
-    with _AUTH_FAILURES_LOCK:
-        _AUTH_FAILURES.pop(client_ip, None)
-
 # ─── HTTP SERVER ─────────────────────────────────────────────────────
 
 def parse_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
@@ -10662,76 +10614,19 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         self.bot = BotRequestHandler.bot
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
-    def _cookie_value(self, name: str) -> str:
-        raw = self.headers.get("Cookie", "")
-        for item in raw.split(";"):
-            key, sep, value = item.strip().partition("=")
-            if sep and key == name:
-                return value
-        return ""
-
-    def _is_authenticated(self) -> bool:
-        # Keep the existing bearer-token option for API/automation clients.
-        api_token = os.environ.get("BOT_API_TOKEN", "")
-        header = self.headers.get("Authorization", "")
-        if api_token and hmac.compare_digest(header, f"Bearer {api_token}"):
-            return True
-        if not auth_enabled():
-            return not api_token
-        return validate_auth_session(self._cookie_value(AUTH_COOKIE_NAME))
-
     def _check_auth(self) -> bool:
-        if self._is_authenticated():
+        token = os.environ.get("BOT_API_TOKEN", "")
+        if not token:
+            return True
+        header = self.headers.get("Authorization", "")
+        expected = f"Bearer {token}"
+        if header == expected:
             return True
         self.send_json({"ok": False, "error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
         return False
 
-    def _redirect(self, location: str, status: HTTPStatus = HTTPStatus.SEE_OTHER) -> None:
-        self.send_response(status)
-        self.send_header("Location", location)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def send_login(self, error: str = "") -> None:
-        login_path = WEB_DIR / "login.html"
-        if not login_path.exists():
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Login page missing")
-            return
-        body = login_path.read_text(encoding="utf-8").replace("{{ERROR}}", error)
-        if not error:
-            body = body.replace('<div class="error"></div>', '')
-        encoded = body.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.end_headers()
-        self.wfile.write(encoded)
-
     def do_GET(self) -> None:
-        parsed_path = urllib.parse.urlparse(self.path).path
-        if parsed_path == "/login":
-            if self._is_authenticated():
-                self._redirect("/")
-            else:
-                self.send_login()
-            return
-        if parsed_path == "/logout":
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/login")
-            self.send_header("Set-Cookie", f"{AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
         if self.path.startswith("/api/") and not self._check_auth():
-            return
-        if not self.path.startswith("/api/") and parsed_path != "/favicon.ico" and not self._is_authenticated():
-            self._redirect("/login")
             return
         try:
             if self.path == "/api/status":
@@ -11042,37 +10937,6 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             return
 
     def do_POST(self) -> None:
-        parsed_path = urllib.parse.urlparse(self.path).path
-        if parsed_path == "/login":
-            client_ip = self.client_address[0] if self.client_address else "unknown"
-            if auth_client_locked(client_ip):
-                self.send_login("Too many failed attempts. Please wait a few minutes and try again.")
-                return
-            length = min(int(self.headers.get("Content-Length", "0") or 0), 8192)
-            raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
-            form = urllib.parse.parse_qs(raw)
-            username = str(form.get("username", [""])[0])
-            password = str(form.get("password", [""])[0])
-            expected_user = os.environ.get("AUXO_AUTH_USERNAME", "")
-            if auth_enabled() and hmac.compare_digest(username, expected_user) and verify_auth_password(password):
-                clear_auth_failures(client_ip)
-                token = create_auth_session(username)
-                secure = os.environ.get("AUXO_AUTH_SECURE_COOKIE", "true").lower() not in {"0", "false", "no"}
-                cookie = f"{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={AUTH_SESSION_SECONDS}; HttpOnly; SameSite=Lax"
-                if secure:
-                    cookie += "; Secure"
-                self.send_response(HTTPStatus.SEE_OTHER)
-                self.send_header("Location", "/")
-                self.send_header("Set-Cookie", cookie)
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                logger.info("Auxo login succeeded for %s from %s", username, client_ip)
-                return
-            record_auth_failure(client_ip)
-            logger.warning("Auxo login failed from %s", client_ip)
-            self.send_login("Invalid username or password.")
-            return
         if not self._check_auth():
             return
         try:
@@ -11298,8 +11162,6 @@ def main() -> None:
     BotRequestHandler.bot = bot
 
     server = ThreadingHTTPServer(("0.0.0.0", port), BotRequestHandler)
-    if not auth_enabled():
-        logger.warning("AUXO WEB AUTH IS NOT CONFIGURED. Set AUXO_AUTH_USERNAME, AUXO_AUTH_PASSWORD_HASH and AUXO_SESSION_SECRET.")
     logger.info(f"Auxo running at http://localhost:{port}")
     print(f"Auxo running at http://localhost:{port}")
     print("Press Ctrl+C to stop.")
