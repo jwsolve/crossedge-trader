@@ -272,6 +272,8 @@
         }
         .metric-card .value.good { color: var(--good); }
         .metric-card .value.bad { color: var(--bad); }
+        .metric-card .metric-note { margin-top: 3px; font-size: 10px; color: var(--muted); }
+        .metric-card .metric-compact { font-size: 17px; line-height: 1.25; text-transform: capitalize; }
 
         /* ─── Chart ─── */
         .chart-section {
@@ -1254,6 +1256,33 @@
                     <div class="label">Open Positions</div>
                     <div class="value" id="position">0</div>
                 </div>
+                <div class="metric-card">
+                    <div class="label">Win Rate</div>
+                    <div class="value" id="dashboardWinRate">—</div>
+                    <div class="metric-note" id="dashboardWinRateNote">No closed trades</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Profit Factor</div>
+                    <div class="value" id="dashboardProfitFactor">—</div>
+                    <div class="metric-note">Gross wins ÷ gross losses</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Average Win</div>
+                    <div class="value" id="dashboardAvgWin">—</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Average Loss</div>
+                    <div class="value" id="dashboardAvgLoss">—</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Closed Trades</div>
+                    <div class="value" id="dashboardClosedTrades">0</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Market / Strategy</div>
+                    <div class="value metric-compact" id="dashboardRegime">—</div>
+                    <div class="metric-note" id="dashboardStrategy">—</div>
+                </div>
             </div>
 
             <!-- Chart -->
@@ -1908,6 +1937,14 @@
             startingCash: $('startingCash'),
             unrealizedPnl: $('unrealizedPnl'),
             position: $('position'),
+            dashboardWinRate: $('dashboardWinRate'),
+            dashboardWinRateNote: $('dashboardWinRateNote'),
+            dashboardProfitFactor: $('dashboardProfitFactor'),
+            dashboardAvgWin: $('dashboardAvgWin'),
+            dashboardAvgLoss: $('dashboardAvgLoss'),
+            dashboardClosedTrades: $('dashboardClosedTrades'),
+            dashboardRegime: $('dashboardRegime'),
+            dashboardStrategy: $('dashboardStrategy'),
             runPill: $('runPill'),
             runDot: $('runDot'),
             runText: $('runText'),
@@ -3359,6 +3396,65 @@
             els.settingsStatus.textContent = 'Settings loaded.';
         }
 
+        function dashboardTradingStats(trades) {
+            const open = new Map();
+            const pnls = [];
+            for (const t of (trades || [])) {
+                const symbol = String(t.symbol || '');
+                const side = String(t.side || '').toUpperCase();
+                if (!symbol) continue;
+                if (side === 'BUY' || side === 'SHORT') {
+                    if (!open.has(symbol)) open.set(symbol, []);
+                    open.get(symbol).push(t);
+                    continue;
+                }
+                if (side !== 'SELL') continue;
+                const queue = open.get(symbol) || [];
+                const entry = queue.shift();
+                if (!entry) continue;
+                const qty = Math.min(Math.abs(Number(entry.quantity || 0)), Math.abs(Number(t.quantity || 0)));
+                if (!(qty > 0)) continue;
+                const entryPrice = Number(entry.price || 0);
+                const exitPrice = Number(t.price || 0);
+                let pnl = String(entry.side || '').toUpperCase() === 'SHORT'
+                    ? (entryPrice - exitPrice) * qty
+                    : (exitPrice - entryPrice) * qty;
+                pnl -= Number(entry.fee_paid || 0) + Number(t.fee_paid || 0);
+                if (Number.isFinite(pnl)) pnls.push(pnl);
+            }
+            const wins = pnls.filter(x => x > 0);
+            const losses = pnls.filter(x => x < 0);
+            const grossWins = wins.reduce((a,b) => a+b, 0);
+            const grossLosses = Math.abs(losses.reduce((a,b) => a+b, 0));
+            return {
+                closed: pnls.length, wins: wins.length, losses: losses.length,
+                winRate: pnls.length ? wins.length / pnls.length * 100 : null,
+                profitFactor: grossLosses > 0 ? grossWins / grossLosses : (grossWins > 0 ? Infinity : null),
+                avgWin: wins.length ? grossWins / wins.length : null,
+                avgLoss: losses.length ? losses.reduce((a,b) => a+b, 0) / losses.length : null
+            };
+        }
+
+        function renderDashboardTradingStats(data) {
+            const stats = dashboardTradingStats(data.trades || []);
+            els.dashboardClosedTrades.textContent = String(stats.closed);
+            els.dashboardWinRate.textContent = stats.winRate === null ? '—' : `${stats.winRate.toFixed(1)}%`;
+            els.dashboardWinRate.className = 'value ' + (stats.winRate === null ? '' : stats.winRate >= 60 ? 'good' : stats.winRate < 45 ? 'bad' : '');
+            els.dashboardWinRateNote.textContent = stats.closed ? `${stats.wins} wins / ${stats.losses} losses` : 'No closed trades';
+            els.dashboardProfitFactor.textContent = stats.profitFactor === null ? '—' : !Number.isFinite(stats.profitFactor) ? '∞' : stats.profitFactor.toFixed(2);
+            els.dashboardProfitFactor.className = 'value ' + (stats.profitFactor === null ? '' : stats.profitFactor >= 1.5 ? 'good' : stats.profitFactor < 1 ? 'bad' : '');
+            els.dashboardAvgWin.textContent = stats.avgWin === null ? '—' : money(stats.avgWin);
+            els.dashboardAvgWin.className = 'value ' + (stats.avgWin === null ? '' : 'good');
+            els.dashboardAvgLoss.textContent = stats.avgLoss === null ? '—' : money(stats.avgLoss);
+            els.dashboardAvgLoss.className = 'value ' + (stats.avgLoss === null ? '' : 'bad');
+            const regime = data.regime || data.current_regime || {};
+            const regimeName = typeof regime === 'string' ? regime : (regime.regime || regime.name || regime.label || '—');
+            const confidence = typeof regime === 'object' ? Number(regime.confidence ?? regime.score) : NaN;
+            els.dashboardRegime.textContent = regimeName === '—' ? '—' : `${String(regimeName).replaceAll('_',' ')}${Number.isFinite(confidence) ? ` ${(confidence <= 1 ? confidence*100 : confidence).toFixed(0)}%` : ''}`;
+            const strategy = data.active_strategy || data.settings?.strategy || '—';
+            els.dashboardStrategy.textContent = `Strategy: ${String(strategy).replaceAll('_',' ')}`;
+        }
+
         // ---- main render ----
         function render(data) {
             lastStatusData = data;
@@ -3380,6 +3476,7 @@
             }
             const posCount = (data.positions || []).length;
             els.position.textContent = posCount;
+            renderDashboardTradingStats(data);
 
             const running = !!data.running;
             els.runDot.className = 'dot ' + (running ? 'green' : 'red');
