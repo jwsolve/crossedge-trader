@@ -4333,6 +4333,75 @@ class PaperBot:
 
     # ─── Snapshot ────────────────────────────────────────────────────
 
+    def live_trade_performance_stats(self) -> dict[str, Any]:
+        """Return dashboard performance from completed LIVE trades in trades.db only.
+
+        A live close is identified by a SELL row with an exchange_order_id.  This
+        excludes paper/manual-local closes while retaining Coinbase manual closes.
+        pnl_pct is used for win/loss classification because older rows may have a
+        zero pnl field even when entry_price/exit_price contain the realised result.
+        """
+        try:
+            rows = self.db.get_trades(limit=999999)
+        except Exception as exc:
+            logger.warning(f"Could not read live performance from trades.db: {exc}")
+            return {
+                "source": "trades.db", "scope": "live_only", "closed_trades": 0,
+                "winning_trades": 0, "losing_trades": 0, "breakeven_trades": 0,
+                "win_rate": None, "profit_factor": None, "average_win": None,
+                "average_loss": None,
+            }
+
+        closed = []
+        for row in rows:
+            if str(row.get("side") or "").upper() != "SELL":
+                continue
+            if not row.get("exchange_order_id"):
+                continue
+
+            pnl_pct = float(row.get("pnl_pct") or 0.0)
+            qty = abs(float(row.get("quantity") or 0.0))
+            entry = row.get("entry_price")
+            exit_price = row.get("exit_price") or row.get("price")
+            fee = float(row.get("fee_paid") or 0.0)
+
+            # Reconstruct quote-currency P/L when possible; the historical pnl
+            # column is not authoritative in older database rows.
+            pnl_quote = None
+            if entry is not None and exit_price is not None and qty > 0:
+                pnl_quote = (float(exit_price) - float(entry)) * qty - fee
+            else:
+                stored = row.get("pnl")
+                if stored is not None:
+                    pnl_quote = float(stored)
+
+            closed.append((pnl_pct, pnl_quote))
+
+        wins = [x for x in closed if x[0] > 0]
+        losses = [x for x in closed if x[0] < 0]
+        breakeven = [x for x in closed if x[0] == 0]
+        decided = len(wins) + len(losses)
+
+        win_values = [x[1] for x in wins if x[1] is not None and x[1] > 0]
+        loss_values = [x[1] for x in losses if x[1] is not None and x[1] < 0]
+        gross_profit = sum(win_values)
+        gross_loss = abs(sum(loss_values))
+
+        return {
+            "source": "trades.db",
+            "scope": "live_only",
+            "closed_trades": len(closed),
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "breakeven_trades": len(breakeven),
+            "win_rate": round((len(wins) / decided) * 100, 2) if decided else None,
+            "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else (None if gross_profit <= 0 else "inf"),
+            "average_win": round(gross_profit / len(win_values), 8) if win_values else None,
+            "average_loss": round(sum(loss_values) / len(loss_values), 8) if loss_values else None,
+            "gross_profit": round(gross_profit, 8),
+            "gross_loss": round(gross_loss, 8),
+        }
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             chart_symbol = self.state.active_symbol or self.state.settings["symbol"]
@@ -4492,9 +4561,11 @@ class PaperBot:
                 strategy_summary = self.strategy_manager.get_performance_summary()
 
             kelly_metrics = self.db.get_kelly_metrics()
+            live_trade_stats = self.live_trade_performance_stats()
 
             return {
                 "running": self.state.running,
+                "live_trade_stats": live_trade_stats,
                 "settings": self.state.settings,
                 "starting_cash": round(starting_cash, 2),
                 "cash": round(cash, 2),
@@ -4786,12 +4857,8 @@ class PaperBot:
             if self.should_live_trade():
                 self.manage_open_orders()
 
-            # Protective exits always have priority over entry/signal strategy logic.
-            # This prevents strategy-specific early returns (for example EMA Golden
-            # Cross HOLD) from bypassing TP/SL/partial-TP/trailing-stop management.
-            decision = self.manage_position_exits(fetched_prices, fetched_candles)
-
-            if not decision and settings.get("strategy_creator_enabled", False) and self.strategy_manager:
+            decision = None
+            if settings.get("strategy_creator_enabled", False) and self.strategy_manager:
                 for symbol in watchlist:
                     candles = fetched_candles.get(symbol, [])
                     if not candles:
@@ -4841,23 +4908,15 @@ class PaperBot:
                 parts = decision.split()
                 symbol = parts[1] if len(parts) > 1 else self.state.active_symbol or settings["symbol"]
                 sell_quantity = None
-                position = self.state.positions.get(symbol)
-                if position:
-                    # Quantity must belong to the symbol being exited.  Using the
-                    # legacy aggregate self.state.coin can sell the wrong amount
-                    # when several Coinbase positions are open.
-                    position_quantity = abs(float(position.get("quantity", 0.0) or 0.0))
-                    if " partial " in f" {decision} ":
-                        sell_quantity = position_quantity * (
+                if " partial " in f" {decision} ":
+                    if self.wants_oanda_demo_trade() and symbol in self.state.positions:
+                        sell_quantity = float(self.state.positions[symbol].get("quantity", 0.0)) * (
                             float(settings.get("partial_take_profit_pct", 50.0)) / 100
                         )
                     else:
-                        sell_quantity = position_quantity
-                elif " partial " in f" {decision} ":
-                    # Backward compatibility for a legacy state with no positions map.
-                    sell_quantity = abs(self.state.coin) * (
-                        float(settings.get("partial_take_profit_pct", 50.0)) / 100
-                    )
+                        sell_quantity = self.state.coin * (
+                            float(settings.get("partial_take_profit_pct", 50.0)) / 100
+                        )
                 if self.should_oanda_demo_trade():
                     self.oanda_demo_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity)
                 elif self.wants_oanda_demo_trade():
@@ -5239,170 +5298,6 @@ class PaperBot:
             "stop_level": first_candle.low if is_green else first_candle.high,
             "opening_time": datetime.fromtimestamp(first_candle.time, tz=timezone.utc).isoformat(),
         }
-
-    # ─── Universal Multi-Position Exit Management ────────────────────
-
-    def manage_position_exits(
-        self,
-        fetched_prices: dict[str, float],
-        candles_by_symbol: dict[str, list[Candle]],
-    ) -> str | None:
-        """Evaluate protective exits for every open position before entry strategy logic.
-
-        This deliberately does not use ``active_symbol`` / root-level entry fields as
-        the source of truth.  Each entry in state.positions owns its quantity, entry,
-        high-water mark, TP/SL and partial-TP state.
-        """
-        with self.lock:
-            settings = dict(self.state.settings)
-            position_symbols = list(self.state.positions.keys())
-
-        for symbol in position_symbols:
-            with self.lock:
-                position = self.state.positions.get(symbol)
-                if not position:
-                    continue
-                position = dict(position)
-
-            quantity = float(position.get("quantity", 0.0) or 0.0)
-            if abs(quantity) <= 0:
-                continue
-
-            price = fetched_prices.get(symbol)
-            if price is None:
-                continue
-            price = float(price)
-
-            entry_price = float(position.get("entry_price", 0.0) or 0.0)
-            if entry_price <= 0:
-                continue
-
-            is_short = bool(position.get("is_short", quantity < 0))
-            position_side = "SHORT" if is_short else "LONG"
-
-            history = self.state.price_history.get(symbol, [])
-            candles = candles_by_symbol.get(symbol) or closes_to_candles(history)
-
-            # Persist the favourable price extreme independently for every position.
-            # For longs this is the highest price; for shorts it is the lowest price.
-            stored_highest = position.get("highest_price")
-            try:
-                stored_highest = float(stored_highest) if stored_highest is not None else entry_price
-            except (TypeError, ValueError):
-                stored_highest = entry_price
-
-            if is_short:
-                favourable_extreme = min(stored_highest, price)
-            else:
-                favourable_extreme = max(stored_highest, price)
-
-            with self.lock:
-                live_position = self.state.positions.get(symbol)
-                if live_position is not None:
-                    live_position["highest_price"] = favourable_extreme
-                # Keep legacy root fields coherent only when they refer to this symbol.
-                if self.state.active_symbol == symbol:
-                    self.state.highest_price = favourable_extreme
-
-            stored_stop = (
-                position.get("stop_price")
-                or position.get("stop")
-                or position.get("stop_loss")
-                or position.get("stop_loss_price")
-            )
-            stored_target = (
-                position.get("target_price")
-                or position.get("target")
-                or position.get("take_profit")
-                or position.get("take_profit_price")
-            )
-            stop_price = float(stored_stop) if stored_stop is not None else None
-            target_price = float(stored_target) if stored_target is not None else None
-            exit_mode = str(position.get("exit_mode") or "stored")
-
-            if stop_price is None or target_price is None:
-                calculated_stop, calculated_target, calculated_mode = exit_prices(
-                    entry_price=entry_price,
-                    candles=candles,
-                    settings=settings,
-                )
-                if stop_price is None:
-                    stop_price = calculated_stop
-                if target_price is None:
-                    target_price = calculated_target
-                if not position.get("exit_mode"):
-                    exit_mode = calculated_mode
-
-                # Persist recovered levels so the UI and future cycles use the same plan.
-                with self.lock:
-                    live_position = self.state.positions.get(symbol)
-                    if live_position is not None:
-                        live_position["stop_price"] = stop_price
-                        live_position["target_price"] = target_price
-                        live_position["exit_mode"] = exit_mode
-
-            entry_time = float(position.get("entry_time", time.time()) or time.time())
-            should_exit, exit_reason = self.should_exit_enhanced(
-                symbol=symbol,
-                candles=candles,
-                entry_time=entry_time,
-                position_side=position_side,
-            )
-            if should_exit:
-                return f"SELL {symbol} {exit_reason}"
-
-            partial_done = bool(position.get("partial_take_profit_done", False))
-
-            # Partial TP is position-specific. Handle shorts symmetrically.
-            partial_ready = False
-            if settings.get("partial_take_profit_enabled") and not partial_done:
-                trigger_fraction = float(
-                    settings.get("partial_take_profit_at_target_pct", 50.0)
-                ) / 100.0
-                partial_trigger = entry_price + ((target_price - entry_price) * trigger_fraction)
-                if is_short:
-                    partial_ready = target_price < entry_price and price <= partial_trigger
-                else:
-                    partial_ready = target_price > entry_price and price >= partial_trigger
-
-            if partial_ready:
-                with self.lock:
-                    live_position = self.state.positions.get(symbol)
-                    if live_position is not None:
-                        live_position["partial_take_profit_done"] = True
-                    if self.state.active_symbol == symbol:
-                        self.state.partial_take_profit_done = True
-                return f"SELL {symbol} partial {exit_mode} target"
-
-            # Position-specific trailing stop.  The old helper is long-only, so shorts
-            # are handled explicitly using their favourable (lowest) price.
-            trailing_stop = None
-            if settings.get("trailing_stop_enabled"):
-                activation = float(settings.get("trailing_activation_pct", 3.0)) / 100.0
-                trail = float(settings.get("trailing_stop_pct", 2.0)) / 100.0
-                if is_short:
-                    if favourable_extreme <= entry_price * (1.0 - activation):
-                        trailing_stop = favourable_extreme * (1.0 + trail)
-                    if trailing_stop is not None and price >= trailing_stop:
-                        return f"SELL {symbol} trailing stop"
-                else:
-                    if favourable_extreme >= entry_price * (1.0 + activation):
-                        trailing_stop = favourable_extreme * (1.0 - trail)
-                    if trailing_stop is not None and price <= trailing_stop:
-                        return f"SELL {symbol} trailing stop"
-
-            if is_short:
-                if price >= stop_price:
-                    return f"SELL {symbol} {exit_mode} stop"
-                if price <= target_price:
-                    return f"SELL {symbol} {exit_mode} target"
-            else:
-                if price <= stop_price:
-                    return f"SELL {symbol} {exit_mode} stop"
-                if price >= target_price:
-                    return f"SELL {symbol} {exit_mode} target"
-
-        return None
 
     # ─── Legacy Decision ─────────────────────────────────────────────
 
