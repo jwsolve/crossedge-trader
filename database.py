@@ -147,6 +147,7 @@ class ManagedOrder:
     expires_at: float
     retry_count: int = 0
     local_applied: bool = False
+    client_order_id: str | None = None
     price: float | None = None
     base_size: float | None = None
     quote_size: float | None = None
