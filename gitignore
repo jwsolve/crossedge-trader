@@ -1,8 +1,0 @@
-.env
-bot_audit.jsonl
-*.pem
-*.key
-__pycache__/
-coinbase_api_key.json
-coinbase-private-key.pem
-cdp_api_key.json
