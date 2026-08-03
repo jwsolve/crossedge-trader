@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Auxo — Sign in</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#090d14;color:#edf2f7;font:15px system-ui,-apple-system,Segoe UI,sans-serif}.card{width:min(92vw,420px);padding:34px;border:1px solid #273244;border-radius:18px;background:#111827;box-shadow:0 24px 80px #0008}.brand{font-size:30px;font-weight:800;letter-spacing:.02em}.sub{color:#94a3b8;margin:6px 0 28px}.field{margin:15px 0}label{display:block;margin-bottom:7px;color:#cbd5e1;font-weight:600}input{width:100%;padding:13px 14px;border-radius:10px;border:1px solid #334155;background:#0b1220;color:#fff;font-size:16px;outline:none}input:focus{border-color:#64748b}button{width:100%;margin-top:10px;padding:13px;border:0;border-radius:10px;font-weight:750;font-size:15px;cursor:pointer;background:#e2e8f0;color:#0f172a}.error{padding:10px 12px;margin:0 0 16px;border-radius:9px;background:#3f1518;color:#fecaca;display:block}.note{margin-top:20px;color:#64748b;font-size:12px;text-align:center}
+</style>
+</head><body><main class="card"><div class="brand">Auxo</div><div class="sub">Trading Engine · Secure Access</div><div class="error">{{ERROR}}</div><form method="post" action="/login" autocomplete="on"><div class="field"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required autofocus></div><div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div><button type="submit">Sign in</button></form><div class="note">Protected Auxo installation</div></main></body></html>

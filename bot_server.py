@@ -23,6 +23,9 @@ import random
 import math
 import os
 import base64
+import hashlib
+import hmac
+import secrets
 import threading
 import time
 import urllib.error
@@ -10573,6 +10576,77 @@ def migrate_to_database():
 
     logger.info(f"Migration complete: {migrated} trades migrated")
 
+# ─── MILESTONE A: SINGLE-USER WEB AUTHENTICATION ────────────────────
+# Configure with AUXO_AUTH_USERNAME, AUXO_AUTH_PASSWORD_HASH and
+# AUXO_SESSION_SECRET. Password hashes use PBKDF2-HMAC-SHA256.
+AUTH_COOKIE_NAME = "auxo_session"
+AUTH_SESSION_SECONDS = int(os.environ.get("AUXO_SESSION_SECONDS", "43200"))
+AUTH_MAX_FAILURES = int(os.environ.get("AUXO_AUTH_MAX_FAILURES", "5"))
+AUTH_LOCKOUT_SECONDS = int(os.environ.get("AUXO_AUTH_LOCKOUT_SECONDS", "300"))
+_AUTH_FAILURES: dict[str, list[float]] = {}
+_AUTH_FAILURES_LOCK = threading.Lock()
+
+def auth_enabled() -> bool:
+    return bool(
+        os.environ.get("AUXO_AUTH_USERNAME", "").strip()
+        and os.environ.get("AUXO_AUTH_PASSWORD_HASH", "").strip()
+        and os.environ.get("AUXO_SESSION_SECRET", "").strip()
+    )
+
+def verify_auth_password(password: str) -> bool:
+    stored = os.environ.get("AUXO_AUTH_PASSWORD_HASH", "").strip()
+    try:
+        scheme, iterations_text, salt_hex, digest_hex = stored.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations_text)
+        ).hex()
+        return hmac.compare_digest(candidate, digest_hex)
+    except Exception:
+        return False
+
+def _auth_signature(payload: str) -> str:
+    secret = os.environ.get("AUXO_SESSION_SECRET", "").encode("utf-8")
+    return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def create_auth_session(username: str) -> str:
+    expires = int(time.time()) + AUTH_SESSION_SECONDS
+    nonce = secrets.token_urlsafe(18)
+    payload = f"{username}|{expires}|{nonce}"
+    encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{encoded}.{_auth_signature(encoded)}"
+
+def validate_auth_session(token: str) -> bool:
+    try:
+        encoded, signature = token.rsplit(".", 1)
+        if not hmac.compare_digest(signature, _auth_signature(encoded)):
+            return False
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        username, expires_text, _nonce = payload.split("|", 2)
+        return (
+            hmac.compare_digest(username, os.environ.get("AUXO_AUTH_USERNAME", ""))
+            and int(expires_text) >= int(time.time())
+        )
+    except Exception:
+        return False
+
+def auth_client_locked(client_ip: str) -> bool:
+    now = time.time()
+    with _AUTH_FAILURES_LOCK:
+        recent = [t for t in _AUTH_FAILURES.get(client_ip, []) if now - t < AUTH_LOCKOUT_SECONDS]
+        _AUTH_FAILURES[client_ip] = recent
+        return len(recent) >= AUTH_MAX_FAILURES
+
+def record_auth_failure(client_ip: str) -> None:
+    with _AUTH_FAILURES_LOCK:
+        _AUTH_FAILURES.setdefault(client_ip, []).append(time.time())
+
+def clear_auth_failures(client_ip: str) -> None:
+    with _AUTH_FAILURES_LOCK:
+        _AUTH_FAILURES.pop(client_ip, None)
+
 # ─── HTTP SERVER ─────────────────────────────────────────────────────
 
 def parse_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
@@ -10588,19 +10662,76 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         self.bot = BotRequestHandler.bot
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
-    def _check_auth(self) -> bool:
-        token = os.environ.get("BOT_API_TOKEN", "")
-        if not token:
-            return True
+    def _cookie_value(self, name: str) -> str:
+        raw = self.headers.get("Cookie", "")
+        for item in raw.split(";"):
+            key, sep, value = item.strip().partition("=")
+            if sep and key == name:
+                return value
+        return ""
+
+    def _is_authenticated(self) -> bool:
+        # Keep the existing bearer-token option for API/automation clients.
+        api_token = os.environ.get("BOT_API_TOKEN", "")
         header = self.headers.get("Authorization", "")
-        expected = f"Bearer {token}"
-        if header == expected:
+        if api_token and hmac.compare_digest(header, f"Bearer {api_token}"):
+            return True
+        if not auth_enabled():
+            return not api_token
+        return validate_auth_session(self._cookie_value(AUTH_COOKIE_NAME))
+
+    def _check_auth(self) -> bool:
+        if self._is_authenticated():
             return True
         self.send_json({"ok": False, "error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
         return False
 
+    def _redirect(self, location: str, status: HTTPStatus = HTTPStatus.SEE_OTHER) -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_login(self, error: str = "") -> None:
+        login_path = WEB_DIR / "login.html"
+        if not login_path.exists():
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Login page missing")
+            return
+        body = login_path.read_text(encoding="utf-8").replace("{{ERROR}}", error)
+        if not error:
+            body = body.replace('<div class="error"></div>', '')
+        encoded = body.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def do_GET(self) -> None:
+        parsed_path = urllib.parse.urlparse(self.path).path
+        if parsed_path == "/login":
+            if self._is_authenticated():
+                self._redirect("/")
+            else:
+                self.send_login()
+            return
+        if parsed_path == "/logout":
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/login")
+            self.send_header("Set-Cookie", f"{AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/api/") and not self._check_auth():
+            return
+        if not self.path.startswith("/api/") and parsed_path != "/favicon.ico" and not self._is_authenticated():
+            self._redirect("/login")
             return
         try:
             if self.path == "/api/status":
@@ -10911,6 +11042,37 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             return
 
     def do_POST(self) -> None:
+        parsed_path = urllib.parse.urlparse(self.path).path
+        if parsed_path == "/login":
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            if auth_client_locked(client_ip):
+                self.send_login("Too many failed attempts. Please wait a few minutes and try again.")
+                return
+            length = min(int(self.headers.get("Content-Length", "0") or 0), 8192)
+            raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+            form = urllib.parse.parse_qs(raw)
+            username = str(form.get("username", [""])[0])
+            password = str(form.get("password", [""])[0])
+            expected_user = os.environ.get("AUXO_AUTH_USERNAME", "")
+            if auth_enabled() and hmac.compare_digest(username, expected_user) and verify_auth_password(password):
+                clear_auth_failures(client_ip)
+                token = create_auth_session(username)
+                secure = os.environ.get("AUXO_AUTH_SECURE_COOKIE", "true").lower() not in {"0", "false", "no"}
+                cookie = f"{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={AUTH_SESSION_SECONDS}; HttpOnly; SameSite=Lax"
+                if secure:
+                    cookie += "; Secure"
+                self.send_response(HTTPStatus.SEE_OTHER)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie", cookie)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                logger.info("Auxo login succeeded for %s from %s", username, client_ip)
+                return
+            record_auth_failure(client_ip)
+            logger.warning("Auxo login failed from %s", client_ip)
+            self.send_login("Invalid username or password.")
+            return
         if not self._check_auth():
             return
         try:
@@ -11136,6 +11298,8 @@ def main() -> None:
     BotRequestHandler.bot = bot
 
     server = ThreadingHTTPServer(("0.0.0.0", port), BotRequestHandler)
+    if not auth_enabled():
+        logger.warning("AUXO WEB AUTH IS NOT CONFIGURED. Set AUXO_AUTH_USERNAME, AUXO_AUTH_PASSWORD_HASH and AUXO_SESSION_SECRET.")
     logger.info(f"Auxo running at http://localhost:{port}")
     print(f"Auxo running at http://localhost:{port}")
     print("Press Ctrl+C to stop.")
