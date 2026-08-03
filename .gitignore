@@ -4,3 +4,13 @@ auth/__pycache__/
 __pycache__/
 
 .env
+
+bot_state.json
+
+bot_audit.jsonl
+
+auxo.log
+
+trades.db
+
+cdp_api_key.json
