@@ -2055,30 +2055,20 @@
             return getComputedStyle(document.body).getPropertyValue(name).trim();
         }
 
+        // Dynamic chart precision. Keep enough decimal places for tight stops/targets
+        // and low-priced assets without making BTC/ETH axes unnecessarily noisy.
         function getPriceFormat(price) {
             if (!price || price <= 0) return { precision: 2, minMove: 0.01 };
             const absPrice = Math.abs(price);
-            let precision, minMove;
-            if (absPrice < 0.0001) {
-                precision = 8;
-                minMove = 0.00000001;
-            } else if (absPrice < 0.001) {
-                precision = 6;
-                minMove = 0.000001;
-            } else if (absPrice < 0.01) {
-                precision = 5;
-                minMove = 0.00001;
-            } else if (absPrice < 1) {
-                precision = 4;
-                minMove = 0.0001;
-            } else if (absPrice < 100) {
-                precision = 2;
-                minMove = 0.01;
-            } else {
-                precision = 2;
-                minMove = 0.01;
-            }
-            return { precision, minMove };
+            let precision;
+            if (absPrice >= 10000) precision = 2;       // BTC-style prices
+            else if (absPrice >= 1000) precision = 3;  // ETH-style prices
+            else if (absPrice >= 100) precision = 4;   // SOL-style prices
+            else if (absPrice >= 1) precision = 5;     // XRP/ATOM-style prices
+            else if (absPrice >= 0.01) precision = 6;  // DOGE-style prices
+            else if (absPrice >= 0.001) precision = 7;
+            else precision = 8;
+            return { precision, minMove: Math.pow(10, -precision) };
         }
 
         const money = v => `${displayCurrency || 'GBP'} ${Number(v || 0).toFixed(2)}`;
@@ -2384,6 +2374,10 @@
                     },
                     rightPriceScale: {
                         borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                        // Keep the visible price range close to the candles/levels so
+                        // small differences between entry, stop and target are legible.
+                        autoScale: true,
+                        scaleMargins: { top: 0.08, bottom: 0.08 },
                     },
                     watermark: { visible: false },
                 });
@@ -2588,8 +2582,14 @@
                 const val = Number(item.value);
                 if (isNaN(val) || val <= 0) return;
 
+                const levelPriceFormat = getPriceFormat(val);
                 const series = chart.addLineSeries({
                     color: item.color,
+                    priceFormat: {
+                        type: 'price',
+                        precision: levelPriceFormat.precision,
+                        minMove: levelPriceFormat.minMove,
+                    },
                     lineWidth: 1,
                     lineStyle: LightweightCharts.LineStyle.Dashed,
                     priceLineVisible: true,
