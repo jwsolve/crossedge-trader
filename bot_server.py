@@ -2376,6 +2376,7 @@ class PaperBot:
                         exit_mode=item.get("exit_mode"),
                         exit_reason=item.get("exit_reason"),
                         regime=item.get("regime"),
+                        learning_context=item.get("learning_context", {}) if isinstance(item.get("learning_context", {}), dict) else {},
                     )
                     for item in raw.get("trades", [])
                 ],
@@ -2816,10 +2817,52 @@ class PaperBot:
 
     # ─── Database-backed Trade Methods ──────────────────────────────
 
+    def build_learning_context(self, symbol: str, price: float, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Capture an immutable entry snapshot for future local/network learning."""
+        settings = dict(settings or self.state.settings)
+        row = dict(self.active_scan_row(symbol) or {})
+        raw_candles = self.state.candle_history.get(symbol, [])
+        candles = []
+        for c in raw_candles[-250:]:
+            try:
+                candles.append(Candle(time=int(c.get("time", 0)), open=float(c["open"]), high=float(c["high"]), low=float(c["low"]), close=float(c["close"]), volume=float(c.get("volume", 0.0))))
+            except (TypeError, ValueError, KeyError, AttributeError):
+                continue
+        closes = [c.close for c in candles]
+        volumes = [c.volume for c in candles if c.volume is not None]
+        rsi = calculate_rsi(closes) if len(closes) >= 15 else None
+        macd_values = calculate_macd(closes) if len(closes) >= 26 else []
+        atr = calculate_atr_from_candles(candles, int(settings.get("atr_period", 14))) if len(candles) >= 2 else None
+        avg_volume = (sum(volumes[-20:]) / len(volumes[-20:])) if volumes[-20:] else 0.0
+        volume_ratio = (volumes[-1] / avg_volume) if volumes and avg_volume > 0 else None
+        granularity = int(settings.get("granularity", settings.get("live_granularity", 3600)))
+        relevant_settings = {k: v for k, v in settings.items() if not any(secret in k.lower() for secret in ("key", "secret", "password", "token"))}
+        return {
+            "schema_version": 1,
+            "strategy": str(settings.get("strategy", "unknown")),
+            "strategy_version": str(settings.get("strategy_version", "1")),
+            "timeframe": granularity_label(granularity),
+            "granularity": granularity,
+            "regime": str(self.state.current_regime.regime if self.state.current_regime else row.get("regime", "unknown")),
+            "settings": relevant_settings,
+            "entry_context": {
+                "rsi": rsi, "macd": macd_values[-1] if macd_values else None, "atr": atr,
+                "atr_pct": (atr / price * 100.0) if atr and price else None, "volume_ratio": volume_ratio,
+                "score": row.get("score"), "base_score": row.get("base_score"), "edge_score": row.get("edge_score"),
+                "support": row.get("support"), "resistance": row.get("resistance"),
+                "support_distance_pct": row.get("support_distance_pct"), "resistance_distance_pct": row.get("resistance_distance_pct"),
+                "reward_risk": row.get("reward_risk"), "signal": row.get("signal"),
+            },
+            "entry": {"signal_price": price, "fill_price": price, "fee": 0.0, "slippage_pct": 0.0, "time": now_iso()},
+            "risk": {},
+        }
+
     def record_trade(self, trade: Trade, pnl: float = 0.0) -> None:
         with self.lock:
             trade.pnl = pnl
-            if trade.entry_price and trade.exit_price and trade.entry_price > 0:
+            if trade.learning_context.get("exit", {}).get("net_pnl_pct") is not None:
+                trade.pnl_pct = float(trade.learning_context["exit"]["net_pnl_pct"])
+            elif trade.entry_price and trade.exit_price and trade.entry_price > 0:
                 trade.pnl_pct = pct(trade.exit_price - trade.entry_price, trade.entry_price)
 
             self.state.trades.append(trade)
@@ -3988,7 +4031,12 @@ class PaperBot:
                     exit_price=fill_price,
                     exit_reason=reason,
                     regime=self.state.current_regime.regime if self.state.current_regime else None,
+                    learning_context=dict(self.state.positions.get(symbol, {}).get("learning_context", {})),
                 )
+                trade.learning_context.setdefault("entry", {}).update({"fill_price": price, "fee": fee_paid, "slippage_pct": 0.0})
+                trade.learning_context.setdefault("risk", {}).update({"stop": stop_price, "target": target_price, "reward_risk": (abs(target_price-price)/abs(price-stop_price)) if stop_price and target_price and abs(price-stop_price) > 0 else None})
+                if symbol in self.state.positions:
+                    self.state.positions[symbol]["learning_context"] = dict(trade.learning_context)
                 self.record_trade(trade)
 
                 self.journal(symbol, "INFO", f"OANDA manual close: {reason} at {fill_price:.6f}", fill_price, {"pnl": pnl})
@@ -4074,7 +4122,12 @@ class PaperBot:
                     exit_price=filled_price,
                     exit_reason=reason,
                     regime=self.state.current_regime.regime if self.state.current_regime else None,
+                    learning_context=dict(self.state.positions.get(symbol, {}).get("learning_context", {})),
                 )
+                trade.learning_context.setdefault("entry", {}).update({"fill_price": price, "fee": fee_paid, "slippage_pct": 0.0})
+                trade.learning_context.setdefault("risk", {}).update({"stop": stop_price, "target": target_price, "reward_risk": (abs(target_price-price)/abs(price-stop_price)) if stop_price and target_price and abs(price-stop_price) > 0 else None})
+                if symbol in self.state.positions:
+                    self.state.positions[symbol]["learning_context"] = dict(trade.learning_context)
                 self.record_trade(trade)
 
                 self.journal(symbol, "INFO", f"Coinbase manual close: {reason} at {filled_price:.6f}", filled_price, {"pnl": pnl})
@@ -5450,6 +5503,13 @@ class PaperBot:
             current_highest = max(highest_price or price, price)
 
             position = positions.get(symbol, {})
+            # Track intra-trade excursion continuously for future learning (MFE/MAE).
+            if symbol in self.state.positions:
+                with self.lock:
+                    live_pos = self.state.positions[symbol]
+                    live_pos["highest_price"] = max(float(live_pos.get("highest_price") or price), price)
+                    live_pos["lowest_price"] = min(float(live_pos.get("lowest_price") or price), price)
+                    self.state.highest_price = live_pos["highest_price"]
 
             # Use the protective levels captured when this position was opened.
             # Recalculating ATR exits on every decision cycle can widen the stop as
@@ -5669,6 +5729,8 @@ class PaperBot:
                     "opened_at": now_iso(),
                     "is_short": True,
                     "entry_time": time.time(),
+                    "lowest_price": price,
+                    "learning_context": self.build_learning_context(symbol, price, settings),
                 }
 
                 trade = Trade(
@@ -5720,6 +5782,8 @@ class PaperBot:
                     "opened_at": now_iso(),
                     "is_short": False,
                     "entry_time": time.time(),
+                    "lowest_price": price,
+                    "learning_context": self.build_learning_context(symbol, price, settings),
                 }
 
                 trade = Trade(
@@ -5829,6 +5893,29 @@ class PaperBot:
             self.state.last_action_time = time.time()
             side = "SELL" if not is_short else "BUY"
 
+            learning_context = dict(position.get("learning_context", {}) or {})
+            opened_ts = float(position.get("entry_time") or time.time())
+            duration_seconds = max(0.0, time.time() - opened_ts)
+            highest_seen = float(position.get("highest_price") or max(entry_price, price))
+            lowest_seen = float(position.get("lowest_price") or min(entry_price, price))
+            if is_short:
+                mfe_pct = ((entry_price - lowest_seen) / entry_price * 100.0) if entry_price else 0.0
+                mae_pct = ((highest_seen - entry_price) / entry_price * 100.0) if entry_price else 0.0
+            else:
+                mfe_pct = ((highest_seen - entry_price) / entry_price * 100.0) if entry_price else 0.0
+                mae_pct = ((entry_price - lowest_seen) / entry_price * 100.0) if entry_price else 0.0
+            entry_fee_total = float(learning_context.get("entry", {}).get("fee") or 0.0)
+            entry_qty = abs(float(position.get("quantity") or sold_quantity))
+            allocated_entry_fee = entry_fee_total * min(1.0, sold_quantity / entry_qty) if entry_qty > 0 else 0.0
+            net_pnl = pnl - fee_paid - allocated_entry_fee
+            net_pnl_pct = (net_pnl / (entry_price * sold_quantity) * 100.0) if entry_price > 0 and sold_quantity > 0 else 0.0
+            learning_context["exit"] = {
+                "fill_price": price, "fee": fee_paid, "reason": reason, "time": now_iso(),
+                "holding_seconds": duration_seconds, "gross_pnl": pnl, "entry_fee_allocated": allocated_entry_fee,
+                "total_fees": allocated_entry_fee + fee_paid, "net_pnl": net_pnl, "net_pnl_pct": net_pnl_pct,
+                "mfe_pct": mfe_pct, "mae_pct": mae_pct, "highest_price": highest_seen, "lowest_price": lowest_seen,
+            }
+
             trade = Trade(
                 time=now_iso(),
                 side=side,
@@ -5843,7 +5930,7 @@ class PaperBot:
                 exchange_order_status=exchange_order_status,
                 exchange_average_filled_price=exchange_average_filled_price,
                 exchange_filled_size=sold_quantity if exchange_order_id else None,
-                pnl=pnl,
+                pnl=net_pnl,
                 entry_price=entry_price,
                 exit_price=price,
                 stop_loss_price=position.get('stop_price'),
@@ -5851,8 +5938,10 @@ class PaperBot:
                 exit_mode=position.get('exit_mode'),
                 exit_reason=reason,
                 regime=self.state.current_regime.regime if self.state.current_regime else None,
+                learning_context=learning_context,
             )
-            self.record_trade(trade)
+            trade.pnl_pct = net_pnl_pct
+            self.record_trade(trade, pnl=net_pnl)
 
             self.record_setup_sell(
                 symbol,

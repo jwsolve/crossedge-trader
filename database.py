@@ -71,6 +71,7 @@ class Trade:
     exit_mode: str | None = None
     exit_reason: str | None = None
     regime: str | None = None
+    learning_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -147,7 +148,6 @@ class ManagedOrder:
     quote_size: float | None = None
     reason: str = ""
     details: dict[str, Any] = field(default_factory=dict)
-    client_order_id: str | None = None
 
 
 @dataclass
@@ -269,6 +269,7 @@ class BotDatabase:
                     exit_mode TEXT,
                     exit_reason TEXT,
                     regime TEXT,
+                    learning_context TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -281,6 +282,7 @@ class BotDatabase:
                 ('stop_loss_price', 'REAL'),
                 ('take_profit_price', 'REAL'),
                 ('exit_mode', 'TEXT'),
+                ('learning_context', 'TEXT'),
             ]:
                 if col not in columns:
                     cursor.execute(f'ALTER TABLE trades ADD COLUMN {col} {col_type}')
@@ -433,8 +435,8 @@ class BotDatabase:
                     cash_after, coin_after, reason, fee_paid,
                     pnl, pnl_pct, entry_price, exit_price,
                     exchange_order_id, exchange_order_status,
-                    stop_loss_price, take_profit_price, exit_mode, exit_reason, regime
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stop_loss_price, take_profit_price, exit_mode, exit_reason, regime, learning_context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_id,
                 trade.time,
@@ -457,6 +459,7 @@ class BotDatabase:
                 getattr(trade, 'exit_mode', None),
                 getattr(trade, 'exit_reason', None),
                 getattr(trade, 'regime', None),
+                json.dumps(getattr(trade, 'learning_context', {}) or {}, separators=(',', ':'), default=str),
             ))
 
             return cursor.lastrowid
@@ -480,7 +483,17 @@ class BotDatabase:
                     LIMIT ?
                 ''', (limit,))
 
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+            for item in rows:
+                raw_context = item.get("learning_context")
+                if isinstance(raw_context, str) and raw_context:
+                    try:
+                        item["learning_context"] = json.loads(raw_context)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        item["learning_context"] = {}
+                elif not isinstance(raw_context, dict):
+                    item["learning_context"] = {}
+            return rows
 
     def get_trade_stats(self, symbol: Optional[str] = None) -> dict:
         with sqlite3.connect(self.db_path) as conn:
