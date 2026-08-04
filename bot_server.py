@@ -11038,8 +11038,45 @@ def _cookie_value(header: str,name: str) -> str | None:
         if sep and k==name:return v
     return None
 
+class EngineManager:
+    """Account-scoped registry for Auxo trading engines.
+
+    D1 provisions only the existing owner account (account_id=1). This creates
+    the multi-engine routing boundary without changing PaperBot trading logic.
+    """
+    def __init__(self) -> None:
+        self._engines: dict[int, PaperBot] = {}
+        self._lock = threading.RLock()
+
+    def register_engine(self, account_id: int, engine: PaperBot) -> None:
+        account_id = int(account_id)
+        with self._lock:
+            existing = self._engines.get(account_id)
+            if existing is not None and existing is not engine:
+                raise RuntimeError(f"Trading engine already registered for account {account_id}")
+            self._engines[account_id] = engine
+
+    def get_engine(self, account_id: int) -> PaperBot | None:
+        with self._lock:
+            return self._engines.get(int(account_id))
+
+    def require_engine(self, account_id: int) -> PaperBot:
+        engine = self.get_engine(account_id)
+        if engine is None:
+            raise KeyError(f"No trading engine provisioned for account {int(account_id)}")
+        return engine
+
+    def has_engine(self, account_id: int) -> bool:
+        return self.get_engine(account_id) is not None
+
+    def account_ids(self) -> list[int]:
+        with self._lock:
+            return sorted(self._engines)
+
+
 class BotRequestHandler(SimpleHTTPRequestHandler):
     bot: PaperBot
+    engine_manager: EngineManager
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.bot = BotRequestHandler.bot
@@ -11062,7 +11099,34 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if not u:self.send_json({"ok":False,"error":"Unauthorized"},HTTPStatus.UNAUTHORIZED); return False
         self.current_user=u; self.current_user_id=int(u["id"]); return True
     def _require_owner_engine_context(self) -> bool:
-        if int(getattr(self,"current_user_id",0))!=1:self.send_json({"ok":False,"error":"Trading engine is not yet provisioned for this user"},HTTPStatus.FORBIDDEN); return False
+        if int(getattr(self, "current_user_id", 0)) != 1:
+            self.send_json(
+                {"ok": False, "error": "Trading engine is not yet provisioned for this user"},
+                HTTPStatus.FORBIDDEN,
+            )
+            return False
+
+        account = db.default_account_for_user(self.current_user_id)
+        if not account:
+            self.send_json(
+                {"ok": False, "error": "No enabled trading account for authenticated user"},
+                HTTPStatus.FORBIDDEN,
+            )
+            return False
+
+        account_id = int(account["id"])
+        engine = self.engine_manager.get_engine(account_id)
+        if engine is None:
+            self.send_json(
+                {"ok": False, "error": f"No trading engine provisioned for account {account_id}"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return False
+
+        # D1 compatibility binding: existing endpoint implementations still use
+        # self.bot, but the instance now comes from account-scoped EngineManager.
+        self.bot = engine
+        self.current_account_id = account_id
         return True
     def _request_account_context(self) -> dict[str, Any] | None:
         """Resolve account only from accounts owned by the authenticated user."""
@@ -11102,7 +11166,11 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/account-context":
             ctx = self._request_account_context()
             if ctx is not None:
-                self.send_json({"ok": True, "context": ctx})
+                self.send_json({
+                    "ok": True,
+                    "context": ctx,
+                    "engine_provisioned": self.engine_manager.has_engine(ctx["account_id"]),
+                })
             return
 
         if self.path == "/api/user-settings":
@@ -11720,19 +11788,22 @@ def main() -> None:
     port = int(os.environ.get("PORT", "8080"))
     bot = PaperBot()
 
-    # Authentication and the trading engine must share the same BotDatabase
-    # instance.  The auth request handlers refer to the module-level `db`.
+    # Authentication and trading share the same database.
     db = bot.db
 
-    # Seed the per-account settings record from the current baseline state.
-    # bot_state.json remains authoritative during Milestone C, so trading
-    # behaviour is unchanged.
+    # D1: account-scoped engine registry. Only the existing owner account is
+    # provisioned, so no second live engine can start yet.
+    engine_manager = EngineManager()
+    engine_manager.register_engine(1, bot)
+
+    # bot_state.json remains authoritative in D1; trading behaviour is unchanged.
     try:
         db.ensure_user_settings(1, 1, dict(bot.state.settings))
     except Exception as exc:
         logger.warning(f"Could not seed owner user_settings: {exc}")
 
-    BotRequestHandler.bot = bot
+    BotRequestHandler.engine_manager = engine_manager
+    BotRequestHandler.bot = engine_manager.require_engine(1)
 
     server = ThreadingHTTPServer(("0.0.0.0", port), BotRequestHandler)
     logger.info(f"Auxo running at http://localhost:{port}")
