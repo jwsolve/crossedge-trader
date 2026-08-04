@@ -11064,14 +11064,84 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
     def _require_owner_engine_context(self) -> bool:
         if int(getattr(self,"current_user_id",0))!=1:self.send_json({"ok":False,"error":"Trading engine is not yet provisioned for this user"},HTTPStatus.FORBIDDEN); return False
         return True
+    def _request_account_context(self) -> dict[str, Any] | None:
+        """Resolve account only from accounts owned by the authenticated user."""
+        user_id = int(getattr(self, "current_user_id", 0))
+        account = db.default_account_for_user(user_id)
+        if not account:
+            self.send_json({"ok": False, "error": "No enabled trading account for authenticated user"}, HTTPStatus.FORBIDDEN)
+            return None
+        return {
+            "user_id": user_id,
+            "account_id": int(account["id"]),
+            "exchange": account.get("exchange"),
+            "account_label": account.get("account_label"),
+        }
+
+    def _require_owner_get_context(self) -> bool:
+        # Until EngineManager exists, global engine/status endpoints must never
+        # expose user 1's state to another authenticated user.
+        return self._require_owner_engine_context()
 
     def do_GET(self) -> None:
         if self.path == "/api/auth/me":
-            u=self._authenticated_user(); self.send_json({"ok":True,"authenticated":bool(u),"auth_configured":db.owner_auth_configured(),"user":u,"accounts":db.trading_accounts_for_user(u["id"]) if u else []}); return
+            u = self._authenticated_user()
+            accounts = db.trading_accounts_for_user(u["id"]) if u else []
+            default_account = db.default_account_for_user(u["id"]) if u else None
+            self.send_json({
+                "ok": True,
+                "authenticated": bool(u),
+                "auth_configured": db.owner_auth_configured(),
+                "user": u,
+                "accounts": accounts,
+                "default_account_id": int(default_account["id"]) if default_account else None,
+            })
+            return
         if self.path.startswith("/api/") and not self._check_auth(): return
+
+        if self.path == "/api/account-context":
+            ctx = self._request_account_context()
+            if ctx is not None:
+                self.send_json({"ok": True, "context": ctx})
+            return
+
+        if self.path == "/api/user-settings":
+            ctx = self._request_account_context()
+            if ctx is None:
+                return
+            self.send_json({
+                "ok": True,
+                "context": ctx,
+                "settings": db.get_user_settings(ctx["user_id"], ctx["account_id"]),
+            })
+            return
+
+        if self.path.startswith("/api/user-trades"):
+            ctx = self._request_account_context()
+            if ctx is None:
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            symbol = query.get("symbol", [None])[0]
+            try:
+                limit = max(1, min(5000, int(query.get("limit", ["250"])[0])))
+            except (TypeError, ValueError):
+                limit = 250
+            rows = db.get_trades(
+                symbol=symbol,
+                limit=limit,
+                user_id=ctx["user_id"],
+                account_id=ctx["account_id"],
+            )
+            self.send_json({"ok": True, "context": ctx, "trades": rows})
+            return
+
         if self.path in {"/","/index.html"} and self._authenticated_user() is None:
             self.send_response(HTTPStatus.FOUND); self.send_header("Location","/login.html"); self.end_headers(); return
         try:
+            if self.path.startswith("/api/") and not self._require_owner_get_context():
+                return
+
             if self.path == "/api/status":
                 try:
                     self.send_json(self.bot.snapshot())
@@ -11403,6 +11473,19 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if raw:db.revoke_auth_session(_session_token_hash(raw))
             self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._clear_auth_cookie(); self.end_headers(); self.wfile.write(b'{"ok":true}'); return
         if not self._check_auth(): return
+
+        if self.path == "/api/user-settings":
+            ctx = self._request_account_context()
+            if ctx is None:
+                return
+            payload = parse_json_body(self)
+            if not isinstance(payload, dict):
+                self.send_json({"ok": False, "error": "Settings payload must be an object"}, HTTPStatus.BAD_REQUEST)
+                return
+            db.save_user_settings(ctx["user_id"], ctx["account_id"], payload)
+            self.send_json({"ok": True, "context": ctx})
+            return
+
         if not self._require_owner_engine_context(): return
         try:
             if self.path == "/api/start":
@@ -11441,7 +11524,18 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 return
 
             if self.path == "/api/settings":
-                self.bot.update_settings(parse_json_body(self))
+                payload = parse_json_body(self)
+                self.bot.update_settings(payload)
+                # Milestone C mirrors the authoritative owner engine settings
+                # into account-scoped storage without changing trading behaviour.
+                ctx = self._request_account_context()
+                if ctx is None:
+                    return
+                db.save_user_settings(
+                    ctx["user_id"],
+                    ctx["account_id"],
+                    dict(self.bot.state.settings),
+                )
                 self.send_json({"ok": True})
                 return
 
@@ -11629,6 +11723,14 @@ def main() -> None:
     # Authentication and the trading engine must share the same BotDatabase
     # instance.  The auth request handlers refer to the module-level `db`.
     db = bot.db
+
+    # Seed the per-account settings record from the current baseline state.
+    # bot_state.json remains authoritative during Milestone C, so trading
+    # behaviour is unchanged.
+    try:
+        db.ensure_user_settings(1, 1, dict(bot.state.settings))
+    except Exception as exc:
+        logger.warning(f"Could not seed owner user_settings: {exc}")
 
     BotRequestHandler.bot = bot
 

@@ -502,6 +502,78 @@ class BotDatabase:
             conn.row_factory=sqlite3.Row
             return [dict(r) for r in conn.execute("SELECT id,user_id,exchange,account_label,enabled FROM trading_accounts WHERE user_id=? ORDER BY id",(int(user_id),)).fetchall()]
 
+    # ─── MILESTONE C: USER / ACCOUNT ISOLATION ───────────────────────
+
+    def get_trading_account(self, account_id: int) -> dict[str, Any] | None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id,user_id,exchange,account_label,enabled,created_at,updated_at "
+                "FROM trading_accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def account_belongs_to_user(self, user_id: int, account_id: int) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM trading_accounts WHERE id=? AND user_id=? AND enabled=1",
+                (int(account_id), int(user_id)),
+            ).fetchone()
+            return bool(row)
+
+    def default_account_for_user(self, user_id: int) -> dict[str, Any] | None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id,user_id,exchange,account_label,enabled,created_at,updated_at "
+                "FROM trading_accounts WHERE user_id=? AND enabled=1 ORDER BY id LIMIT 1",
+                (int(user_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_user_settings(self, user_id: int, account_id: int) -> dict[str, Any]:
+        if not self.account_belongs_to_user(user_id, account_id):
+            raise PermissionError("Trading account does not belong to authenticated user")
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT settings_json FROM user_settings WHERE user_id=? AND account_id=?",
+                (int(user_id), int(account_id)),
+            ).fetchone()
+        if not row or not row[0]:
+            return {}
+        try:
+            value = json.loads(row[0])
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def save_user_settings(self, user_id: int, account_id: int, settings: dict[str, Any]) -> None:
+        if not self.account_belongs_to_user(user_id, account_id):
+            raise PermissionError("Trading account does not belong to authenticated user")
+        payload = json.dumps(settings or {}, separators=(",", ":"), default=str)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO user_settings(user_id,account_id,settings_json,updated_at)
+                   VALUES (?,?,?,CURRENT_TIMESTAMP)
+                   ON CONFLICT(user_id,account_id) DO UPDATE SET
+                     settings_json=excluded.settings_json,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (int(user_id), int(account_id), payload),
+            )
+            conn.commit()
+
+    def ensure_user_settings(self, user_id: int, account_id: int, settings: dict[str, Any]) -> None:
+        if not self.account_belongs_to_user(user_id, account_id):
+            raise PermissionError("Trading account does not belong to authenticated user")
+        with sqlite3.connect(self.db_path) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM user_settings WHERE user_id=? AND account_id=?",
+                (int(user_id), int(account_id)),
+            ).fetchone()
+        if not exists:
+            self.save_user_settings(user_id, account_id, settings)
+
     def save_trade(self, trade) -> int:
         trade_id = getattr(trade, 'trade_id', None) or str(uuid.uuid4())
 
@@ -548,36 +620,53 @@ class BotDatabase:
 
             return cursor.lastrowid
 
-    def get_trades(self, symbol: Optional[str] = None, limit: int = 100) -> list[dict]:
+    def get_trades(
+        self,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        user_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+    ) -> list[dict]:
+        """Read trades, optionally scoped to an authenticated user/account.
+
+        Existing engine callers that omit user_id/account_id retain their current
+        behaviour. HTTP/user-facing callers should always supply both.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(int(user_id))
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(int(account_id))
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM trades{where} ORDER BY time DESC LIMIT ?",
+                    tuple(params),
+                ).fetchall()
+            ]
 
-            if symbol:
-                cursor.execute('''
-                    SELECT * FROM trades
-                    WHERE symbol = ?
-                    ORDER BY time DESC
-                    LIMIT ?
-                ''', (symbol, limit))
-            else:
-                cursor.execute('''
-                    SELECT * FROM trades
-                    ORDER BY time DESC
-                    LIMIT ?
-                ''', (limit,))
-
-            rows = [dict(row) for row in cursor.fetchall()]
-            for item in rows:
-                raw_context = item.get("learning_context")
-                if isinstance(raw_context, str) and raw_context:
-                    try:
-                        item["learning_context"] = json.loads(raw_context)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        item["learning_context"] = {}
-                elif not isinstance(raw_context, dict):
+        for item in rows:
+            raw_context = item.get("learning_context")
+            if isinstance(raw_context, str) and raw_context:
+                try:
+                    item["learning_context"] = json.loads(raw_context)
+                except (TypeError, ValueError, json.JSONDecodeError):
                     item["learning_context"] = {}
-            return rows
+            elif not isinstance(raw_context, dict):
+                item["learning_context"] = {}
+        return rows
 
     def get_trade_stats(self, symbol: Optional[str] = None) -> dict:
         with sqlite3.connect(self.db_path) as conn:
@@ -614,14 +703,6 @@ class BotDatabase:
                 total = result[0] or 0
                 wins = result[1] or 0
                 losses = result[2] or 0
-                gross_profit = float(result[5] or 0.0)
-                gross_loss = float(result[6] or 0.0)
-
-                profit_factor = (
-                    abs(gross_profit / gross_loss)
-                    if gross_loss != 0
-                    else 0.0
-                )
                 return {
                     'total_trades': total,
                     'winning_trades': wins,
@@ -631,7 +712,7 @@ class BotDatabase:
                     'avg_win': result[5] or 0.0,
                     'avg_loss': result[6] or 0.0,
                     'win_rate': (wins / total * 100) if total > 0 else 0.0,
-                    'profit_factor': profit_factor,
+                    'profit_factor': abs(result[5] / result[6]) if result[6] and result[6] != 0 else 0,
                 }
             return {}
 
