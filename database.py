@@ -614,6 +614,14 @@ class BotDatabase:
                 total = result[0] or 0
                 wins = result[1] or 0
                 losses = result[2] or 0
+                gross_profit = float(result[5] or 0.0)
+                gross_loss = float(result[6] or 0.0)
+
+                profit_factor = (
+                    abs(gross_profit / gross_loss)
+                    if gross_loss != 0
+                    else 0.0
+                )
                 return {
                     'total_trades': total,
                     'winning_trades': wins,
@@ -623,7 +631,7 @@ class BotDatabase:
                     'avg_win': result[5] or 0.0,
                     'avg_loss': result[6] or 0.0,
                     'win_rate': (wins / total * 100) if total > 0 else 0.0,
-                    'profit_factor': abs(result[5] / result[6]) if result[6] and result[6] != 0 else 0,
+                    'profit_factor': profit_factor,
                 }
             return {}
 
