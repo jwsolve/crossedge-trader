@@ -73,6 +73,28 @@ from exchange_connectors import (
 from expectancy_engine import ExpectancyEngine
 from regime_detector import RegimeDetector, RegimeResult
 
+# ─── D2 ACCOUNT-SCOPED STATE ───────────────────────────────────────
+STATE_DIR = BASE_DIR / "state"
+
+def account_state_file(account_id: int) -> Path:
+    return STATE_DIR / f"account_{int(account_id)}.json"
+
+def migrate_legacy_state_to_account(account_id: int = 1) -> Path:
+    """Copy legacy bot_state.json into isolated account state once.
+
+    The legacy file is deliberately retained for rollback. Existing account
+    state is never overwritten, making this migration idempotent.
+    """
+    import shutil
+    target = account_state_file(account_id)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return target
+    if STATE_FILE.exists():
+        shutil.copy2(STATE_FILE, target)
+        logger.info("Copied legacy state %s -> %s; legacy file retained", STATE_FILE, target)
+    return target
+
 # ─── Logging Setup ───
 logging.basicConfig(
     level=logging.INFO,
@@ -1733,7 +1755,10 @@ def rsi_series(values: list[float], window: int) -> list[float | None]:
 
 # ─── PAPER BOT CLASS ──────────────────────────────────────────────
 class PaperBot:
-    def __init__(self) -> None:
+    def __init__(self, account_id: int = 1, state_file: Path | None = None) -> None:
+        self.account_id = int(account_id)
+        self.state_file = Path(state_file) if state_file is not None else account_state_file(self.account_id)
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.state = self.load_state()
         self.quote_currency = self.state.settings.get("quote_currency", "GBP")
@@ -1755,8 +1780,8 @@ class PaperBot:
         self.regime_detector = RegimeDetector(lookback=100)
 
         # Migrate existing data if needed
-        if STATE_FILE.exists() and not self.state.db_initialized:
-            migrate_to_database()
+        if self.state_file.exists() and not self.state.db_initialized:
+            migrate_to_database(self.state_file)
             self.state.db_initialized = True
             self.save_state()
 
@@ -2352,7 +2377,7 @@ class PaperBot:
     # ─── Load/Save State ─────────────────────────────────────────────
 
     def load_state(self) -> BotState:
-        if not STATE_FILE.exists():
+        if not self.state_file.exists():
             state = BotState()
             state.day_start_date = today_key()
             state.peak_equity = float(state.settings["starting_cash"])
@@ -2362,7 +2387,7 @@ class PaperBot:
             return state
 
         try:
-            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
             state = BotState(
                 running=False,
                 settings={**DEFAULT_SETTINGS, **raw.get("settings", {})},
@@ -2567,7 +2592,7 @@ class PaperBot:
     def save_state(self) -> None:
         with self.lock:
             data = asdict(self.state)
-        STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self.state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         logger.debug("State saved")
 
     def backfill_tpsl_from_positions(self) -> None:
@@ -10952,15 +10977,16 @@ def coinbase_quote_comparison(settings: dict[str, Any]) -> dict[str, Any]:
 
 # ─── MIGRATION FUNCTION ────────────────────────────────────────────
 
-def migrate_to_database():
-    if not STATE_FILE.exists():
+def migrate_to_database(state_file: Path | None = None):
+    source_state_file = Path(state_file) if state_file is not None else STATE_FILE
+    if not source_state_file.exists():
         logger.info("No state file to migrate")
         return
 
     db = BotDatabase()
 
     try:
-        with open(STATE_FILE, 'r') as f:
+        with open(source_state_file, 'r') as f:
             data = json.load(f)
     except Exception as e:
         logger.error(f"Failed to load state file: {e}")
@@ -11786,7 +11812,8 @@ def coinbase_private_key_source() -> str:
 def main() -> None:
     global db
     port = int(os.environ.get("PORT", "8080"))
-    bot = PaperBot()
+    owner_state_file = migrate_legacy_state_to_account(1)
+    bot = PaperBot(account_id=1, state_file=owner_state_file)
 
     # Authentication and trading share the same database.
     db = bot.db
@@ -11796,7 +11823,7 @@ def main() -> None:
     engine_manager = EngineManager()
     engine_manager.register_engine(1, bot)
 
-    # bot_state.json remains authoritative in D1; trading behaviour is unchanged.
+    # state/account_1.json is authoritative in D2; trading behaviour is unchanged.
     try:
         db.ensure_user_settings(1, 1, dict(bot.state.settings))
     except Exception as exc:
