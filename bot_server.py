@@ -242,6 +242,9 @@ DEFAULT_SETTINGS = {
     "coinbase_maker_first_enabled": True,
     "coinbase_maker_offset_pct": 0.00,
     "coinbase_maker_market_fallback": True,
+    "kraken_maker_first_enabled": True,
+    "kraken_maker_offset_pct": 0.00,
+    "kraken_maker_market_fallback": True,
     "native_stop_enabled": False,
     "max_live_order_gbp": 5.0,
     "max_daily_live_loss_gbp": 25.0,  # legacy key: now means max DAILY P/L loss in quote currency
@@ -6579,6 +6582,24 @@ class PaperBot:
             "risk_pnl": realised + unrealised,
         }
 
+    def live_exchange(self) -> str:
+        return str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+
+    def live_available_balance(self,currency:str)->float:
+        return kraken_available_balance(currency) if self.live_exchange()=="kraken" else coinbase_available_balance(currency)
+
+    def live_round_price(self,v,symbol,quote):
+        return kraken_round_price(v,symbol,quote) if self.live_exchange()=="kraken" else self.coinbase_round_price(v,f"{symbol}-{quote}")
+
+    def live_round_size(self,v,symbol,quote):
+        return kraken_round_size(v,symbol,quote) if self.live_exchange()=="kraken" else self.coinbase_round_size(v,f"{symbol}-{quote}")
+
+    def live_reconcile(self,oid):
+        return kraken_reconcile_order(oid) if self.live_exchange()=="kraken" else coinbase_reconcile_order(oid)
+
+    def live_cancel(self,oid):
+        return kraken_cancel_order(oid) if self.live_exchange()=="kraken" else coinbase_cancel_orders([oid])
+
     def coinbase_maker_exit_allowed(self, reason: str) -> bool:
         """Only profit-taking exits may wait on a maker order.
 
@@ -6704,7 +6725,7 @@ class PaperBot:
                 self.journal(symbol, "BLOCK", self.state.last_signal, price, guard)
             return
 
-        gbp_available = coinbase_available_balance(settings["quote_currency"])
+        gbp_available = self.live_available_balance(settings["quote_currency"])
         if gbp_available < quote_size:
             with self.lock:
                 self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: only {settings['quote_currency']} {gbp_available:.2f} available"
@@ -6714,15 +6735,13 @@ class PaperBot:
         product_id = f"{symbol}-{settings['quote_currency']}"
         order_type = str(settings.get("live_order_type", "market"))
         limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
-        maker_first = (
-            bool(settings.get("coinbase_maker_first_enabled", True))
-            and str(settings.get("active_exchange", "coinbase")).lower() == "coinbase"
-        )
-        maker_offset = max(0.0, float(settings.get("coinbase_maker_offset_pct", 0.0))) / 100.0
+        active_exchange = str(settings.get("active_exchange") or settings.get("exchange") or "coinbase").lower()
+        maker_first = ((active_exchange=="coinbase" and settings.get("coinbase_maker_first_enabled",True)) or
+                       (active_exchange=="kraken" and settings.get("kraken_maker_first_enabled",True)))
+        maker_offset = max(0.0,float(settings.get("kraken_maker_offset_pct" if active_exchange=="kraken" else "coinbase_maker_offset_pct",0.0)))/100
         if maker_first:
             order_type = "maker"
 
-        active_exchange = settings.get("active_exchange", "coinbase")
         connector = self.connectors.get(active_exchange)
         if not connector:
             raise RuntimeError(f"No connector available for {active_exchange}")
@@ -6745,13 +6764,13 @@ class PaperBot:
                     if bid <= 0 or ask <= 0:
                         raise RuntimeError("Maker-first entry requires a valid Coinbase bid/ask")
                     raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
-                    limit_price = self.coinbase_round_price(raw_maker_price, product_id)
+                    limit_price = self.live_round_price(raw_maker_price,symbol,str(settings["quote_currency"]))
                 else:
                     best_price, _, _ = self.price_aggregator.get_best_price(symbol, side=side)
                     if side == "BUY":
-                        limit_price = self.coinbase_round_price(best_price * (1 + limit_offset), product_id)
+                        limit_price = self.live_round_price(best_price*(1+limit_offset),symbol,str(settings["quote_currency"]))
                     else:
-                        limit_price = self.coinbase_round_price(best_price * (1 - limit_offset), product_id)
+                        limit_price = self.live_round_price(best_price*(1-limit_offset),symbol,str(settings["quote_currency"]))
 
                 ok, volume, recommended = self.price_aggregator.check_liquidity(symbol, side, quote_size)
                 if not ok:
@@ -6761,8 +6780,9 @@ class PaperBot:
                     return
 
                 base_size = quote_size / limit_price if limit_price > 0 else 0.0
-                base_size = self.coinbase_round_size(base_size, product_id)
-                order = coinbase_limit_order(product_id, side, base_size, limit_price, post_only=(order_type == "maker"))
+                base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
+                order = (kraken_order(symbol,str(settings["quote_currency"]),side,"limit",base_size,limit_price,order_type=="maker")
+                         if active_exchange=="kraken" else coinbase_limit_order(product_id,side,base_size,limit_price,post_only=(order_type=="maker")))
 
             else:
                 # For Coinbase, submit through Auxo's native order helper so the
@@ -6778,21 +6798,24 @@ class PaperBot:
                     else:
                         best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
                         base_size = quote_size / best_price if best_price > 0 else 0.0
-                        base_size = self.coinbase_round_size(base_size, product_id)
+                        base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
                         order = coinbase_market_order(
                             product_id=product_id,
                             side=side,
                             base_size=base_size,
                         )
+                elif active_exchange == "kraken":
+                    px=float(guard.get("ask") if side=="BUY" else guard.get("bid") or price)
+                    base_size=self.live_round_size(quote_size/px,symbol,str(settings["quote_currency"]))
+                    order=kraken_order(symbol,str(settings["quote_currency"]),side,"market",base_size)
                 else:
-                    # Preserve the existing connector path for non-Coinbase
-                    # exchanges. These connectors have their own order IDs.
+                    # Preserve the existing connector path for other exchanges.
                     if side == "BUY":
                         raw_order = connector.market_buy(symbol, quote_size)
                     else:
                         best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
                         base_size = quote_size / best_price if best_price > 0 else 0.0
-                        base_size = self.coinbase_round_size(base_size, product_id)
+                        base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
                         raw_order = connector.market_sell(symbol, base_size)
 
                     try:
@@ -6801,7 +6824,7 @@ class PaperBot:
                         order_id = str(uuid.uuid4())
                     order = {"order_id": order_id, "raw": raw_order}
 
-            order_id = coinbase_order_id(order)
+            order_id = str(order["order_id"]) if active_exchange=="kraken" else coinbase_order_id(order)
             managed = self.track_order(
                 order_id,
                 symbol,
@@ -6813,7 +6836,7 @@ class PaperBot:
                 base_size=base_size if order_type != "market" else None,
                 quote_size=quote_size,
                 reason=f"{reason} | size {spend_reason}",
-                client_order_id=order.get("client_order_id"),
+                client_order_id=order.get("client_order_id") if active_exchange=="coinbase" else None,
                 details={
                     "native_stop_requested": bool(settings.get("native_stop_enabled")) or order_type in {"bracket", "native_stop_scaffold"},
                     "stop_price": stop_price,
@@ -6821,7 +6844,7 @@ class PaperBot:
                     "is_short": is_short,
                 },
             )
-            fill = coinbase_reconcile_order(order_id)
+            fill = self.live_reconcile(order_id)
             if self.apply_reconciled_order(managed, fill):
                 return
             if fill["filled_size"] <= 0:
@@ -6850,7 +6873,8 @@ class PaperBot:
         # to determine the permitted quantity precision.
         product_id = f"{symbol}-{settings['quote_currency']}"
 
-        base_available = coinbase_available_balance(symbol)
+        active_exchange=self.live_exchange()
+        base_available = self.live_available_balance(symbol)
 
         desired_size = (
             quantity_override
@@ -6862,10 +6886,7 @@ class PaperBot:
 
         # Coinbase requires base_size to conform to the
         # product's base_increment.
-        base_size = self.coinbase_round_size(
-            base_size,
-            product_id,
-        )
+        base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
 
         if base_size <= 0:
             with self.lock:
@@ -6881,9 +6902,9 @@ class PaperBot:
             return
 
         if self.state.active_stop_order_id:
-            stop_order_id = self.state.active_stop_order_id
+            stop_order_id = self.state.active_stop_order_id if active_exchange=="coinbase" else None
             try:
-                cancel_response = coinbase_cancel_orders([stop_order_id])
+                cancel_response = self.live_cancel(stop_order_id)
                 self.journal(
                     symbol,
                     "INFO",
@@ -6900,49 +6921,37 @@ class PaperBot:
 
         configured_order_type = str(settings.get("live_order_type", "market"))
         exit_side = "SELL" if not is_short else "BUY"
-        maker_first_exit = (
-            bool(settings.get("coinbase_maker_first_enabled", True))
-            and self.coinbase_maker_exit_allowed(reason)
-        )
+        maker_first_exit = self.coinbase_maker_exit_allowed(reason) and (
+            (active_exchange=="coinbase" and settings.get("coinbase_maker_first_enabled",True)) or
+            (active_exchange=="kraken" and settings.get("kraken_maker_first_enabled",True)))
 
         if maker_first_exit:
-            ticker = fetch_coinbase_ticker(symbol, str(settings["quote_currency"]))
-            bid = float(ticker.get("bid") or 0.0)
-            ask = float(ticker.get("ask") or 0.0)
+            g=live_market_guard(active_exchange,symbol,str(settings["quote_currency"]),
+                int(settings.get("live_granularity",3600)),int(settings.get("live_candle_count",300)),
+                float(settings["max_live_spread_pct"]),0.0)
+            bid=float(g.get("bid") or 0); ask=float(g.get("ask") or 0)
             if bid <= 0 or ask <= 0:
                 raise RuntimeError("Maker-first exit requires a valid Coinbase bid/ask")
-            maker_offset = max(0.0, float(settings.get("coinbase_maker_offset_pct", 0.0))) / 100.0
+            maker_offset = max(0.0,float(settings.get("kraken_maker_offset_pct" if active_exchange=="kraken" else "coinbase_maker_offset_pct",0.0)))/100.0
             raw_limit = ask * (1.0 + maker_offset) if exit_side == "SELL" else bid * (1.0 - maker_offset)
-            limit_price = self.coinbase_round_price(raw_limit, product_id)
+            limit_price = self.live_round_price(raw_limit,symbol,str(settings["quote_currency"]))
             order_type = "maker"
-            order = coinbase_limit_order(
-                product_id=product_id,
-                side=exit_side,
-                base_size=base_size,
-                limit_price=limit_price,
-                post_only=True,
-            )
+            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price,True)
+                     if active_exchange=="kraken" else coinbase_limit_order(product_id,exit_side,base_size,limit_price,post_only=True))
         elif configured_order_type == "limit" and self.coinbase_maker_exit_allowed(reason):
             limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
-            limit_price = self.coinbase_round_price(price * (1 - limit_offset), product_id)
+            limit_price = self.live_round_price(price*(1-limit_offset),symbol,str(settings["quote_currency"]))
             order_type = "limit"
-            order = coinbase_limit_order(
-                product_id=product_id,
-                side=exit_side,
-                base_size=base_size,
-                limit_price=limit_price,
-            )
+            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price)
+                     if active_exchange=="kraken" else coinbase_limit_order(product_id,exit_side,base_size,limit_price))
         else:
             # Protective/urgent exits deliberately remain taker/market.
             order_type = "market"
-            order = coinbase_market_order(
-                product_id=product_id,
-                side=exit_side,
-                base_size=base_size,
-            )
+            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"market",base_size)
+                     if active_exchange=="kraken" else coinbase_market_order(product_id,exit_side,base_size=base_size))
 
         try:
-            order_id = coinbase_order_id(order)
+            order_id = str(order["order_id"]) if active_exchange=="kraken" else coinbase_order_id(order)
         except Exception as exc:
             with self.lock:
                 self.state.last_signal = (
@@ -6983,7 +6992,7 @@ class PaperBot:
             reason=reason,
             client_order_id=order.get("client_order_id"),
         )
-        fill = coinbase_reconcile_order(order_id)
+        fill = self.live_reconcile(order_id)
         if self.apply_reconciled_order(managed, fill):
             if abs(self.state.coin) > 0 and bool(settings.get("native_stop_enabled")) and self.state.entry_price:
                 self.submit_native_stop_for_position(
@@ -7058,7 +7067,7 @@ class PaperBot:
                 continue
 
             try:
-                fill = coinbase_reconcile_order(order.order_id)
+                fill = self.live_reconcile(order.order_id)
             except Exception as exc:
                 order.updated_at = now_iso()
                 order.status = "RECONCILE_ERROR"
@@ -7170,7 +7179,7 @@ class PaperBot:
 
     def expire_order(self, order: ManagedOrder) -> None:
         try:
-            cancel_response = coinbase_cancel_orders([order.order_id])
+            cancel_response = self.live_cancel(order.order_id)
             order.status = "EXPIRED"
             order.updated_at = now_iso()
             if self.state.active_stop_order_id == order.order_id:
@@ -7260,6 +7269,8 @@ class PaperBot:
             logger.warning(f"Order replace failed: {exc}")
 
     def submit_native_stop_for_position(self, entry_order: ManagedOrder, entry_price: float) -> None:
+        if self.live_exchange() != "coinbase":
+            return
         if not self.state.settings.get("native_stop_enabled", False):
             return
 
@@ -8007,6 +8018,83 @@ def oanda_market_order(
 def oanda_decimal(value: float, symbol: str) -> str:
     places = 3 if normalize_forex_symbol(symbol).endswith("JPY") else 5
     return f"{value:.{places}f}"
+
+
+# ─── KRAKEN PRO PRIVATE API ─────────────────────────────────────────
+def kraken_live_is_armed() -> bool:
+    return bool(os.environ.get("KRAKEN_API_KEY","").strip() and
+                os.environ.get("KRAKEN_API_SECRET","").strip() and
+                os.environ.get("LIVE_TRADING_CONFIRM","")=="I_UNDERSTAND_THIS_PLACES_REAL_ORDERS")
+
+def kraken_private(path: str, params: dict[str, Any] | None=None) -> dict[str, Any]:
+    if not kraken_live_is_armed():
+        raise RuntimeError("Kraken live trading locked: configure KRAKEN_API_KEY, KRAKEN_API_SECRET and LIVE_TRADING_CONFIRM")
+    p=dict(params or {}); nonce=str(time.time_ns()); p["nonce"]=nonce
+    post=urllib.parse.urlencode(p)
+    msg=path.encode()+hashlib.sha256((nonce+post).encode()).digest()
+    secret=base64.b64decode(os.environ["KRAKEN_API_SECRET"])
+    sig=base64.b64encode(hmac.new(secret,msg,hashlib.sha512).digest()).decode()
+    req=urllib.request.Request("https://api.kraken.com"+path,data=post.encode(),method="POST",
+        headers={"API-Key":os.environ["KRAKEN_API_KEY"].strip(),"API-Sign":sig,
+                 "Content-Type":"application/x-www-form-urlencoded","User-Agent":"auxo/1.0"})
+    try:
+        with urllib.request.urlopen(req,timeout=15) as r: data=json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Kraken API error {e.code}: {e.read().decode(errors='replace')}") from e
+    if data.get("error"): raise RuntimeError("Kraken API rejected request: "+"; ".join(data["error"]))
+    return data
+
+_KRAKEN_PAIRS={}
+def kraken_pair_info(symbol:str, quote:str)->dict[str,Any]:
+    key=f"{symbol.upper()}/{quote.upper()}"
+    if key in _KRAKEN_PAIRS:return _KRAKEN_PAIRS[key]
+    base={"BTC":"XBT","DOGE":"XDG"}.get(symbol.upper(),symbol.upper())
+    data=fetch_json("https://api.kraken.com/0/public/AssetPairs")
+    wanted={f"{base}{quote.upper()}",f"{base}/{quote.upper()}",f"{symbol.upper()}{quote.upper()}",f"{symbol.upper()}/{quote.upper()}"}
+    for k,v in (data.get("result") or {}).items():
+        if k.upper() in wanted or str(v.get("altname","")).upper() in wanted or str(v.get("wsname","")).upper() in wanted:
+            x={"pair":v.get("altname") or k,"price_decimals":int(v.get("pair_decimals",8)),
+               "lot_decimals":int(v.get("lot_decimals",8)),"ordermin":float(v.get("ordermin") or 0)}
+            _KRAKEN_PAIRS[key]=x;return x
+    raise RuntimeError(f"Kraken pair unavailable: {key}")
+
+def kraken_round_price(v,s,q): return round(float(v),kraken_pair_info(s,q)["price_decimals"])
+def kraken_round_size(v,s,q):
+    d=kraken_pair_info(s,q)["lot_decimals"]; f=10**d
+    return math.floor(float(v)*f)/f
+
+def kraken_available_balance(currency:str)->float:
+    raw=(kraken_private("/0/private/Balance").get("result") or {})
+    aliases={"XXBT":"BTC","XBT":"BTC","XXDG":"DOGE","XDG":"DOGE","ZGBP":"GBP","ZUSD":"USD","ZEUR":"EUR","ZUSDT":"USDT"}
+    total=0.0
+    for a,v in raw.items():
+        clean=aliases.get(a,a)
+        if clean.startswith(("X","Z")) and len(clean)==4: clean=clean[1:]
+        if clean.upper()==currency.upper(): total+=float(v or 0)
+    return total
+
+def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False):
+    info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)
+    if size<=0 or (info["ordermin"] and size<info["ordermin"]):
+        raise RuntimeError(f"Kraken size {size} below minimum {info['ordermin']}")
+    p={"pair":info["pair"],"type":side.lower(),"ordertype":kind.lower(),
+       "volume":decimal_text(size,info["lot_decimals"])}
+    if kind=="limit":
+        p["price"]=decimal_text(kraken_round_price(price,symbol,quote),info["price_decimals"])
+    if post_only:p["oflags"]="post"
+    data=kraken_private("/0/private/AddOrder",p); ids=(data.get("result") or {}).get("txid") or []
+    if not ids:raise RuntimeError(f"Kraken returned no txid: {data}")
+    return {"order_id":str(ids[0]),"raw":data}
+
+def kraken_reconcile_order(oid):
+    row=(kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}).get(oid,{})
+    size=float(row.get("vol_exec") or 0); cost=float(row.get("cost") or 0)
+    avg=float(row.get("price") or 0) or (cost/size if size else 0)
+    return {"order_id":oid,"status":str(row.get("status") or "UNKNOWN").upper(),"filled_size":size,
+            "filled_value":cost,"total_fee":float(row.get("fee") or 0),"average_price":avg,
+            "fills_count":len(row.get("trades") or []),"order":row}
+
+def kraken_cancel_order(oid): return kraken_private("/0/private/CancelOrder",{"txid":oid})
 
 # ─── COINBASE API FUNCTIONS ─────────────────────────────────────────
 
