@@ -269,6 +269,8 @@ class BotDatabase:
             )''')
             cursor.execute("INSERT OR IGNORE INTO users (id, display_name, status) VALUES (1, 'Auxo Owner', 'active')")
             cursor.execute("INSERT OR IGNORE INTO trading_accounts (id, user_id, exchange, account_label, enabled) VALUES (1, 1, 'coinbase', 'Primary Coinbase', 1)")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS auth_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, session_token_hash TEXT UNIQUE NOT NULL, user_id INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, revoked_at TEXT)""")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
 
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
@@ -460,6 +462,45 @@ class BotDatabase:
             logger.info("Database initialized successfully with enhanced tracking")
 
     # ─── Trade Methods ────────────────────────────────────────────────
+
+    def get_user(self, user_id: int) -> dict[str, Any] | None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT id,email,display_name,password_hash,status FROM users WHERE id=?", (int(user_id),)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT id,email,display_name,password_hash,status FROM users WHERE lower(email)=lower(?)", (email.strip(),)).fetchone()
+            return dict(row) if row else None
+
+    def owner_auth_configured(self) -> bool:
+        u=self.get_user(1); return bool(u and u.get("email") and u.get("password_hash"))
+
+    def configure_owner_auth(self, email: str, password_hash: str, display_name: str="Auxo Owner") -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE users SET email=?,password_hash=?,display_name=?,status='active',updated_at=CURRENT_TIMESTAMP WHERE id=1", (email.strip().lower(),password_hash,display_name.strip() or "Auxo Owner")); conn.commit()
+
+    def create_auth_session(self, token_hash: str, user_id: int, expires_at: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT INTO auth_sessions(session_token_hash,user_id,expires_at) VALUES (?,?,?)", (token_hash,int(user_id),expires_at)); conn.commit()
+
+    def get_auth_session(self, token_hash: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory=sqlite3.Row
+            row=conn.execute("SELECT s.id session_id,s.user_id,u.email,u.display_name,u.status FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.session_token_hash=? AND s.revoked_at IS NULL AND datetime(s.expires_at)>datetime('now') AND u.status='active'",(token_hash,)).fetchone()
+            if not row: return None
+            conn.execute("UPDATE auth_sessions SET last_seen_at=CURRENT_TIMESTAMP WHERE id=?",(row['session_id'],)); conn.commit(); return dict(row)
+
+    def revoke_auth_session(self, token_hash: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE session_token_hash=?",(token_hash,)); conn.commit()
+
+    def trading_accounts_for_user(self, user_id: int) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory=sqlite3.Row
+            return [dict(r) for r in conn.execute("SELECT id,user_id,exchange,account_label,enabled FROM trading_accounts WHERE user_id=? ORDER BY id",(int(user_id),)).fetchall()]
 
     def save_trade(self, trade) -> int:
         trade_id = getattr(trade, 'trade_id', None) or str(uuid.uuid4())

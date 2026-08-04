@@ -19,6 +19,9 @@ Enhanced with:
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import secrets
 import random
 import math
 import os
@@ -11019,6 +11022,22 @@ def parse_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, Any]:
         return {}
     return json.loads(handler.rfile.read(length).decode("utf-8"))
 
+AUTH_COOKIE_NAME="auxo_session"
+AUTH_SESSION_HOURS=168
+PASSWORD_ITERATIONS=310000
+def _password_hash(password: str, salt: bytes | None=None) -> str:
+    salt=salt or secrets.token_bytes(16); d=hashlib.pbkdf2_hmac("sha256",password.encode(),salt,PASSWORD_ITERATIONS); return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${d.hex()}"
+def _password_verify(password: str, encoded: str | None) -> bool:
+    try:
+        a,i,sh,dh=str(encoded or "").split("$",3); d=hashlib.pbkdf2_hmac("sha256",password.encode(),bytes.fromhex(sh),int(i)); return a=="pbkdf2_sha256" and hmac.compare_digest(d.hex(),dh)
+    except Exception:return False
+def _session_token_hash(token: str) -> str:return hashlib.sha256(token.encode()).hexdigest()
+def _cookie_value(header: str,name: str) -> str | None:
+    for part in (header or "").split(";"):
+        k,sep,v=part.strip().partition("=")
+        if sep and k==name:return v
+    return None
+
 class BotRequestHandler(SimpleHTTPRequestHandler):
     bot: PaperBot
 
@@ -11026,20 +11045,32 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         self.bot = BotRequestHandler.bot
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    def _set_auth_cookie(self, token: str) -> None:
+        self.send_header("Set-Cookie",f"{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_SESSION_HOURS*3600}")
+    def _clear_auth_cookie(self) -> None:
+        self.send_header("Set-Cookie",f"{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+    def _authenticated_user(self) -> dict[str, Any] | None:
+        api=os.environ.get("BOT_API_TOKEN",""); header=self.headers.get("Authorization","")
+        if api and hmac.compare_digest(header,f"Bearer {api}"):
+            u=db.get_user(1); return {"id":1,"email":u.get("email") if u else None,"display_name":u.get("display_name") if u else "Auxo Owner","auth_type":"api_token"}
+        raw=_cookie_value(self.headers.get("Cookie",""),AUTH_COOKIE_NAME)
+        if not raw:return None
+        x=db.get_auth_session(_session_token_hash(raw))
+        return {"id":int(x["user_id"]),"email":x.get("email"),"display_name":x.get("display_name") or "Auxo User","auth_type":"session"} if x else None
     def _check_auth(self) -> bool:
-        token = os.environ.get("BOT_API_TOKEN", "")
-        if not token:
-            return True
-        header = self.headers.get("Authorization", "")
-        expected = f"Bearer {token}"
-        if header == expected:
-            return True
-        self.send_json({"ok": False, "error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
-        return False
+        u=self._authenticated_user()
+        if not u:self.send_json({"ok":False,"error":"Unauthorized"},HTTPStatus.UNAUTHORIZED); return False
+        self.current_user=u; self.current_user_id=int(u["id"]); return True
+    def _require_owner_engine_context(self) -> bool:
+        if int(getattr(self,"current_user_id",0))!=1:self.send_json({"ok":False,"error":"Trading engine is not yet provisioned for this user"},HTTPStatus.FORBIDDEN); return False
+        return True
 
     def do_GET(self) -> None:
-        if self.path.startswith("/api/") and not self._check_auth():
-            return
+        if self.path == "/api/auth/me":
+            u=self._authenticated_user(); self.send_json({"ok":True,"authenticated":bool(u),"auth_configured":db.owner_auth_configured(),"user":u,"accounts":db.trading_accounts_for_user(u["id"]) if u else []}); return
+        if self.path.startswith("/api/") and not self._check_auth(): return
+        if self.path in {"/","/index.html"} and self._authenticated_user() is None:
+            self.send_response(HTTPStatus.FOUND); self.send_header("Location","/login.html"); self.end_headers(); return
         try:
             if self.path == "/api/status":
                 try:
@@ -11349,8 +11380,23 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             return
 
     def do_POST(self) -> None:
-        if not self._check_auth():
-            return
+        if self.path == "/api/auth/setup":
+            if db.owner_auth_configured(): self.send_json({"ok":False,"error":"Owner authentication is already configured"},HTTPStatus.CONFLICT); return
+            p=parse_json_body(self); email=str(p.get("email") or "").strip().lower(); password=str(p.get("password") or ""); name=str(p.get("display_name") or "Auxo Owner").strip()
+            if "@" not in email or len(password)<10:self.send_json({"ok":False,"error":"Use a valid email and a password of at least 10 characters"},HTTPStatus.BAD_REQUEST); return
+            db.configure_owner_auth(email,_password_hash(password),name); token=secrets.token_urlsafe(48); exp=(datetime.now(timezone.utc)+timedelta(hours=AUTH_SESSION_HOURS)).strftime("%Y-%m-%d %H:%M:%S"); db.create_auth_session(_session_token_hash(token),1,exp)
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._set_auth_cookie(token); self.end_headers(); self.wfile.write(json.dumps({"ok":True,"user":{"id":1,"email":email,"display_name":name}}).encode()); return
+        if self.path == "/api/auth/login":
+            p=parse_json_body(self); email=str(p.get("email") or "").strip().lower(); password=str(p.get("password") or ""); u=db.get_user_by_email(email)
+            if not u or u.get("status")!="active" or not _password_verify(password,u.get("password_hash")):self.send_json({"ok":False,"error":"Invalid email or password"},HTTPStatus.UNAUTHORIZED); return
+            token=secrets.token_urlsafe(48); exp=(datetime.now(timezone.utc)+timedelta(hours=AUTH_SESSION_HOURS)).strftime("%Y-%m-%d %H:%M:%S"); db.create_auth_session(_session_token_hash(token),int(u["id"]),exp)
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._set_auth_cookie(token); self.end_headers(); self.wfile.write(json.dumps({"ok":True,"user":{"id":u["id"],"email":u["email"],"display_name":u["display_name"]}}).encode()); return
+        if self.path == "/api/auth/logout":
+            raw=_cookie_value(self.headers.get("Cookie",""),AUTH_COOKIE_NAME)
+            if raw:db.revoke_auth_session(_session_token_hash(raw))
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._clear_auth_cookie(); self.end_headers(); self.wfile.write(b'{"ok":true}'); return
+        if not self._check_auth(): return
+        if not self._require_owner_engine_context(): return
         try:
             if self.path == "/api/start":
                 self.bot.start()
