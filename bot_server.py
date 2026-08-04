@@ -11190,7 +11190,12 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                     return
                 return
 
-            if self.path.endswith('.css') or self.path.endswith('.js') or self.path.endswith('.json') or self.path.endswith('.png') or self.path.endswith('.jpg') or self.path.endswith('.svg'):
+            # Serve real static files directly, including login.html.
+            # Previously every non-API HTML path fell through to send_index(),
+            # so /login.html incorrectly returned the Auxo dashboard.
+            parsed_path = urllib.parse.urlparse(self.path).path
+            requested_static = WEB_DIR / parsed_path.lstrip("/")
+            if parsed_path != "/" and requested_static.exists() and requested_static.is_file():
                 try:
                     self.serve_static_file()
                 except BrokenPipeError:
@@ -11289,14 +11294,16 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
     def serve_static_file(self) -> None:
         try:
-            path = self.path.lstrip('/')
+            path = urllib.parse.urlparse(self.path).path.lstrip('/')
             file_path = WEB_DIR / path
 
             if not file_path.exists() or not file_path.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
 
-            if path.endswith('.css'):
+            if path.endswith('.html'):
+                content_type = 'text/html; charset=utf-8'
+            elif path.endswith('.css'):
                 content_type = 'text/css'
             elif path.endswith('.js'):
                 content_type = 'application/javascript'
