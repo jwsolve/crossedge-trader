@@ -712,7 +712,11 @@ class BotDatabase:
                     'avg_win': result[5] or 0.0,
                     'avg_loss': result[6] or 0.0,
                     'win_rate': (wins / total * 100) if total > 0 else 0.0,
-                    'profit_factor': abs(result[5] / result[6]) if result[6] and result[6] != 0 else 0,
+                    # AVG() returns NULL when there are no winning (or losing)
+                    # rows. Use the already-normalised values above so a symbol
+                    # with losses but no wins cannot raise None / float here.
+                    'profit_factor': abs((result[5] or 0.0) / (result[6] or 0.0))
+                    if (result[6] or 0.0) != 0 else 0.0,
                 }
             return {}
 
