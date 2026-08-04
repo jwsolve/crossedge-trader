@@ -239,6 +239,9 @@ DEFAULT_SETTINGS = {
     "live_trading_enabled": False,
     "live_order_type": "market",
     "live_limit_offset_pct": 0.05,
+    "coinbase_maker_first_enabled": True,
+    "coinbase_maker_offset_pct": 0.00,
+    "coinbase_maker_market_fallback": True,
     "native_stop_enabled": False,
     "max_live_order_gbp": 5.0,
     "max_daily_live_loss_gbp": 25.0,  # legacy key: now means max DAILY P/L loss in quote currency
@@ -6576,6 +6579,23 @@ class PaperBot:
             "risk_pnl": realised + unrealised,
         }
 
+    def coinbase_maker_exit_allowed(self, reason: str) -> bool:
+        """Only profit-taking exits may wait on a maker order.
+
+        Stops, trailing stops, drawdown/risk exits, force/manual closes and
+        other protective exits remain market orders so fee optimisation never
+        outranks risk reduction.
+        """
+        reason_l = str(reason or "").lower()
+        protective = (
+            "stop", "trailing", "drawdown", "risk", "emergency", "force",
+            "manual", "close if", "loss", "liquidat", "kill",
+        )
+        if any(token in reason_l for token in protective):
+            return False
+        profit = ("target", "take profit", "take-profit", "profit")
+        return any(token in reason_l for token in profit)
+
     def live_buy(
         self,
         symbol: str,
@@ -6694,6 +6714,13 @@ class PaperBot:
         product_id = f"{symbol}-{settings['quote_currency']}"
         order_type = str(settings.get("live_order_type", "market"))
         limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
+        maker_first = (
+            bool(settings.get("coinbase_maker_first_enabled", True))
+            and str(settings.get("active_exchange", "coinbase")).lower() == "coinbase"
+        )
+        maker_offset = max(0.0, float(settings.get("coinbase_maker_offset_pct", 0.0))) / 100.0
+        if maker_first:
+            order_type = "maker"
 
         active_exchange = settings.get("active_exchange", "coinbase")
         connector = self.connectors.get(active_exchange)
@@ -6709,12 +6736,22 @@ class PaperBot:
         )
 
         try:
-            if order_type in {"limit", "bracket", "native_stop_scaffold"}:
-                best_price, _, _ = self.price_aggregator.get_best_price(symbol, side=side)
-                if side == "BUY":
-                    limit_price = self.coinbase_round_price(best_price * (1 + limit_offset), product_id)
+            if order_type in {"limit", "bracket", "native_stop_scaffold", "maker"}:
+                if order_type == "maker":
+                    # Rest at (or slightly behind) the same-side top of book.
+                    # BUY <= bid and SELL >= ask prevents an intentional cross.
+                    bid = float(guard.get("bid") or 0.0)
+                    ask = float(guard.get("ask") or 0.0)
+                    if bid <= 0 or ask <= 0:
+                        raise RuntimeError("Maker-first entry requires a valid Coinbase bid/ask")
+                    raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
+                    limit_price = self.coinbase_round_price(raw_maker_price, product_id)
                 else:
-                    limit_price = self.coinbase_round_price(best_price * (1 - limit_offset), product_id)
+                    best_price, _, _ = self.price_aggregator.get_best_price(symbol, side=side)
+                    if side == "BUY":
+                        limit_price = self.coinbase_round_price(best_price * (1 + limit_offset), product_id)
+                    else:
+                        limit_price = self.coinbase_round_price(best_price * (1 - limit_offset), product_id)
 
                 ok, volume, recommended = self.price_aggregator.check_liquidity(symbol, side, quote_size)
                 if not ok:
@@ -6725,7 +6762,7 @@ class PaperBot:
 
                 base_size = quote_size / limit_price if limit_price > 0 else 0.0
                 base_size = self.coinbase_round_size(base_size, product_id)
-                order = coinbase_limit_order(product_id, side, base_size, limit_price)
+                order = coinbase_limit_order(product_id, side, base_size, limit_price, post_only=(order_type == "maker"))
 
             else:
                 # For Coinbase, submit through Auxo's native order helper so the
@@ -6861,21 +6898,46 @@ class PaperBot:
                     self.journal(symbol, "BLOCK", self.state.last_signal, price)
                 return
 
-        order_type = str(settings.get("live_order_type", "market"))
+        configured_order_type = str(settings.get("live_order_type", "market"))
+        exit_side = "SELL" if not is_short else "BUY"
+        maker_first_exit = (
+            bool(settings.get("coinbase_maker_first_enabled", True))
+            and self.coinbase_maker_exit_allowed(reason)
+        )
 
-        if order_type == "limit":
-            limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
-            limit_price = self.coinbase_round_price(price * (1 - limit_offset), product_id)
+        if maker_first_exit:
+            ticker = fetch_coinbase_ticker(symbol, str(settings["quote_currency"]))
+            bid = float(ticker.get("bid") or 0.0)
+            ask = float(ticker.get("ask") or 0.0)
+            if bid <= 0 or ask <= 0:
+                raise RuntimeError("Maker-first exit requires a valid Coinbase bid/ask")
+            maker_offset = max(0.0, float(settings.get("coinbase_maker_offset_pct", 0.0))) / 100.0
+            raw_limit = ask * (1.0 + maker_offset) if exit_side == "SELL" else bid * (1.0 - maker_offset)
+            limit_price = self.coinbase_round_price(raw_limit, product_id)
+            order_type = "maker"
             order = coinbase_limit_order(
                 product_id=product_id,
-                side="SELL" if not is_short else "BUY",
+                side=exit_side,
+                base_size=base_size,
+                limit_price=limit_price,
+                post_only=True,
+            )
+        elif configured_order_type == "limit" and self.coinbase_maker_exit_allowed(reason):
+            limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
+            limit_price = self.coinbase_round_price(price * (1 - limit_offset), product_id)
+            order_type = "limit"
+            order = coinbase_limit_order(
+                product_id=product_id,
+                side=exit_side,
                 base_size=base_size,
                 limit_price=limit_price,
             )
         else:
+            # Protective/urgent exits deliberately remain taker/market.
+            order_type = "market"
             order = coinbase_market_order(
                 product_id=product_id,
-                side="SELL" if not is_short else "BUY",
+                side=exit_side,
                 base_size=base_size,
             )
 
@@ -6916,7 +6978,7 @@ class PaperBot:
             "SELL" if not is_short else "BUY",
             "EXIT",
             order_type,
-            price=price,
+            price=limit_price if order_type in {"limit", "maker"} else price,
             base_size=base_size,
             reason=reason,
             client_order_id=order.get("client_order_id"),
@@ -7130,7 +7192,37 @@ class PaperBot:
 
     def replace_order(self, order: ManagedOrder) -> None:
         try:
-            if order.order_type == "limit" and order.price and order.base_size:
+            replacement_order_type = order.order_type
+            replacement_price = order.price
+
+            if order.order_type == "maker" and order.base_size:
+                retry_limit = int(self.state.settings.get("order_retry_limit", 1))
+                if order.retry_count < retry_limit:
+                    ticker = fetch_coinbase_ticker(
+                        order.symbol,
+                        str(self.state.settings.get("quote_currency", "GBP")),
+                    )
+                    bid = float(ticker.get("bid") or 0.0)
+                    ask = float(ticker.get("ask") or 0.0)
+                    offset = max(0.0, float(self.state.settings.get("coinbase_maker_offset_pct", 0.0))) / 100.0
+                    raw_price = bid * (1.0 - offset) if order.side == "BUY" else ask * (1.0 + offset)
+                    replacement_price = self.coinbase_round_price(raw_price, order.product_id)
+                    replacement = coinbase_limit_order(
+                        product_id=order.product_id,
+                        side=order.side,
+                        base_size=order.base_size,
+                        limit_price=replacement_price,
+                        post_only=True,
+                    )
+                elif bool(self.state.settings.get("coinbase_maker_market_fallback", True)):
+                    replacement_order_type = "market"
+                    if order.side == "BUY" and order.quote_size:
+                        replacement = coinbase_market_order(order.product_id, order.side, quote_size=order.quote_size)
+                    else:
+                        replacement = coinbase_market_order(order.product_id, order.side, base_size=order.base_size)
+                else:
+                    return
+            elif order.order_type == "limit" and order.price and order.base_size:
                 replacement = coinbase_limit_order(
                     product_id=order.product_id,
                     side=order.side,
@@ -7138,8 +7230,10 @@ class PaperBot:
                     limit_price=order.price,
                 )
             elif order.side == "BUY" and order.quote_size:
+                replacement_order_type = "market"
                 replacement = coinbase_market_order(order.product_id, order.side, quote_size=order.quote_size)
             elif order.base_size:
+                replacement_order_type = "market"
                 replacement = coinbase_market_order(order.product_id, order.side, base_size=order.base_size)
             else:
                 return
@@ -7150,8 +7244,8 @@ class PaperBot:
                 order.product_id,
                 order.side,
                 order.role,
-                order.order_type,
-                price=order.price,
+                replacement_order_type,
+                price=replacement_price,
                 base_size=order.base_size,
                 quote_size=order.quote_size,
                 reason=order.reason,
@@ -8113,14 +8207,20 @@ def coinbase_limit_order(
     side: str,
     base_size: float,
     limit_price: float,
+    post_only: bool = False,
 ) -> dict[str, Any]:
+    """Submit a Coinbase GTC limit order.
+
+    post_only=True is the maker-first execution primitive: Coinbase must rest
+    the order on the book rather than immediately taking liquidity.
+    """
     if base_size <= 0 or limit_price <= 0:
         raise RuntimeError("Limit order requires positive base_size and limit_price")
     order_configuration = {
         "limit_limit_gtc": {
             "base_size": decimal_text(base_size, 10),
             "limit_price": decimal_text(limit_price, 8),
-            "post_only": False,
+            "post_only": bool(post_only),
         }
     }
     return coinbase_create_order(product_id, side, order_configuration)
