@@ -11622,8 +11622,14 @@ def coinbase_private_key_source() -> str:
 # ─── MAIN ────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global db
     port = int(os.environ.get("PORT", "8080"))
     bot = PaperBot()
+
+    # Authentication and the trading engine must share the same BotDatabase
+    # instance.  The auth request handlers refer to the module-level `db`.
+    db = bot.db
+
     BotRequestHandler.bot = bot
 
     server = ThreadingHTTPServer(("0.0.0.0", port), BotRequestHandler)
