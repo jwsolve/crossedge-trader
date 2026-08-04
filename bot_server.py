@@ -73,6 +73,8 @@ from exchange_connectors import (
 from expectancy_engine import ExpectancyEngine
 from regime_detector import RegimeDetector, RegimeResult
 
+BASE_DIR = Path(__file__).resolve().parent
+
 # ─── D2 ACCOUNT-SCOPED STATE ───────────────────────────────────────
 STATE_DIR = BASE_DIR / "state"
 
@@ -139,7 +141,6 @@ except ImportError:
     REQUESTS_AVAILABLE = False
     logger.warning("requests package not installed – news guard disabled")
 
-BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 ENV_FILE = BASE_DIR / ".env"
 AUDIT_LOG_FILE = BASE_DIR / "bot_audit.jsonl"
