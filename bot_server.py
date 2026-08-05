@@ -6633,6 +6633,36 @@ class PaperBot:
         self.reconcile_kraken_margin(force=True)
         return {"ok":bool(closed) and not errors,"stage":"D8.5","closed":closed,"errors":errors}
 
+    def kraken_margin_order_diagnostics(self,symbol:str,quote_amount:float,validate_with_kraken:bool=True)->dict[str,Any]:
+        """D8.6.1 diagnostic: inspect exact pair/order params. validate=true cannot execute an order."""
+        s=self.state.settings
+        symbol=str(symbol or "").upper(); quote=str(s.get("quote_currency") or "GBP").upper()
+        amount=float(quote_amount or 0)
+        pair_diag=kraken_margin_pair_diagnostics(symbol,quote)
+        candles=fetch_kraken_candles(symbol,quote,60,20)
+        if not candles: raise RuntimeError(f"No Kraken market price available for {symbol}/{quote}")
+        price=float(candles[-1].close)
+        qty=amount/price if price>0 and amount>0 else 0.0
+        rounded=kraken_round_size(qty,symbol,quote) if qty>0 else 0.0
+        leverage=float(s.get("kraken_margin_leverage",2))
+        params={"pair":pair_diag.get("resolved_pair"),"type":"sell","ordertype":"market",
+                "volume":decimal_text(rounded,8),"leverage":str(int(leverage) if leverage.is_integer() else leverage)}
+        result={"ok":True,"stage":"D8.6.1","diagnostic_only":True,"pair":pair_diag,
+                "reference_price":price,"quote_amount":amount,"calculated_quantity":qty,
+                "rounded_quantity":rounded,"add_order_params":params,
+                "note":"API credentials/secrets are intentionally excluded."}
+        if validate_with_kraken:
+            if not kraken_api_configured():
+                result["validate"]={"ok":False,"error":"Kraken API credentials not configured"}
+            else:
+                vp=dict(params); vp["validate"]="true"
+                try:
+                    response=kraken_private("/0/private/AddOrder",vp)
+                    result["validate"]={"ok":True,"response":response.get("result") or {}}
+                except Exception as exc:
+                    result["validate"]={"ok":False,"error":str(exc)}
+        return result
+
     def kraken_tiny_live_short(self,symbol:str,quote_amount:float)->dict[str,Any]:
         """D8.6 owner-only, independently capped real-money SHORT test."""
         if int(self.user_id)!=1: raise RuntimeError("Owner-only test")
@@ -6645,8 +6675,19 @@ class PaperBot:
         safety=self.kraken_margin_safety()
         if not safety.get("new_shorts_allowed"): raise RuntimeError("Kraken margin safety is LOCKED")
         symbol=str(symbol).upper(); quote=str(s.get("quote_currency") or "GBP").upper()
-        price=float(fetch_price("kraken",symbol,quote)); qty=amount/price
-        order=kraken_order(symbol,quote,"SELL","market",qty,leverage=float(s.get("kraken_margin_leverage",2)))
+        # Use Auxo's existing Kraken market-data path rather than a nonexistent fetch_price helper.
+        candles=fetch_kraken_candles(symbol,quote,60,20)
+        if not candles:
+            raise RuntimeError(f"No Kraken market price available for {symbol}/{quote}")
+        price=float(candles[-1].close)
+        if price<=0:
+            raise RuntimeError(f"Invalid Kraken market price for {symbol}/{quote}: {price}")
+        qty=amount/price
+        try:
+            order=kraken_order(symbol,quote,"SELL","market",qty,leverage=float(s.get("kraken_margin_leverage",2)))
+        except Exception as exc:
+            diagnostic=self.kraken_margin_order_diagnostics(symbol,amount,validate_with_kraken=False)
+            raise RuntimeError(f"{exc} | D8.6.1 diagnostic={json.dumps(diagnostic,separators=(',',':'))}") from exc
         return {"ok":True,"stage":"D8.6","symbol":symbol,"quote_amount":amount,"reference_price":price,"quantity":qty,"order_id":order.get("order_id")}
 
     def live_status(self) -> dict[str, Any]:
@@ -8269,6 +8310,37 @@ def kraken_pair_info(symbol:str, quote:str)->dict[str,Any]:
                "lot_decimals":int(v.get("lot_decimals",8)),"ordermin":float(v.get("ordermin") or 0)}
             _KRAKEN_PAIRS[key]=x;return x
     raise RuntimeError(f"Kraken pair unavailable: {key}")
+
+
+def kraken_margin_pair_diagnostics(symbol:str,quote:str)->dict[str,Any]:
+    """Public/read-only diagnostics for the exact Kraken pair Auxo will submit."""
+    symbol=str(symbol or "").upper(); quote=str(quote or "").upper()
+    info=kraken_pair_info(symbol,quote)
+    pair=info.get("pair")
+    raw=fetch_json("https://api.kraken.com/0/public/AssetPairs?"+urllib.parse.urlencode({"pair":pair}))
+    errors=raw.get("error") or []
+    result=raw.get("result") or {}
+    key=next(iter(result.keys()),None)
+    meta=result.get(key,{}) if key else {}
+    return {
+        "requested_symbol":symbol,
+        "requested_quote":quote,
+        "resolved_pair":pair,
+        "assetpairs_key":key,
+        "altname":meta.get("altname"),
+        "wsname":meta.get("wsname"),
+        "base":meta.get("base"),
+        "quote":meta.get("quote"),
+        "ordermin":meta.get("ordermin"),
+        "lot_decimals":meta.get("lot_decimals"),
+        "pair_decimals":meta.get("pair_decimals"),
+        "leverage_buy":meta.get("leverage_buy") or [],
+        "leverage_sell":meta.get("leverage_sell") or [],
+        "margin_call":meta.get("margin_call"),
+        "margin_stop":meta.get("margin_stop"),
+        "public_api_errors":errors,
+        "short_margin_advertised":bool(meta.get("leverage_sell") or []),
+    }
 
 def kraken_round_price(v,s,q): return round(float(v),kraken_pair_info(s,q)["price_decimals"])
 def kraken_round_size(v,s,q):
@@ -11726,6 +11798,10 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                     return
                 return
 
+            if self.path == "/api/kraken-margin/diagnose-order":
+                q=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                # GET uses safe defaults; diagnostic validation cannot execute an order.
+                self.send_json(self.bot.kraken_margin_order_diagnostics("ADA",5.0,True)); return
             if self.path == "/api/kraken-margin/validate":
                 self.send_json(self.bot.validate_kraken_short_lifecycle()); return
             if self.path == "/api/kraken-margin/read-only-check":
@@ -12023,6 +12099,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             return
 
     def do_POST(self) -> None:
+        # Normalise the request path so API routes also work with a trailing slash/query string.
+        self.path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
         if self.path == "/api/auth/setup":
             if db.owner_auth_configured(): self.send_json({"ok":False,"error":"Owner authentication is already configured"},HTTPStatus.CONFLICT); return
             p=parse_json_body(self); email=str(p.get("email") or "").strip().lower(); password=str(p.get("password") or ""); name=str(p.get("display_name") or "Auxo Owner").strip()
@@ -12288,6 +12366,9 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
         if not self._require_owner_engine_context(): return
         try:
+            if self.path == "/api/kraken-margin/diagnose-order":
+                p=parse_json_body(self)
+                self.send_json(self.bot.kraken_margin_order_diagnostics(str(p.get("symbol") or "ADA"),float(p.get("quote_amount") or 5),True)); return
             if self.path == "/api/kraken-margin/reconcile":
                 self.send_json({"ok":True,"reconciliation":self.bot.reconcile_kraken_margin(force=True)}); return
             if self.path == "/api/kraken-margin/emergency-close":
