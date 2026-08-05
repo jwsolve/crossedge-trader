@@ -479,6 +479,7 @@ class BotState:
     price_history: dict[str, list[float]] = field(default_factory=dict)
     candle_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     positions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    kraken_margin_owned: dict[str, dict[str, Any]] = field(default_factory=dict)
     scan_rows: list[dict[str, Any]] = field(default_factory=list)
     trades: list[Trade] = field(default_factory=list)
     journal: list[JournalEntry] = field(default_factory=list)
@@ -6583,14 +6584,29 @@ class PaperBot:
             local=[]
             for sym,p in self.state.positions.items():
                 if p.get("is_short"):
-                    local.append({"symbol":str(sym).upper(),"quantity":abs(float(p.get("quantity") or 0))})
+                    local.append({"symbol":str(sym).upper(),"quantity":abs(float(p.get("quantity") or 0)),"source":"strategy"})
+            # D8.6.8 ownership registry: live Kraken margin orders created by Auxo are persisted
+            # independently from strategy positions so reconciliation survives restarts.
+            owned=getattr(self.state,"kraken_margin_owned",{}) or {}
+            for oid,rec in owned.items():
+                if str(rec.get("status") or "open").lower() in {"open","pending","adopted"}:
+                    local.append({"symbol":str(rec.get("symbol") or "").upper(),
+                                  "quantity":abs(float(rec.get("quantity") or 0)),
+                                  "source":"kraken_margin_owned","order_id":oid})
             result["ignored_dust"]=[]
             dust_limit=max(0.0,float(self.state.settings.get("kraken_margin_dust_quote",0.10)))
             for kp in result["positions"]:
                 pair=str(kp.get("pair") or "").upper()
                 qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
                 if qty<=0: continue
-                if not any(x["symbol"] in pair for x in local):
+                owners=[x for x in local if x["symbol"] and x["symbol"] in pair]
+                if owners:
+                    result.setdefault("owned_positions",[]).append({
+                        "position_id":kp.get("position_id"),"pair":pair,
+                        "remaining_quantity":qty,"quote_value":abs(float(kp.get("value") or 0)),
+                        "owners":owners
+                    })
+                else:
                     # Dust is judged by remaining quote value, never by token quantity.
                     value=abs(float(kp.get("value") or 0))
                     if value<=dust_limit:
@@ -6607,6 +6623,12 @@ class PaperBot:
                         )
             for lp in local:
                 if not any(lp["symbol"] in str(k.get("pair") or "").upper() for k in result["positions"]):
+                    if lp.get("source")=="kraken_margin_owned":
+                        rec=owned.get(lp.get("order_id"),{})
+                        age=now-float(rec.get("created_ts") or now)
+                        if age<30:
+                            result.setdefault("pending_owned_orders",[]).append({"order_id":lp.get("order_id"),"symbol":lp["symbol"],"age_seconds":age})
+                            continue
                     result["mismatches"].append(f"Auxo SHORT {lp['symbol']} missing at Kraken")
             shorts=[p for p in result["positions"] if str(p.get("type") or "").upper()=="SELL"
                     and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
@@ -6745,7 +6767,12 @@ class PaperBot:
             try:
                 data=kraken_private("/0/private/AddOrder",{"pair":pair,"type":"buy","ordertype":"market","volume":decimal_text(remaining,8),
                     "leverage":str(int(float(self.state.settings.get("kraken_margin_leverage",2))))})
-                closed.append({"position_id":pos.get("position_id"),"pair":pair,"quantity":remaining,"order_ids":(data.get("result") or {}).get("txid") or []})
+                cover_ids=(data.get("result") or {}).get("txid") or []
+                closed.append({"position_id":pos.get("position_id"),"pair":pair,"quantity":remaining,"order_ids":cover_ids})
+                for oid,rec in (getattr(self.state,"kraken_margin_owned",{}) or {}).items():
+                    if str(rec.get("symbol") or "").upper() in pair.upper() and str(rec.get("status") or "").lower() in {"open","pending","adopted"}:
+                        rec["status"]="closing"; rec["close_order_ids"]=cover_ids; rec["closing_ts"]=time.time()
+                self.save_state()
             except Exception as exc: errors.append({"pair":pair,"error":str(exc)})
         self.reconcile_kraken_margin(force=True)
         return {"ok":bool(closed) and not errors,"stage":"D8.5","closed":closed,"errors":errors}
@@ -6819,7 +6846,31 @@ class PaperBot:
         except Exception as exc:
             diagnostic=self.kraken_margin_order_diagnostics(symbol,amount,validate_with_kraken=False)
             raise RuntimeError(f"{exc} | D8.6.1 diagnostic={json.dumps(diagnostic,separators=(',',':'))}") from exc
-        return {"ok":True,"stage":"D8.6","symbol":symbol,"quote_amount":amount,"reference_price":price,"quantity":qty,"order_id":order.get("order_id")}
+        order_id=order.get("order_id")
+        rounded_qty=kraken_round_size(qty,symbol,quote)
+        self.state.kraken_margin_owned[order_id]={
+            "order_id":order_id,"symbol":symbol,"quote":quote,"pair":pair_diag.get("resolved_pair"),
+            "side":"SHORT","quantity":rounded_qty,"quote_amount":amount,
+            "reference_price":price,"leverage":requested,"status":"pending","created_ts":time.time()
+        }
+        self.save_state()
+        try:
+            self.db.write_audit(self.user_id,self.account_id,"kraken_margin_order_owned",
+                                {"order_id":order_id,"symbol":symbol,"quote":quote,
+                                 "quantity":rounded_qty,"quote_amount":amount,"leverage":requested})
+        except Exception as exc:
+            logger.warning(f"Could not audit Kraken margin ownership: {exc}")
+        # Reconcile once after persistence; failure does not erase ownership.
+        post=self.reconcile_kraken_margin(force=True)
+        if post.get("healthy"):
+            self.state.kraken_margin_owned[order_id]["status"]="adopted"
+            self.state.kraken_margin_owned[order_id]["adopted_ts"]=time.time()
+            self.save_state()
+        return {"ok":True,"stage":"D8.6","symbol":symbol,"quote_amount":amount,
+                "reference_price":price,"quantity":rounded_qty,"order_id":order_id,
+                "ownership_status":self.state.kraken_margin_owned[order_id]["status"],
+                "post_reconciliation":{"healthy":post.get("healthy"),"status":post.get("status"),
+                                       "mismatches":post.get("mismatches",[])}}
 
     def live_status(self) -> dict[str, Any]:
         with self.lock:
