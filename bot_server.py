@@ -372,6 +372,8 @@ DEFAULT_SETTINGS = {
     "oanda_account_type": "standard",
     "max_drawdown_pct": 20.0,
     "allow_short_selling": False,
+    "kraken_margin_short_enabled": False,
+    "kraken_margin_leverage": 2.0,
     "telegram_enabled": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
@@ -2113,6 +2115,7 @@ class PaperBot:
             entry_price=entry_price,
             candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
             settings=self.state.settings,
+            position_side=position_side,
         )
 
         risk_per_unit = abs(entry_price - stop_price) if stop_price else 0
@@ -2188,62 +2191,33 @@ class PaperBot:
 
         return spend, " | ".join(reason_parts)
 
-    def exit_prices(
-        self,
-        entry_price: float,
-        candles: list[Candle],
-        settings: dict[str, Any],
-    ) -> tuple[float, float, str]:
-        """Calculate stop loss and take profit prices."""
-        if not candles or len(candles) < 14:
-            stop = entry_price * (1 - float(settings["stop_loss_pct"]) / 100)
-            target = entry_price * (1 + float(settings["take_profit_pct"]) / 100)
-            return stop, target, "fixed"
-
-        atr_enabled = settings.get("use_atr_exits", True)
-        if atr_enabled:
-            atr_period = int(settings.get("atr_period", 14))
-            atr_value = self.calculate_atr(candles, atr_period)
-
-            if atr_value and atr_value > 0:
-                atr_stop_mult = float(settings.get("atr_stop_multiplier", 1.5))
-                atr_target_mult = float(settings.get("atr_target_multiplier", 2.5))
-
-                regime = getattr(self.state, 'current_regime', None)
-                if regime:
-                    if regime.regime == "volatile":
-                        atr_stop_mult *= 1.3
-                        atr_target_mult *= 1.2
-                    elif regime.regime == "dead":
-                        atr_stop_mult *= 0.7
-                        atr_target_mult *= 0.8
-
-                stop = entry_price - (atr_value * atr_stop_mult)
-                target = entry_price + (atr_value * atr_target_mult)
-
-                min_stop_pct = 0.2
-                if (entry_price - stop) / entry_price * 100 < min_stop_pct:
-                    stop = entry_price * (1 - float(settings["stop_loss_pct"]) / 100)
-                    target = entry_price * (1 + float(settings["take_profit_pct"]) / 100)
-                    return stop, target, "fixed"
-
-                return stop, target, f"ATR ({atr_value:.4f})"
-
+    def exit_prices(self, entry_price: float, candles: list[Candle], settings: dict[str, Any], position_side: str = "LONG") -> tuple[float,float,str]:
+        short = str(position_side).upper() == "SHORT"
+        sl=float(settings["stop_loss_pct"])/100.0; tp=float(settings["take_profit_pct"])/100.0
+        def fixed():
+            return (entry_price*(1+sl),entry_price*(1-tp),"fixed") if short else (entry_price*(1-sl),entry_price*(1+tp),"fixed")
+        if not candles or len(candles)<14: return fixed()
+        if settings.get("use_atr_exits",True):
+            atr=self.calculate_atr(candles,int(settings.get("atr_period",14)))
+            if atr and atr>0:
+                sm=float(settings.get("atr_stop_multiplier",1.5)); tm=float(settings.get("atr_target_multiplier",2.5))
+                regime=getattr(self.state,"current_regime",None)
+                if regime and regime.regime=="volatile": sm*=1.3; tm*=1.2
+                elif regime and regime.regime=="dead": sm*=0.7; tm*=0.8
+                stop=entry_price+atr*sm if short else entry_price-atr*sm
+                target=entry_price-atr*tm if short else entry_price+atr*tm
+                if target>0: return stop,target,f"ATR ({atr:.4f})"
         if settings.get("use_dynamic_sr_exits"):
-            levels = support_resistance(candles, settings)
-            support = levels.get("support")
-            resistance = levels.get("resistance")
-            if support and resistance and levels.get("confirmed"):
-                stop_buffer = float(settings.get("support_stop_buffer_pct", 2.0)) / 100
-                target_buffer = float(settings.get("resistance_target_buffer_pct", 0.5)) / 100
-                sr_stop = float(support) * (1 - stop_buffer)
-                sr_target = float(resistance) * (1 - target_buffer)
-                if sr_stop < entry_price and sr_target > entry_price:
-                    return sr_stop, sr_target, "S/R"
-
-        stop = entry_price * (1 - float(settings["stop_loss_pct"]) / 100)
-        target = entry_price * (1 + float(settings["take_profit_pct"]) / 100)
-        return stop, target, "fixed"
+            lv=support_resistance(candles,settings); sup=lv.get("support"); res=lv.get("resistance")
+            if sup and res and lv.get("confirmed"):
+                sb=float(settings.get("support_stop_buffer_pct",2))/100; tb=float(settings.get("resistance_target_buffer_pct",.5))/100
+                if short:
+                    stop=float(res)*(1+sb); target=float(sup)*(1+tb)
+                    if stop>entry_price and 0<target<entry_price: return stop,target,"S/R"
+                else:
+                    stop=float(sup)*(1-sb); target=float(res)*(1-tb)
+                    if stop<entry_price and target>entry_price: return stop,target,"S/R"
+        return fixed()
 
     def live_net_exit_prices(
         self,
@@ -4337,10 +4311,7 @@ class PaperBot:
                 raise RuntimeError(f"Coinbase close failed: {exc}")
 
         else:
-            if is_short:
-                self.paper_buy(symbol, price, reason, None, is_short=True)
-            else:
-                self.paper_sell(symbol, price, reason, None)
+            self.paper_sell(symbol, price, reason, None)
 
             with self.lock:
                 self.state.last_signal = f"{reason}: {symbol}"
@@ -4388,7 +4359,7 @@ class PaperBot:
             "strategy_evolution_frequency", "strategy_max_active",
             "kelly_fraction", "atr_period", "atr_multiplier", "max_hold_hours",
             "rsi_oversold", "rsi_overbought", "ma_exit_period",
-            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee",
+            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee", "kraken_margin_leverage",
         }
         bool_fields = {
             "live_trading_enabled", "use_sr_filter", "use_dynamic_sr_exits",
@@ -5252,7 +5223,7 @@ class PaperBot:
                     self.state.last_signal = f"OANDA SELL blocked: {oanda_demo_status_message()}"
                     self.journal(symbol, "BLOCK", self.state.last_signal, fetched_prices.get(symbol, active_price))
                 elif self.should_live_trade():
-                    self.live_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity)
+                    self.live_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity, is_short=bool(self.state.positions.get(symbol,{}).get("is_short",False)))
                 else:
                     self.paper_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity)
 
@@ -5745,6 +5716,7 @@ class PaperBot:
                     entry_price=entry_price,
                     candles=candles,
                     settings=settings,
+                    position_side="SHORT" if position.get("is_short",False) else "LONG",
                 )
                 if stop_price is None:
                     stop_price = calculated_stop
@@ -5772,17 +5744,15 @@ class PaperBot:
                 target_price=target_price,
                 settings=settings,
                 already_done=partial_take_profit_done,
+                is_short=(position_side=="SHORT"),
             ):
                 with self.lock:
                     self.state.partial_take_profit_done = True
                 return f"SELL {symbol} partial {exit_mode} target"
 
-            trailing_stop = trailing_stop_price(
-                entry_price=entry_price,
-                highest_price=current_highest,
-                settings=settings,
-            )
-            if trailing_stop and price <= trailing_stop:
+            trail_ref=float(position.get("lowest_price") or price) if position_side=="SHORT" else current_highest
+            trailing_stop=trailing_stop_price(entry_price,trail_ref,settings,is_short=(position_side=="SHORT"))
+            if trailing_stop and ((position_side=="SHORT" and price>=trailing_stop) or (position_side!="SHORT" and price<=trailing_stop)):
                 return f"SELL {symbol} trailing stop"
 
             if position_side == "SHORT":
@@ -5915,11 +5885,14 @@ class PaperBot:
                     entry_price=price,
                     candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
                     settings=self.state.settings,
+                    position_side="SHORT" if is_short else "LONG",
                 )
 
             if is_short:
+                coin_bought = quantity_override if quantity_override is not None else spend / price
+                fee_paid = fee_override if fee_override is not None else spend * trade_fee
                 self.state.coin -= coin_bought
-                self.state.cash += spend
+                self.state.cash += (spend - fee_paid)
                 self.state.active_symbol = symbol
                 self.state.entry_price = price
                 self.state.highest_price = price
@@ -6069,11 +6042,13 @@ class PaperBot:
             gross = sold_quantity * price
             fee_paid = fee_override if fee_override is not None else gross * trade_fee
             cash_received = gross - fee_paid
-
-            self.state.cash += cash_received
+            if is_short:
+                self.state.cash -= (gross + fee_paid)
+                self.state.coin += sold_quantity
+            else:
+                self.state.cash += cash_received
 
             if is_short:
-                self.state.coin += sold_quantity
                 if symbol in self.state.positions:
                     remaining = position_quantity + sold_quantity
                     if remaining >= 0:
@@ -6755,6 +6730,12 @@ class PaperBot:
         max_daily_spend = float(settings.get("max_daily_live_spend_quote", 250.0))
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
+        active_exchange=str(settings.get("active_exchange") or settings.get("exchange") or "coinbase").lower()
+        if is_short:
+            if not settings.get("allow_short_selling",False): raise RuntimeError("Short selling is disabled")
+            if active_exchange!="kraken": raise RuntimeError("Live crypto shorting is Kraken-only")
+            if not settings.get("kraken_margin_short_enabled",False): raise RuntimeError("Kraken live margin shorts are disabled")
+
         if candles is None:
             with self.lock:
                 candles = closes_to_candles(self.state.price_history.get(symbol, []))
@@ -6870,7 +6851,9 @@ class PaperBot:
             entry_price=price,
             candles=candles or closes_to_candles(self.state.price_history.get(symbol, [])),
             settings=self.state.settings,
+            position_side="SHORT" if is_short else "LONG",
         )
+        margin_leverage=float(settings.get("kraken_margin_leverage",2)) if is_short else None
 
         try:
             if order_type in {"limit", "bracket", "native_stop_scaffold", "maker"}:
@@ -6899,7 +6882,7 @@ class PaperBot:
 
                 base_size = quote_size / limit_price if limit_price > 0 else 0.0
                 base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
-                order = (kraken_order(symbol,str(settings["quote_currency"]),side,"limit",base_size,limit_price,order_type=="maker")
+                order = (kraken_order(symbol,str(settings["quote_currency"]),side,"limit",base_size,limit_price,order_type=="maker",leverage=margin_leverage)
                          if active_exchange=="kraken" else coinbase_limit_order(product_id,side,base_size,limit_price,post_only=(order_type=="maker")))
 
             else:
@@ -6925,7 +6908,7 @@ class PaperBot:
                 elif active_exchange == "kraken":
                     px=float(guard.get("ask") if side=="BUY" else guard.get("bid") or price)
                     base_size=self.live_round_size(quote_size/px,symbol,str(settings["quote_currency"]))
-                    order=kraken_order(symbol,str(settings["quote_currency"]),side,"market",base_size)
+                    order=kraken_order(symbol,str(settings["quote_currency"]),side,"market",base_size,leverage=margin_leverage)
                 else:
                     # Preserve the existing connector path for other exchanges.
                     if side == "BUY":
@@ -6992,7 +6975,7 @@ class PaperBot:
         product_id = f"{symbol}-{settings['quote_currency']}"
 
         active_exchange=self.live_exchange()
-        base_available = self.live_available_balance(symbol)
+        base_available = abs(float(self.state.positions.get(symbol,{}).get("quantity",0))) if is_short else self.live_available_balance(symbol)
 
         desired_size = (
             quantity_override
@@ -7039,6 +7022,7 @@ class PaperBot:
 
         configured_order_type = str(settings.get("live_order_type", "market"))
         exit_side = "SELL" if not is_short else "BUY"
+        margin_leverage=float(settings.get("kraken_margin_leverage",2)) if (active_exchange=="kraken" and is_short) else None
         maker_first_exit = self.coinbase_maker_exit_allowed(reason) and (
             (active_exchange=="coinbase" and settings.get("coinbase_maker_first_enabled",True)) or
             (active_exchange=="kraken" and settings.get("kraken_maker_first_enabled",True)))
@@ -7054,18 +7038,18 @@ class PaperBot:
             raw_limit = ask * (1.0 + maker_offset) if exit_side == "SELL" else bid * (1.0 - maker_offset)
             limit_price = self.live_round_price(raw_limit,symbol,str(settings["quote_currency"]))
             order_type = "maker"
-            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price,True)
+            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price,True,leverage=margin_leverage)
                      if active_exchange=="kraken" else coinbase_limit_order(product_id,exit_side,base_size,limit_price,post_only=True))
         elif configured_order_type == "limit" and self.coinbase_maker_exit_allowed(reason):
             limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
             limit_price = self.live_round_price(price*(1-limit_offset),symbol,str(settings["quote_currency"]))
             order_type = "limit"
-            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price)
+            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price,leverage=margin_leverage)
                      if active_exchange=="kraken" else coinbase_limit_order(product_id,exit_side,base_size,limit_price))
         else:
             # Protective/urgent exits deliberately remain taker/market.
             order_type = "market"
-            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"market",base_size)
+            order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"market",base_size,leverage=margin_leverage)
                      if active_exchange=="kraken" else coinbase_market_order(product_id,exit_side,base_size=base_size))
 
         try:
@@ -7223,17 +7207,12 @@ class PaperBot:
                 entry_price=filled_price,
                 candles=candles,
                 settings=self.state.settings,
+                position_side="SHORT" if is_short else "LONG",
             )
-            stop_price, target_price, cost_details = self.live_net_exit_prices(
-                symbol=order.symbol,
-                entry_price=filled_price,
-                quantity=float(fill["filled_size"]),
-                entry_value=filled_value,
-                entry_fee=entry_fee,
-                raw_stop=raw_stop,
-                raw_target=raw_target,
-                settings=self.state.settings,
-            )
+            if is_short:
+                stop_price,target_price,cost_details=raw_stop,raw_target,{"short_margin":True}
+            else:
+                stop_price,target_price,cost_details=self.live_net_exit_prices(symbol=order.symbol,entry_price=filled_price,quantity=float(fill["filled_size"]),entry_value=filled_value,entry_fee=entry_fee,raw_stop=raw_stop,raw_target=raw_target,settings=self.state.settings)
             self.journal(order.symbol, "INFO", "LIVE exits recalculated from confirmed fill and estimated net costs", filled_price, {
                 **cost_details,
                 "raw_stop": raw_stop,
@@ -8191,7 +8170,7 @@ def kraken_available_balance(currency:str)->float:
         if clean.upper()==currency.upper(): total+=float(v or 0)
     return total
 
-def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False):
+def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
     info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)
     if size<=0 or (info["ordermin"] and size<info["ordermin"]):
         raise RuntimeError(f"Kraken size {size} below minimum {info['ordermin']}")
@@ -8200,6 +8179,7 @@ def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False):
     if kind=="limit":
         p["price"]=decimal_text(kraken_round_price(price,symbol,quote),info["price_decimals"])
     if post_only:p["oflags"]="post"
+    if leverage is not None: p["leverage"]=str(int(float(leverage)))
     data=kraken_private("/0/private/AddOrder",p); ids=(data.get("result") or {}).get("txid") or []
     if not ids:raise RuntimeError(f"Kraken returned no txid: {data}")
     return {"order_id":str(ids[0]),"raw":data}
@@ -10879,31 +10859,19 @@ def position_spend(
     capped_spend = min(spend, max_fraction_spend, cash)
     return capped_spend, f"risk {settings.get('risk_per_trade_pct', 1.0)}% via {exit_mode} stop"
 
-def partial_take_profit_ready(
-    price: float,
-    entry_price: float,
-    target_price: float,
-    settings: dict[str, Any],
-    already_done: bool,
-) -> bool:
-    if already_done or not settings.get("partial_take_profit_enabled"):
-        return False
-    trigger_fraction = float(settings.get("partial_take_profit_at_target_pct", 50.0)) / 100
-    trigger_price = entry_price + ((target_price - entry_price) * trigger_fraction)
-    return target_price > entry_price and price >= trigger_price
+def partial_take_profit_ready(price,entry_price,target_price,settings,already_done,is_short=False):
+    if already_done or not settings.get("partial_take_profit_enabled"): return False
+    f=float(settings.get("partial_take_profit_at_target_pct",50))/100; trigger=entry_price+(target_price-entry_price)*f
+    return price<=trigger if is_short and target_price<entry_price else (price>=trigger if (not is_short and target_price>entry_price) else False)
 
-def trailing_stop_price(
-    entry_price: float,
-    highest_price: float | None,
-    settings: dict[str, Any],
-) -> float | None:
-    if not settings.get("trailing_stop_enabled") or not highest_price:
-        return None
-    activation = float(settings.get("trailing_activation_pct", 3.0)) / 100
-    if highest_price < entry_price * (1 + activation):
-        return None
-    trail = float(settings.get("trailing_stop_pct", 2.0)) / 100
-    return highest_price * (1 - trail)
+def trailing_stop_price(entry_price,highest_price,settings,is_short=False):
+    if not settings.get("trailing_stop_enabled") or not highest_price: return None
+    a=float(settings.get("trailing_activation_pct",3))/100; t=float(settings.get("trailing_stop_pct",2))/100
+    if is_short:
+        if highest_price>entry_price*(1-a): return None
+        return highest_price*(1+t)
+    if highest_price<entry_price*(1+a): return None
+    return highest_price*(1-t)
 
 def chart_trade_plan(
     state: BotState,

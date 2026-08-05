@@ -1458,7 +1458,9 @@
                                     <option value="self_learning">Self-Learning (AI)</option>
                                 </select>
                             </label>
-                            <label>Allow Short Selling <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
+                            <label>Allow Short Selling 🔻 <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
+<label>Kraken Live Margin Shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled (paper only)</option><option value="true">Enabled</option></select></label>
+<label>Kraken Margin Leverage <input type="number" name="kraken_margin_leverage" min="2" max="5" step="1" value="2"></label>
                             <label>Short SMA <input name="short_window" type="number" value="5" step="1" /></label>
                             <label>Long SMA <input name="long_window" type="number" value="20" step="1" /></label>
                             <label>EWO buy EMA <input name="base_nb_candles_buy" type="number" value="14" step="1" /></label>
