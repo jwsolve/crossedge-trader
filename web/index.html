@@ -236,6 +236,24 @@
             color: var(--text);
         }
 
+        /* ─── User Administration ─── */
+        .admin-section { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); }
+        .admin-toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:14px; }
+        .admin-toolbar h2 { font-size:18px; margin:0; }
+        .admin-form { display:grid; grid-template-columns:repeat(5,minmax(150px,1fr)); gap:10px; padding:12px; background:var(--panel-hover); border:1px solid var(--line); border-radius:8px; margin-bottom:14px; }
+        .admin-form label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
+        .admin-form input,.admin-form select { border:1px solid var(--line); border-radius:5px; padding:7px 8px; background:var(--input-bg); color:var(--input-text); }
+        .admin-form .admin-form-actions { display:flex; align-items:end; gap:6px; }
+        .admin-btn { border:1px solid var(--line); background:var(--button-bg); color:var(--button-text); border-radius:6px; padding:7px 11px; cursor:pointer; }
+        .admin-btn:hover { background:var(--panel-hover); }
+        .admin-btn.danger { color:var(--bad); border-color:var(--bad); }
+        .admin-btn.primary { color:#fff; background:var(--accent); border-color:var(--accent); }
+        .admin-table input,.admin-table select { max-width:180px; border:1px solid var(--line); border-radius:4px; padding:5px 6px; background:var(--input-bg); color:var(--input-text); }
+        .admin-actions { display:flex; gap:5px; flex-wrap:wrap; }
+        .admin-owner { font-size:10px; font-weight:700; color:var(--accent); }
+        @media (max-width:900px) { .admin-form { grid-template-columns:1fr 1fr; } }
+        @media (max-width:600px) { .admin-form { grid-template-columns:1fr; } }
+
         /* ─── Tab Panes ─── */
         .tab-pane { display: none; }
         .tab-pane.active { display: block; }
@@ -1225,9 +1243,11 @@
                 <button class="active" data-tab="dashboard">Dashboard</button>
                 <button data-tab="trading">Trading</button>
                 <button data-tab="analysis">Analysis</button>
+                <button data-tab="admin" id="adminTabBtn" style="display:none;">Users</button>
             </div>
             <div class="header-actions">
                 <button class="theme-toggle" id="themeToggle" title="Toggle theme">🌓</button>
+                <button class="theme-toggle" id="logoutBtn" title="Log out" style="font-size:13px;">Logout</button>
             </div>
         </header>
 
@@ -1919,6 +1939,33 @@
             </div>
         </div>
 
+        <!-- ─── OWNER USER ADMINISTRATION TAB ─── -->
+        <div class="tab-pane" id="tab-admin">
+            <section class="admin-section">
+                <div class="admin-toolbar">
+                    <div>
+                        <h2>User Administration</h2>
+                        <div class="muted">Owner-only. New secondary users are paper-only.</div>
+                    </div>
+                    <button class="admin-btn" id="refreshUsersBtn" type="button">Refresh</button>
+                </div>
+                <form class="admin-form" id="createUserForm">
+                    <label>Display name<input id="adminNewName" required placeholder="Kraken Test" /></label>
+                    <label>Email<input id="adminNewEmail" type="email" required placeholder="user@example.com" /></label>
+                    <label>Password<input id="adminNewPassword" type="password" minlength="10" required placeholder="10+ characters" /></label>
+                    <label>Exchange<select id="adminNewExchange"><option value="kraken">Kraken</option><option value="coinbase">Coinbase</option></select></label>
+                    <div class="admin-form-actions"><button class="admin-btn primary" type="submit">Add user</button></div>
+                </form>
+                <div class="message-box" id="adminMessage"></div>
+                <div class="table-wrap">
+                    <table class="admin-table">
+                        <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Account</th><th>Exchange</th><th>Trades</th><th>Actions</th></tr></thead>
+                        <tbody id="adminUsersBody"><tr><td colspan="8" class="muted">Open the Users tab to load users.</td></tr></tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+
     </div>
 
     <script>
@@ -1966,6 +2013,12 @@
             recentActivity: $('recentActivity'),
             streamingDot: $('streamingDot'),
             streamingText: $('streamingText'),
+            logoutBtn: $('logoutBtn'),
+            adminTabBtn: $('adminTabBtn'),
+            adminUsersBody: $('adminUsersBody'),
+            adminMessage: $('adminMessage'),
+            createUserForm: $('createUserForm'),
+            refreshUsersBtn: $('refreshUsersBtn'),
             // Trading
             startBtn: $('startBtn'),
             stopBtn: $('stopBtn'),
@@ -2158,9 +2211,60 @@
         // ---- API ----
         async function post(url, body = {}) {
             const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            if (r.status === 401 && url !== '/api/auth/login') { window.location.href = 'login.html'; throw new Error('Session expired'); }
             return r.json();
         }
-        async function getJson(url) { const r = await fetch(url); return r.json(); }
+        async function getJson(url) {
+            const r = await fetch(url);
+            if (r.status === 401) { window.location.href = 'login.html'; throw new Error('Session expired'); }
+            return r.json();
+        }
+
+        async function logoutAuxo() {
+            try { await post('/api/auth/logout'); } catch (e) { /* redirect regardless */ }
+            window.location.href = 'login.html';
+        }
+
+        async function loadCurrentUser() {
+            try {
+                const r = await getJson('/api/auth/me');
+                if (!r.authenticated) { window.location.href = 'login.html'; return; }
+                const isOwner = Number(r.user?.id || 0) === 1;
+                if (els.adminTabBtn) els.adminTabBtn.style.display = isOwner ? '' : 'none';
+            } catch (e) {}
+        }
+
+        function adminEscape(v) {
+            return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        async function loadAdminUsers() {
+            if (!els.adminUsersBody) return;
+            els.adminMessage.style.display = 'none';
+            try {
+                const r = await getJson('/api/admin/users');
+                if (!r.ok) throw new Error(r.error || 'Could not load users');
+                els.adminUsersBody.innerHTML = (r.users || []).map(u => {
+                    const owner = Number(u.id) === 1;
+                    return `<tr data-user-id="${u.id}">
+                        <td>${u.id}${owner ? ' <span class="admin-owner">OWNER</span>' : ''}</td>
+                        <td><input class="adm-name" value="${adminEscape(u.display_name)}"></td>
+                        <td><input class="adm-email" type="email" value="${adminEscape(u.email)}"></td>
+                        <td><select class="adm-status" ${owner?'disabled':''}><option value="active" ${u.status==='active'?'selected':''}>Active</option><option value="disabled" ${u.status==='disabled'?'selected':''}>Disabled</option></select></td>
+                        <td>${adminEscape(u.account_label || '—')} (#${u.account_id ?? '—'})</td>
+                        <td>${adminEscape(u.exchange || '—')}</td>
+                        <td>${Number(u.trade_rows || 0)}</td>
+                        <td><div class="admin-actions">
+                            <button class="admin-btn adm-save" type="button">Save</button>
+                            <button class="admin-btn adm-password" type="button">Password</button>
+                            ${owner ? '' : '<button class="admin-btn danger adm-delete" type="button">Delete</button>'}
+                        </div></td>
+                    </tr>`;
+                }).join('') || '<tr><td colspan="8" class="muted">No users found.</td></tr>';
+            } catch (e) {
+                els.adminMessage.style.display='block'; els.adminMessage.textContent=e.message;
+            }
+        }
 
         // ---- theme ----
         function applyTheme(theme) {
@@ -3861,6 +3965,7 @@
             dashboard: $('tab-dashboard'),
             trading: $('tab-trading'),
             analysis: $('tab-analysis'),
+            admin: $('tab-admin'),
         };
         mainTabs.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -3871,6 +3976,7 @@
                 if (id === 'dashboard' && lastStatusData) {
                     // chart already there
                 }
+                if (id === 'admin') loadAdminUsers();
             });
         });
 
@@ -3896,6 +4002,60 @@
                 Object.entries(analysisPanes).forEach(([k, el]) => el.classList.toggle('active', k === id));
             });
         });
+
+        // Authentication / owner user administration
+        if (els.logoutBtn) els.logoutBtn.addEventListener('click', logoutAuxo);
+        if (els.refreshUsersBtn) els.refreshUsersBtn.addEventListener('click', loadAdminUsers);
+
+        if (els.createUserForm) els.createUserForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const payload = {
+                display_name: $('adminNewName').value.trim(),
+                email: $('adminNewEmail').value.trim(),
+                password: $('adminNewPassword').value,
+                exchange: $('adminNewExchange').value,
+            };
+            const r = await post('/api/admin/users/create', payload);
+            els.adminMessage.style.display='block';
+            els.adminMessage.textContent = r.ok ? 'User created.' : (r.error || 'Create failed');
+            if (r.ok) { els.createUserForm.reset(); $('adminNewExchange').value='kraken'; await loadAdminUsers(); }
+        });
+
+        if (els.adminUsersBody) els.adminUsersBody.addEventListener('click', async (e) => {
+            const row=e.target.closest('tr[data-user-id]'); if (!row) return;
+            const userId=Number(row.dataset.userId);
+            try {
+                if (e.target.classList.contains('adm-save')) {
+                    const r=await post('/api/admin/users/update',{
+                        user_id:userId,
+                        display_name:row.querySelector('.adm-name').value.trim(),
+                        email:row.querySelector('.adm-email').value.trim(),
+                        status:row.querySelector('.adm-status').value
+                    });
+                    if (!r.ok) throw new Error(r.error || 'Update failed');
+                    els.adminMessage.style.display='block'; els.adminMessage.textContent='User updated.';
+                    await loadAdminUsers();
+                }
+                if (e.target.classList.contains('adm-password')) {
+                    const password=prompt('Enter a new password (minimum 10 characters):');
+                    if (password === null) return;
+                    const r=await post('/api/admin/users/password',{user_id:userId,password});
+                    if (!r.ok) throw new Error(r.error || 'Password update failed');
+                    els.adminMessage.style.display='block'; els.adminMessage.textContent='Password updated; existing sessions for that user were logged out.';
+                }
+                if (e.target.classList.contains('adm-delete')) {
+                    if (!confirm('Delete this user login/account? Historical trades will be retained.')) return;
+                    const r=await post('/api/admin/users/delete',{user_id:userId});
+                    if (!r.ok) throw new Error(r.error || 'Delete failed');
+                    els.adminMessage.style.display='block'; els.adminMessage.textContent='User deleted. Historical trades retained.';
+                    await loadAdminUsers();
+                }
+            } catch (err) {
+                els.adminMessage.style.display='block'; els.adminMessage.textContent=err.message;
+            }
+        });
+
+        loadCurrentUser();
 
         // Start / Stop
         els.startBtn.addEventListener('click', async () => {

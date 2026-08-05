@@ -502,6 +502,85 @@ class BotDatabase:
             conn.row_factory=sqlite3.Row
             return [dict(r) for r in conn.execute("SELECT id,user_id,exchange,account_label,enabled FROM trading_accounts WHERE user_id=? ORDER BY id",(int(user_id),)).fetchall()]
 
+    # ─── D6 OWNER USER ADMINISTRATION ────────────────────────────────
+    def admin_list_users(self) -> list[dict[str, Any]]:
+        """Owner-facing user list with account and trade counts; never exposes password hashes."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT u.id, u.email, u.display_name, u.status, u.created_at, u.updated_at,
+                       a.id AS account_id, a.exchange, a.account_label, a.enabled AS account_enabled,
+                       COUNT(t.id) AS trade_rows
+                FROM users u
+                LEFT JOIN trading_accounts a ON a.id = (
+                    SELECT a2.id FROM trading_accounts a2
+                    WHERE a2.user_id=u.id ORDER BY a2.id LIMIT 1
+                )
+                LEFT JOIN trades t ON t.user_id=u.id AND (a.id IS NULL OR t.account_id=a.id)
+                GROUP BY u.id, a.id
+                ORDER BY u.id
+            """).fetchall()
+            return [dict(r) for r in rows]
+
+    def admin_update_user(self, user_id: int, email: str, display_name: str, status: str) -> None:
+        user_id = int(user_id)
+        email = str(email or "").strip().lower()
+        display_name = str(display_name or "").strip() or "Auxo User"
+        status = str(status or "active").strip().lower()
+        if status not in {"active", "disabled"}:
+            raise ValueError("Status must be active or disabled")
+        if user_id == 1 and status != "active":
+            raise ValueError("The Auxo owner cannot be disabled")
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "UPDATE users SET email=?,display_name=?,status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (email, display_name, status, user_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("User not found")
+            if status != "active":
+                conn.execute(
+                    "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=? AND revoked_at IS NULL",
+                    (user_id,),
+                )
+            conn.commit()
+
+    def admin_set_password(self, user_id: int, password_hash: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (password_hash, int(user_id)),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("User not found")
+            # Force all existing browser sessions for that user to log in again.
+            conn.execute(
+                "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=? AND revoked_at IS NULL",
+                (int(user_id),),
+            )
+            conn.commit()
+
+    def admin_delete_user(self, user_id: int) -> dict[str, Any]:
+        """Delete a non-owner login/account configuration while retaining historical trades."""
+        user_id = int(user_id)
+        if user_id == 1:
+            raise ValueError("The Auxo owner cannot be deleted")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            accounts = [int(r["id"]) for r in conn.execute(
+                "SELECT id FROM trading_accounts WHERE user_id=? ORDER BY id", (user_id,)
+            ).fetchall()]
+            exists = conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone()
+            if not exists:
+                raise ValueError("User not found")
+            conn.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=? AND revoked_at IS NULL", (user_id,))
+            conn.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM trading_accounts WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            conn.commit()
+        return {"account_ids": accounts}
+
     # ─── MILESTONE C: USER / ACCOUNT ISOLATION ───────────────────────
 
     def get_trading_account(self, account_id: int) -> dict[str, Any] | None:

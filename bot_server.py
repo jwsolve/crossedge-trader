@@ -11322,6 +11322,19 @@ class EngineManager:
         with self._lock:
             return sorted(self._engines)
 
+    def remove_engine(self, account_id: int, stop: bool = True) -> bool:
+        """Remove an account engine from the registry, stopping it first when possible."""
+        with self._lock:
+            engine = self._engines.pop(int(account_id), None)
+        if engine is None:
+            return False
+        if stop:
+            try:
+                engine.stop()
+            except Exception as exc:
+                logger.warning("Could not stop engine for removed account %s: %s", account_id, exc)
+        return True
+
 
 class BotRequestHandler(SimpleHTTPRequestHandler):
     bot: PaperBot
@@ -11405,6 +11418,11 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             })
             return
         if self.path.startswith("/api/") and not self._check_auth(): return
+
+        if self.path == "/api/admin/users":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
+            self.send_json({"ok":True,"users":db.admin_list_users()}); return
 
         if self.path == "/api/account-context":
             ctx = self._request_account_context()
@@ -11784,6 +11802,101 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if raw:db.revoke_auth_session(_session_token_hash(raw))
             self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._clear_auth_cookie(); self.end_headers(); self.wfile.write(b'{"ok":true}'); return
         if not self._check_auth(): return
+
+        if self.path == "/api/admin/users/create":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            email=str(p.get("email") or "").strip().lower()
+            password=str(p.get("password") or "")
+            name=str(p.get("display_name") or "Auxo User").strip()
+            exchange=str(p.get("exchange") or "kraken").strip().lower()
+            account_label=str(p.get("account_label") or ("Kraken Paper" if exchange=="kraken" else "Coinbase Paper")).strip()
+            if "@" not in email or len(password)<10:
+                self.send_json({"ok":False,"error":"Use a valid email and password of at least 10 characters"}, HTTPStatus.BAD_REQUEST); return
+            if exchange not in {"coinbase","kraken"}:
+                self.send_json({"ok":False,"error":"Exchange must be coinbase or kraken"}, HTTPStatus.BAD_REQUEST); return
+            try:
+                ids=db.create_user_with_account(email,name,_password_hash(password),exchange,account_label)
+                settings=dict(DEFAULT_SETTINGS)
+                settings.update({"exchange":exchange,"active_exchange":exchange,"live_trading_enabled":False,"oanda_demo_trading_enabled":False,"quote_currency":"GBP"})
+                db.save_user_settings(ids["user_id"],ids["account_id"],settings)
+                engine=PaperBot(account_id=ids["account_id"], user_id=ids["user_id"], state_file=account_state_file(ids["account_id"]))
+                with engine.lock:
+                    engine.state.settings.update(settings)
+                    engine.state.cash=float(settings["starting_cash"])
+                    engine.state.db_initialized=True
+                    engine.save_state()
+                self.engine_manager.register_engine(ids["account_id"],engine)
+                self.send_json({"ok":True,**ids,"exchange":exchange,"mode":"paper"})
+            except sqlite3.IntegrityError:
+                self.send_json({"ok":False,"error":"A user with that email already exists"},HTTPStatus.CONFLICT)
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/api/admin/users/update":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                uid=int(p.get("user_id"))
+                email=str(p.get("email") or "").strip().lower()
+                name=str(p.get("display_name") or "").strip()
+                status=str(p.get("status") or "active").strip().lower()
+                if "@" not in email:
+                    raise ValueError("Use a valid email address")
+                db.admin_update_user(uid,email,name,status)
+                self.send_json({"ok":True})
+            except sqlite3.IntegrityError:
+                self.send_json({"ok":False,"error":"A user with that email already exists"},HTTPStatus.CONFLICT)
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/api/admin/users/password":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                uid=int(p.get("user_id")); password=str(p.get("password") or "")
+                if len(password)<10: raise ValueError("Password must be at least 10 characters")
+                db.admin_set_password(uid,_password_hash(password))
+                self.send_json({"ok":True})
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/api/admin/users/delete":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                uid=int(p.get("user_id"))
+                if uid == 1: raise ValueError("The Auxo owner cannot be deleted")
+                user=db.get_user(uid)
+                if not user: raise ValueError("User not found")
+                accounts=db.trading_accounts_for_user(uid)
+                # Safety: do not delete a user while their engine is running or has an open position.
+                for account in accounts:
+                    engine=self.engine_manager.get_engine(int(account["id"]))
+                    if engine is not None:
+                        with engine.lock:
+                            if engine.state.running:
+                                raise ValueError("Stop this user's bot before deleting the user")
+                            if engine.state.positions or engine.state.coin > 0:
+                                raise ValueError("Close/reset this user's open position before deleting the user")
+                result=db.admin_delete_user(uid)
+                for aid in result.get("account_ids",[]):
+                    self.engine_manager.remove_engine(int(aid), stop=True)
+                    state_path=account_state_file(int(aid))
+                    if state_path.exists():
+                        archive=state_path.with_suffix(state_path.suffix + f".deleted-{int(time.time())}")
+                        state_path.rename(archive)
+                self.send_json({"ok":True,"deleted_user_id":uid,"historical_trades_retained":True})
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
+            return
 
         if self.path == "/api/admin/create-paper-user":
             if int(self.current_user_id) != 1:
