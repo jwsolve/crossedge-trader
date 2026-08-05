@@ -8225,14 +8225,22 @@ def oanda_decimal(value: float, symbol: str) -> str:
 
 
 # ─── KRAKEN PRO PRIVATE API ─────────────────────────────────────────
-def kraken_live_is_armed() -> bool:
+def kraken_api_configured() -> bool:
+    """Credentials are enough for authenticated READ operations."""
     return bool(os.environ.get("KRAKEN_API_KEY","").strip() and
-                os.environ.get("KRAKEN_API_SECRET","").strip() and
+                os.environ.get("KRAKEN_API_SECRET","").strip())
+
+def kraken_live_is_armed() -> bool:
+    """Real order placement requires credentials plus the explicit live interlock."""
+    return bool(kraken_api_configured() and
                 os.environ.get("LIVE_TRADING_CONFIRM","")=="I_UNDERSTAND_THIS_PLACES_REAL_ORDERS")
 
 def kraken_private(path: str, params: dict[str, Any] | None=None) -> dict[str, Any]:
-    if not kraken_live_is_armed():
-        raise RuntimeError("Kraken live trading locked: configure KRAKEN_API_KEY, KRAKEN_API_SECRET and LIVE_TRADING_CONFIRM")
+    # Private Kraken endpoints such as OpenPositions, OpenOrders, TradeBalance
+    # and Ledgers are allowed in D8.4 read-only mode. Order-producing helpers
+    # enforce kraken_live_is_armed() separately.
+    if not kraken_api_configured():
+        raise RuntimeError("Kraken private API unavailable: configure KRAKEN_API_KEY and KRAKEN_API_SECRET")
     p=dict(params or {}); nonce=str(time.time_ns()); p["nonce"]=nonce
     post=urllib.parse.urlencode(p)
     msg=path.encode()+hashlib.sha256((nonce+post).encode()).digest()
@@ -8313,6 +8321,8 @@ def kraken_margin_snapshot(ledger_limit:int=100)->dict[str,Any]:
             "margin_level_pct":margin_level,"open_exposure_quote":exposure}
 
 def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
+    if not kraken_live_is_armed():
+        raise RuntimeError("Kraken order placement locked: LIVE_TRADING_CONFIRM is not armed")
     info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)
     if size<=0 or (info["ordermin"] and size<info["ordermin"]):
         raise RuntimeError(f"Kraken size {size} below minimum {info['ordermin']}")
@@ -8334,7 +8344,10 @@ def kraken_reconcile_order(oid):
             "filled_value":cost,"total_fee":float(row.get("fee") or 0),"average_price":avg,
             "fills_count":len(row.get("trades") or []),"order":row}
 
-def kraken_cancel_order(oid): return kraken_private("/0/private/CancelOrder",{"txid":oid})
+def kraken_cancel_order(oid):
+    if not kraken_live_is_armed():
+        raise RuntimeError("Kraken order cancellation locked: LIVE_TRADING_CONFIRM is not armed")
+    return kraken_private("/0/private/CancelOrder",{"txid":oid})
 
 # ─── COINBASE API FUNCTIONS ─────────────────────────────────────────
 
