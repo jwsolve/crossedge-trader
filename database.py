@@ -271,6 +271,17 @@ class BotDatabase:
             cursor.execute("INSERT OR IGNORE INTO trading_accounts (id, user_id, exchange, account_label, enabled) VALUES (1, 1, 'coinbase', 'Primary Coinbase', 1)")
             cursor.execute("""CREATE TABLE IF NOT EXISTS auth_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, session_token_hash TEXT UNIQUE NOT NULL, user_id INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, revoked_at TEXT)""")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
+            # D8 subscription/entitlement foundation.
+            cursor.execute("PRAGMA table_info(users)")
+            user_cols={r[1] for r in cursor.fetchall()}
+            if "subscription_tier" not in user_cols:
+                cursor.execute("ALTER TABLE users ADD COLUMN subscription_tier TEXT NOT NULL DEFAULT 'starter'")
+            cursor.execute("UPDATE users SET subscription_tier='owner' WHERE id=1")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS user_entitlement_overrides (
+                user_id INTEGER PRIMARY KEY,
+                overrides_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""")
 
             cursor.execute("""CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -477,13 +488,13 @@ class BotDatabase:
     def get_user(self, user_id: int) -> dict[str, Any] | None:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT id,email,display_name,password_hash,status FROM users WHERE id=?", (int(user_id),)).fetchone()
+            row = conn.execute("SELECT id,email,display_name,password_hash,status,subscription_tier FROM users WHERE id=?", (int(user_id),)).fetchone()
             return dict(row) if row else None
 
     def get_user_by_email(self, email: str) -> dict[str, Any] | None:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT id,email,display_name,password_hash,status FROM users WHERE lower(email)=lower(?)", (email.strip(),)).fetchone()
+            row = conn.execute("SELECT id,email,display_name,password_hash,status,subscription_tier FROM users WHERE lower(email)=lower(?)", (email.strip(),)).fetchone()
             return dict(row) if row else None
 
     def owner_auth_configured(self) -> bool:
@@ -584,7 +595,7 @@ class BotDatabase:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
-                SELECT u.id, u.email, u.display_name, u.status, u.created_at, u.updated_at,
+                SELECT u.id, u.email, u.display_name, u.status, u.subscription_tier, u.created_at, u.updated_at,
                        a.id AS account_id, a.exchange, a.account_label, a.enabled AS account_enabled,
                        COUNT(t.id) AS trade_rows
                 FROM users u
@@ -597,6 +608,38 @@ class BotDatabase:
                 ORDER BY u.id
             """).fetchall()
             return [dict(r) for r in rows]
+
+    def set_subscription_tier(self, user_id:int, tier:str) -> None:
+        tier=str(tier or "").strip().lower()
+        if tier not in {"starter","pro","elite","owner"}:
+            raise ValueError("Unknown subscription tier")
+        if int(user_id)==1 and tier!="owner":
+            raise ValueError("The Auxo owner must remain on the Owner tier")
+        if int(user_id)!=1 and tier=="owner":
+            raise ValueError("Owner tier is reserved for user 1")
+        with sqlite3.connect(self.db_path) as conn:
+            cur=conn.execute("UPDATE users SET subscription_tier=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(tier,int(user_id)))
+            if cur.rowcount != 1: raise ValueError("User not found")
+            conn.commit()
+
+    def entitlement_overrides(self, user_id:int) -> dict[str,Any]:
+        with sqlite3.connect(self.db_path) as conn:
+            row=conn.execute("SELECT overrides_json FROM user_entitlement_overrides WHERE user_id=?",(int(user_id),)).fetchone()
+        if not row: return {}
+        try:
+            data=json.loads(row[0] or "{}")
+            return data if isinstance(data,dict) else {}
+        except Exception:
+            return {}
+
+    def set_entitlement_overrides(self, user_id:int, overrides:dict[str,Any]) -> None:
+        if not isinstance(overrides,dict): raise ValueError("Overrides must be an object")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""INSERT INTO user_entitlement_overrides(user_id,overrides_json,updated_at)
+                            VALUES (?,?,CURRENT_TIMESTAMP)
+                            ON CONFLICT(user_id) DO UPDATE SET overrides_json=excluded.overrides_json,updated_at=CURRENT_TIMESTAMP""",
+                         (int(user_id),json.dumps(overrides,separators=(",",":"))))
+            conn.commit()
 
     def admin_update_user(self, user_id: int, email: str, display_name: str, status: str) -> None:
         user_id = int(user_id)
@@ -652,6 +695,7 @@ class BotDatabase:
             conn.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=? AND revoked_at IS NULL", (user_id,))
             conn.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
             conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM user_entitlement_overrides WHERE user_id=?", (user_id,))
             conn.execute("DELETE FROM trading_accounts WHERE user_id=?", (user_id,))
             conn.execute("DELETE FROM users WHERE id=?", (user_id,))
             conn.commit()

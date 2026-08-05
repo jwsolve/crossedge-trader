@@ -1954,14 +1954,15 @@
                     <label>Display name<input id="adminNewName" required placeholder="Kraken Test" /></label>
                     <label>Email<input id="adminNewEmail" type="email" required placeholder="user@example.com" /></label>
                     <label>Password<input id="adminNewPassword" type="password" minlength="10" required placeholder="10+ characters" /></label>
-                    <label>Exchange<select id="adminNewExchange"><option value="kraken">Kraken</option><option value="coinbase">Coinbase</option></select></label>
+                    <label>Tier<select id="adminNewTier"><option value="starter">Starter</option><option value="pro">Pro</option><option value="elite">Elite</option></select></label>
+                    <label>Exchange<select id="adminNewExchange"><option value="coinbase">Coinbase</option><option value="kraken">Kraken</option></select></label>
                     <div class="admin-form-actions"><button class="admin-btn primary" type="submit">Add user</button></div>
                 </form>
                 <div class="message-box" id="adminMessage"></div>
                 <div class="table-wrap">
                     <table class="admin-table">
-                        <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Account</th><th>Exchange</th><th>Trades</th><th>Actions</th></tr></thead>
-                        <tbody id="adminUsersBody"><tr><td colspan="8" class="muted">Open the Users tab to load users.</td></tr></tbody>
+                        <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Tier</th><th>Account</th><th>Exchange</th><th>Trades</th><th>Actions</th></tr></thead>
+                        <tbody id="adminUsersBody"><tr><td colspan="9" class="muted">Open the Users tab to load users.</td></tr></tbody>
                     </table>
                 </div>
 
@@ -2257,11 +2258,55 @@
             window.location.href = 'login.html';
         }
 
+        let currentEntitlements = null;
+        const PREMIUM_SETTING_FEATURES = {
+            live_trading_enabled:'live_trading',
+            coinbase_maker_first_enabled:'maker_first',
+            kraken_maker_first_enabled:'maker_first',
+            risk_sizing_mode:'advanced_risk',
+            use_atr_exits:'advanced_risk',
+            trailing_stop_enabled:'advanced_risk',
+            partial_take_profit_enabled:'advanced_risk',
+            self_learning_enabled:'setup_learning',
+            regime_filter_enabled:'regime_detection',
+            regime_adaptation_enabled:'regime_detection',
+            strategy_switching_enabled:'regime_detection',
+            auto_disable_weak_pairs:'auto_disable_weak_pairs',
+            strategy_creator_enabled:'strategy_evolution',
+            strategy_evolution_enabled:'strategy_evolution'
+        };
+        function applyEntitlementUI() {
+            if (!currentEntitlements) return;
+            const f=currentEntitlements.features||{};
+            if (els.tierBadge) {
+                els.tierBadge.style.display='';
+                els.tierBadge.textContent=String(currentEntitlements.tier||'starter').toUpperCase();
+            }
+            Object.entries(PREMIUM_SETTING_FEATURES).forEach(([name,feature])=>{
+                const input=els.settingsForm?.elements?.[name];
+                if (!input) return;
+                const locked=!Boolean(f[feature]);
+                input.disabled=locked;
+                const holder=input.closest('.setting-row, label, .form-group, .setting-item') || input.parentElement;
+                if (holder) {
+                    holder.style.opacity=locked?'0.55':'';
+                    holder.title=locked?`Locked on ${currentEntitlements.tier} tier`:'';
+                }
+            });
+            if (els.optimizerBtn) {
+                els.optimizerBtn.disabled=!Boolean(f.optimizer);
+                els.optimizerBtn.title=f.optimizer?'':'Optimizer requires Pro or Elite';
+            }
+            document.getElementById('evolveStrategiesBtn')?.toggleAttribute('disabled',!Boolean(f.strategy_evolution));
+        }
+
         async function loadCurrentUser() {
             try {
                 const r = await getJson('/api/auth/me');
                 if (!r.authenticated) { window.location.href = 'login.html'; return; }
                 const isOwner = Number(r.user?.id || 0) === 1;
+                currentEntitlements=r.entitlements || null;
+                applyEntitlementUI();
                 if (els.adminTabBtn) els.adminTabBtn.style.display = isOwner ? '' : 'none';
                 if (els.accountSelector) {
                     els.accountSelector.innerHTML=(r.accounts||[]).filter(a=>Number(a.enabled)===1).map(a =>
@@ -2289,16 +2334,18 @@
                         <td><input class="adm-name" value="${adminEscape(u.display_name)}"></td>
                         <td><input class="adm-email" type="email" value="${adminEscape(u.email)}"></td>
                         <td><select class="adm-status" ${owner?'disabled':''}><option value="active" ${u.status==='active'?'selected':''}>Active</option><option value="disabled" ${u.status==='disabled'?'selected':''}>Disabled</option></select></td>
+                        <td><select class="adm-tier" ${owner?'disabled':''}><option value="starter" ${u.subscription_tier==='starter'?'selected':''}>Starter</option><option value="pro" ${u.subscription_tier==='pro'?'selected':''}>Pro</option><option value="elite" ${u.subscription_tier==='elite'?'selected':''}>Elite</option><option value="owner" ${owner?'selected':''}>Owner</option></select></td>
                         <td>${adminEscape(u.account_label || '—')} (#${u.account_id ?? '—'})</td>
                         <td>${adminEscape(u.exchange || '—')}</td>
                         <td>${Number(u.trade_rows || 0)}</td>
                         <td><div class="admin-actions">
                             <button class="admin-btn adm-save" type="button">Save</button>
                             <button class="admin-btn adm-password" type="button">Password</button>
+                            <button class="admin-btn adm-entitlements" type="button">Access</button>
                             ${owner ? '' : '<button class="admin-btn danger adm-delete" type="button">Delete</button>'}
                         </div></td>
                     </tr>`;
-                }).join('') || '<tr><td colspan="8" class="muted">No users found.</td></tr>';
+                }).join('') || '<tr><td colspan="9" class="muted">No users found.</td></tr>';
 
                 if (els.adminAccountsBody) {
                     els.adminAccountsBody.innerHTML=(r.accounts||[]).map(a => `<tr data-account-id="${a.id}">
@@ -4108,6 +4155,7 @@
                 email: $('adminNewEmail').value.trim(),
                 password: $('adminNewPassword').value,
                 exchange: $('adminNewExchange').value,
+                subscription_tier: $('adminNewTier').value,
             };
             const r = await post('/api/admin/users/create', payload);
             els.adminMessage.style.display='block';
@@ -4129,6 +4177,17 @@
                     if (!r.ok) throw new Error(r.error || 'Update failed');
                     els.adminMessage.style.display='block'; els.adminMessage.textContent='User updated.';
                     await loadAdminUsers();
+                }
+                if (e.target.classList.contains('adm-entitlements')) {
+                    const tier=row.querySelector('.adm-tier')?.value || 'starter';
+                    const raw=prompt('Optional entitlement overrides as JSON. Example: {"max_accounts":5,"auto_disable_weak_pairs":true}\\nUse {} for no overrides.', '{}');
+                    if (raw===null) return;
+                    let overrides={};
+                    try { overrides=JSON.parse(raw||'{}'); } catch (_) { throw new Error('Overrides must be valid JSON'); }
+                    const r=await post('/api/admin/users/entitlements',{user_id:userId,subscription_tier:tier,overrides});
+                    if (!r.ok) throw new Error(r.error||'Entitlement update failed');
+                    els.adminMessage.style.display='block'; els.adminMessage.textContent=`Access updated to ${tier}.`;
+                    await loadAdminUsers(); await loadAudit();
                 }
                 if (e.target.classList.contains('adm-password')) {
                     const password=prompt('Enter a new password (minimum 10 characters):');
@@ -4574,6 +4633,7 @@
                 render(data);
                 if (!settingsLoaded) {
                     loadSettings(data);
+                    applyEntitlementUI();
                 }
                 updateStreamingUI(data);
             } catch (e) { /* ignore */ }

@@ -189,6 +189,90 @@ if DOTENV_LOADED_KEYS:
     logger.info(f"Loaded {len(DOTENV_LOADED_KEYS)} environment variables from .env")
 
 # ─── Default Settings ──────────────────────────────────────────────
+# ─── D8 SUBSCRIPTION TIERS / ENTITLEMENTS ───────────────────────────
+TIER_ENTITLEMENTS: dict[str,dict[str,Any]] = {
+    "starter": {
+        "max_accounts": 1, "coinbase": True, "kraken": False, "live_trading": False,
+        "maker_first": False, "advanced_risk": False, "setup_learning": False,
+        "regime_detection": False, "auto_disable_weak_pairs": False,
+        "strategy_evolution": False, "optimizer": False,
+    },
+    "pro": {
+        "max_accounts": 3, "coinbase": True, "kraken": True, "live_trading": True,
+        "maker_first": True, "advanced_risk": True, "setup_learning": True,
+        "regime_detection": True, "auto_disable_weak_pairs": False,
+        "strategy_evolution": False, "optimizer": True,
+    },
+    "elite": {
+        "max_accounts": 10, "coinbase": True, "kraken": True, "live_trading": True,
+        "maker_first": True, "advanced_risk": True, "setup_learning": True,
+        "regime_detection": True, "auto_disable_weak_pairs": True,
+        "strategy_evolution": True, "optimizer": True,
+    },
+    "owner": {
+        "max_accounts": 999, "coinbase": True, "kraken": True, "live_trading": True,
+        "maker_first": True, "advanced_risk": True, "setup_learning": True,
+        "regime_detection": True, "auto_disable_weak_pairs": True,
+        "strategy_evolution": True, "optimizer": True,
+    },
+}
+SETTING_ENTITLEMENTS = {
+    "live_trading_enabled":"live_trading",
+    "coinbase_maker_first_enabled":"maker_first",
+    "kraken_maker_first_enabled":"maker_first",
+    "risk_sizing_mode":"advanced_risk",
+    "use_atr_exits":"advanced_risk",
+    "trailing_stop_enabled":"advanced_risk",
+    "partial_take_profit_enabled":"advanced_risk",
+    "self_learning_enabled":"setup_learning",
+    "regime_filter_enabled":"regime_detection",
+    "regime_adaptation_enabled":"regime_detection",
+    "strategy_switching_enabled":"regime_detection",
+    "auto_disable_weak_pairs":"auto_disable_weak_pairs",
+    "strategy_creator_enabled":"strategy_evolution",
+    "strategy_evolution_enabled":"strategy_evolution",
+}
+
+def effective_entitlements(user_id:int) -> dict[str,Any]:
+    user=db.get_user(int(user_id))
+    tier=str((user or {}).get("subscription_tier") or ("owner" if int(user_id)==1 else "starter")).lower()
+    if int(user_id)==1: tier="owner"
+    ent=dict(TIER_ENTITLEMENTS.get(tier,TIER_ENTITLEMENTS["starter"]))
+    overrides=db.entitlement_overrides(int(user_id))
+    for key,value in overrides.items():
+        if key in ent:
+            ent[key]=value
+    return {"tier":tier,"features":ent,"overrides":overrides}
+
+def enforce_account_entitlement(user_id:int, exchange:str, creating:bool=False) -> dict[str,Any]:
+    info=effective_entitlements(user_id); ent=info["features"]; exchange=str(exchange or "").lower()
+    if exchange not in {"coinbase","kraken"} or not bool(ent.get(exchange,False)):
+        raise PermissionError(f"{exchange.title()} is not available on the {info['tier'].title()} tier")
+    if creating:
+        current=len(db.trading_accounts_for_user(int(user_id)))
+        if current >= int(ent.get("max_accounts",1)):
+            raise PermissionError(f"{info['tier'].title()} allows a maximum of {int(ent.get('max_accounts',1))} trading account(s)")
+    return info
+
+def enforce_settings_entitlements(user_id:int, payload:dict[str,Any]) -> dict[str,Any]:
+    info=effective_entitlements(user_id); ent=info["features"]
+    blocked=[]
+    for setting,feature in SETTING_ENTITLEMENTS.items():
+        if setting not in payload or bool(ent.get(feature,False)):
+            continue
+        value=payload.get(setting)
+        # Block enabling boolean premium settings; advanced risk mode is premium unless fixed.
+        enabled = (str(value).lower() not in {"","0","false","off","none","fixed"}) if setting=="risk_sizing_mode" else (
+            value is True or str(value).lower() in {"1","true","on","yes"}
+        )
+        if enabled: blocked.append((setting,feature))
+    if blocked:
+        names=", ".join(x[0] for x in blocked)
+        raise PermissionError(f"Your {info['tier'].title()} tier does not allow: {names}")
+    if payload.get("live_trading_enabled") in {True,"true","1","on","yes"} and not ent.get("live_trading"):
+        raise PermissionError(f"Live trading requires Pro or Elite")
+    return info
+
 DEFAULT_SETTINGS = {
     "asset_class": "crypto",
     "exchange": "coinbase",
@@ -11432,6 +11516,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 "user": u,
                 "accounts": accounts,
                 "default_account_id": int(default_account["id"]) if default_account else None,
+                "entitlements": effective_entitlements(int(u["id"])) if u else None,
             })
             return
         if self.path.startswith("/api/") and not self._check_auth(): return
@@ -11445,6 +11530,9 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if int(self.current_user_id) != 1:
                 self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
             users=db.admin_list_users()
+            for user in users:
+                user["entitlement_overrides"]=db.entitlement_overrides(int(user["id"]))
+                user["effective_entitlements"]=effective_entitlements(int(user["id"]))
             accounts=[]
             for user in users:
                 accounts.extend(db.trading_accounts_for_user(int(user["id"])))
@@ -11853,6 +11941,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             try:
                 uid=int(p.get("user_id")); exchange=str(p.get("exchange") or "kraken").lower()
                 label=str(p.get("account_label") or f"{exchange.title()} Paper")
+                enforce_account_entitlement(uid,exchange,creating=True)
                 aid=db.create_trading_account(uid,exchange,label)
                 settings=dict(DEFAULT_SETTINGS)
                 settings.update({"exchange":exchange,"active_exchange":exchange,"live_trading_enabled":False,
@@ -11916,14 +12005,22 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             email=str(p.get("email") or "").strip().lower()
             password=str(p.get("password") or "")
             name=str(p.get("display_name") or "Auxo User").strip()
-            exchange=str(p.get("exchange") or "kraken").strip().lower()
-            account_label=str(p.get("account_label") or ("Kraken Paper" if exchange=="kraken" else "Coinbase Paper")).strip()
+            exchange=str(p.get("exchange") or "coinbase").strip().lower()
+            tier=str(p.get("subscription_tier") or "starter").strip().lower()
+            account_label=str(p.get("account_label") or (f"{exchange.title()} Paper")).strip()
             if "@" not in email or len(password)<10:
                 self.send_json({"ok":False,"error":"Use a valid email and password of at least 10 characters"}, HTTPStatus.BAD_REQUEST); return
             if exchange not in {"coinbase","kraken"}:
                 self.send_json({"ok":False,"error":"Exchange must be coinbase or kraken"}, HTTPStatus.BAD_REQUEST); return
             try:
                 ids=db.create_user_with_account(email,name,_password_hash(password),exchange,account_label)
+                db.set_subscription_tier(ids["user_id"],tier)
+                try:
+                    enforce_account_entitlement(ids["user_id"],exchange,creating=False)
+                except Exception:
+                    # Roll back a just-created invalid user cleanly.
+                    db.admin_delete_user(ids["user_id"])
+                    raise
                 settings=dict(DEFAULT_SETTINGS)
                 settings.update({"exchange":exchange,"active_exchange":exchange,"live_trading_enabled":False,"oanda_demo_trading_enabled":False,"quote_currency":"GBP"})
                 db.save_user_settings(ids["user_id"],ids["account_id"],settings)
@@ -11939,6 +12036,23 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok":True,**ids,"exchange":exchange,"mode":"paper"})
             except sqlite3.IntegrityError:
                 self.send_json({"ok":False,"error":"A user with that email already exists"},HTTPStatus.CONFLICT)
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/api/admin/users/entitlements":
+            if int(self.current_user_id)!=1:
+                self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                uid=int(p.get("user_id")); tier=str(p.get("subscription_tier") or "starter").lower()
+                overrides=p.get("overrides") or {}
+                db.set_subscription_tier(uid,tier)
+                db.set_entitlement_overrides(uid,overrides)
+                info=effective_entitlements(uid)
+                db.write_audit(int(self.current_user_id),None,"admin_entitlements",
+                               {"target_user_id":uid,"tier":tier,"overrides":overrides})
+                self.send_json({"ok":True,"entitlements":info})
             except Exception as exc:
                 self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
             return
@@ -12038,7 +12152,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if not isinstance(payload, dict):
                 self.send_json({"ok": False, "error": "Settings payload must be an object"}, HTTPStatus.BAD_REQUEST)
                 return
-            if int(ctx["user_id"]) != 1:
+            enforce_settings_entitlements(int(ctx["user_id"]),payload)
+            if not effective_entitlements(int(ctx["user_id"]))["features"].get("live_trading",False):
                 payload["live_trading_enabled"] = False
                 payload["oanda_demo_trading_enabled"] = False
             db.save_user_settings(ctx["user_id"], ctx["account_id"], payload)
@@ -12087,7 +12202,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
             if self.path == "/api/settings":
                 payload = parse_json_body(self)
-                if int(self.current_user_id) != 1:
+                enforce_settings_entitlements(int(self.current_user_id),payload)
+                if not effective_entitlements(int(self.current_user_id))["features"].get("live_trading",False):
                     payload["live_trading_enabled"] = False
                     payload["oanda_demo_trading_enabled"] = False
                 self.bot.update_settings(payload)
@@ -12111,6 +12227,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 return
 
             if self.path == "/api/optimize":
+                if not effective_entitlements(int(self.current_user_id))["features"].get("optimizer",False):
+                    self.send_json({"ok":False,"error":"Optimizer requires Pro or Elite"},HTTPStatus.FORBIDDEN); return
                 payload = parse_json_body(self)
                 settings = {**self.bot.snapshot()["settings"], **payload}
                 self.send_json(run_optimizer(settings))
@@ -12168,6 +12286,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 return
 
             if self.path == "/api/evolve-strategies":
+                if not effective_entitlements(int(self.current_user_id))["features"].get("strategy_evolution",False):
+                    self.send_json({"ok":False,"error":"Strategy evolution requires Elite"},HTTPStatus.FORBIDDEN); return
                 generations = int(parse_json_body(self).get('generations', 50))
                 result = self.bot.evolve_strategies(generations)
                 self.send_json(result)
