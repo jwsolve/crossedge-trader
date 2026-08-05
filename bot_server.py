@@ -11348,6 +11348,22 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("Set-Cookie",f"{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_SESSION_HOURS*3600}")
     def _clear_auth_cookie(self) -> None:
         self.send_header("Set-Cookie",f"{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+
+    def _set_account_cookie(self, account_id:int) -> None:
+        self.send_header("Set-Cookie",f"auxo_account_id={int(account_id)}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_SESSION_HOURS*3600}")
+    def _clear_account_cookie(self) -> None:
+        self.send_header("Set-Cookie","auxo_account_id=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+    def _selected_account(self) -> dict[str,Any] | None:
+        uid=int(getattr(self,"current_user_id",0))
+        raw=_cookie_value(self.headers.get("Cookie",""),"auxo_account_id")
+        if raw:
+            try:
+                aid=int(raw)
+                if db.account_belongs_to_user(uid,aid):
+                    return db.get_trading_account(aid)
+            except Exception:
+                pass
+        return db.default_account_for_user(uid)
     def _authenticated_user(self) -> dict[str, Any] | None:
         api=os.environ.get("BOT_API_TOKEN",""); header=self.headers.get("Authorization","")
         if api and hmac.compare_digest(header,f"Bearer {api}"):
@@ -11362,7 +11378,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         self.current_user=u; self.current_user_id=int(u["id"]); return True
     def _require_owner_engine_context(self) -> bool:
         # D5: resolve only the authenticated user's own provisioned account engine.
-        account = db.default_account_for_user(self.current_user_id)
+        account = self._selected_account()
         if not account:
             self.send_json(
                 {"ok": False, "error": "No enabled trading account for authenticated user"},
@@ -11387,7 +11403,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
     def _request_account_context(self) -> dict[str, Any] | None:
         """Resolve account only from accounts owned by the authenticated user."""
         user_id = int(getattr(self, "current_user_id", 0))
-        account = db.default_account_for_user(user_id)
+        account = self._selected_account()
         if not account:
             self.send_json({"ok": False, "error": "No enabled trading account for authenticated user"}, HTTPStatus.FORBIDDEN)
             return None
@@ -11407,7 +11423,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/auth/me":
             u = self._authenticated_user()
             accounts = db.trading_accounts_for_user(u["id"]) if u else []
-            default_account = db.default_account_for_user(u["id"]) if u else None
+            self.current_user_id=int(u["id"]) if u else 0
+            default_account = self._selected_account() if u else None
             self.send_json({
                 "ok": True,
                 "authenticated": bool(u),
@@ -11419,10 +11436,19 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/") and not self._check_auth(): return
 
+        if self.path == "/api/admin/audit":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+            self.send_json({"ok":True,"entries":db.audit_entries(250)}); return
+
         if self.path == "/api/admin/users":
             if int(self.current_user_id) != 1:
                 self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
-            self.send_json({"ok":True,"users":db.admin_list_users()}); return
+            users=db.admin_list_users()
+            accounts=[]
+            for user in users:
+                accounts.extend(db.trading_accounts_for_user(int(user["id"])))
+            self.send_json({"ok":True,"users":users,"accounts":accounts}); return
 
         if self.path == "/api/account-context":
             ctx = self._request_account_context()
@@ -11800,8 +11826,88 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/auth/logout":
             raw=_cookie_value(self.headers.get("Cookie",""),AUTH_COOKIE_NAME)
             if raw:db.revoke_auth_session(_session_token_hash(raw))
-            self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._clear_auth_cookie(); self.end_headers(); self.wfile.write(b'{"ok":true}'); return
+            try: db.write_audit(int(self._authenticated_user()["id"]) if self._authenticated_user() else None,None,"logout")
+            except Exception: pass
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._clear_auth_cookie(); self._clear_account_cookie(); self.end_headers(); self.wfile.write(b'{"ok":true}'); return
         if not self._check_auth(): return
+
+        if self.path == "/api/auth/select-account":
+            p=parse_json_body(self)
+            try:
+                aid=int(p.get("account_id"))
+                if not db.account_belongs_to_user(int(self.current_user_id),aid):
+                    raise PermissionError("Account does not belong to authenticated user or is disabled")
+                account=db.get_trading_account(aid)
+                if not self.engine_manager.has_engine(aid):
+                    raise RuntimeError("Trading engine is not provisioned for this account")
+                db.write_audit(int(self.current_user_id),aid,"select_account",{"label":account.get("account_label")})
+                self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._set_account_cookie(aid); self.end_headers()
+                self.wfile.write(json.dumps({"ok":True,"account":account}).encode()); return
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST); return
+
+        if self.path == "/api/admin/accounts/create":
+            if int(self.current_user_id)!=1:
+                self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                uid=int(p.get("user_id")); exchange=str(p.get("exchange") or "kraken").lower()
+                label=str(p.get("account_label") or f"{exchange.title()} Paper")
+                aid=db.create_trading_account(uid,exchange,label)
+                settings=dict(DEFAULT_SETTINGS)
+                settings.update({"exchange":exchange,"active_exchange":exchange,"live_trading_enabled":False,
+                                 "oanda_demo_trading_enabled":False,"quote_currency":"GBP"})
+                db.save_user_settings(uid,aid,settings)
+                engine=PaperBot(account_id=aid,user_id=uid,state_file=account_state_file(aid))
+                with engine.lock:
+                    engine.state.settings.update(settings); engine.state.cash=float(settings["starting_cash"])
+                    engine.state.db_initialized=True; engine.save_state()
+                self.engine_manager.register_engine(aid,engine)
+                db.write_audit(int(self.current_user_id),aid,"admin_create_account",
+                               {"target_user_id":uid,"exchange":exchange,"label":label,"mode":"paper"})
+                self.send_json({"ok":True,"account_id":aid,"mode":"paper"}); return
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST); return
+
+        if self.path == "/api/admin/accounts/update":
+            if int(self.current_user_id)!=1:
+                self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                aid=int(p.get("account_id")); enabled=bool(p.get("enabled",True)); label=str(p.get("account_label") or "")
+                engine=self.engine_manager.get_engine(aid)
+                if engine is not None and not enabled:
+                    with engine.lock:
+                        if engine.state.running or engine.state.positions or engine.state.coin>0:
+                            raise ValueError("Stop the bot and close/reset open positions before disabling this account")
+                db.update_trading_account(aid,label,enabled)
+                db.write_audit(int(self.current_user_id),aid,"admin_update_account",{"label":label,"enabled":enabled})
+                self.send_json({"ok":True}); return
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST); return
+
+        if self.path == "/api/admin/accounts/delete":
+            if int(self.current_user_id)!=1:
+                self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self)
+            try:
+                aid=int(p.get("account_id")); account=db.get_trading_account(aid)
+                if not account: raise ValueError("Trading account not found")
+                engine=self.engine_manager.get_engine(aid)
+                if engine is not None:
+                    with engine.lock:
+                        if engine.state.running or engine.state.positions or engine.state.coin>0:
+                            raise ValueError("Stop the bot and close/reset open positions before deleting this account")
+                db.write_audit(int(self.current_user_id),aid,"admin_delete_account",
+                               {"target_user_id":account["user_id"],"label":account["account_label"],
+                                "historical_trades_retained":True})
+                db.delete_trading_account(aid); self.engine_manager.remove_engine(aid,stop=True)
+                state_path=account_state_file(aid)
+                if state_path.exists():
+                    state_path.rename(state_path.with_suffix(state_path.suffix+f".deleted-{int(time.time())}"))
+                self.send_json({"ok":True,"historical_trades_retained":True}); return
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST); return
 
         if self.path == "/api/admin/users/create":
             if int(self.current_user_id) != 1:
@@ -11828,6 +11934,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                     engine.state.db_initialized=True
                     engine.save_state()
                 self.engine_manager.register_engine(ids["account_id"],engine)
+                db.write_audit(int(self.current_user_id),ids["account_id"],"admin_create_user",
+                               {"target_user_id":ids["user_id"],"email":email,"exchange":exchange})
                 self.send_json({"ok":True,**ids,"exchange":exchange,"mode":"paper"})
             except sqlite3.IntegrityError:
                 self.send_json({"ok":False,"error":"A user with that email already exists"},HTTPStatus.CONFLICT)
@@ -11847,6 +11955,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 if "@" not in email:
                     raise ValueError("Use a valid email address")
                 db.admin_update_user(uid,email,name,status)
+                db.write_audit(int(self.current_user_id),None,"admin_update_user",{"target_user_id":uid,"email":email,"status":status})
                 self.send_json({"ok":True})
             except sqlite3.IntegrityError:
                 self.send_json({"ok":False,"error":"A user with that email already exists"},HTTPStatus.CONFLICT)
@@ -11862,6 +11971,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 uid=int(p.get("user_id")); password=str(p.get("password") or "")
                 if len(password)<10: raise ValueError("Password must be at least 10 characters")
                 db.admin_set_password(uid,_password_hash(password))
+                db.write_audit(int(self.current_user_id),None,"admin_reset_password",{"target_user_id":uid})
                 self.send_json({"ok":True})
             except Exception as exc:
                 self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)

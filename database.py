@@ -272,6 +272,17 @@ class BotDatabase:
             cursor.execute("""CREATE TABLE IF NOT EXISTS auth_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, session_token_hash TEXT UNIQUE NOT NULL, user_id INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, revoked_at TEXT)""")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
 
+            cursor.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                account_id INTEGER,
+                action TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_log(user_id, created_at DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_account_time ON audit_log(account_id, created_at DESC)")
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -500,7 +511,72 @@ class BotDatabase:
     def trading_accounts_for_user(self, user_id: int) -> list[dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory=sqlite3.Row
-            return [dict(r) for r in conn.execute("SELECT id,user_id,exchange,account_label,enabled FROM trading_accounts WHERE user_id=? ORDER BY id",(int(user_id),)).fetchall()]
+            return [dict(r) for r in conn.execute(
+                """SELECT a.id,a.user_id,a.exchange,a.account_label,a.enabled,a.created_at,a.updated_at,
+                          COUNT(t.id) AS trade_rows
+                   FROM trading_accounts a
+                   LEFT JOIN trades t ON t.account_id=a.id AND t.user_id=a.user_id
+                   WHERE a.user_id=?
+                   GROUP BY a.id
+                   ORDER BY a.id""",(int(user_id),)
+            ).fetchall()]
+
+    def create_trading_account(self, user_id:int, exchange:str, account_label:str) -> int:
+        exchange=str(exchange or "").strip().lower()
+        if exchange not in {"coinbase","kraken"}:
+            raise ValueError("Exchange must be coinbase or kraken")
+        with sqlite3.connect(self.db_path) as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE id=?",(int(user_id),)).fetchone():
+                raise ValueError("User not found")
+            cur=conn.execute(
+                "INSERT INTO trading_accounts(user_id,exchange,account_label,enabled) VALUES (?,?,?,1)",
+                (int(user_id),exchange,str(account_label or f"{exchange.title()} Paper").strip())
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def update_trading_account(self, account_id:int, account_label:str, enabled:bool) -> None:
+        account_id=int(account_id)
+        if account_id == 1 and not enabled:
+            raise ValueError("Primary owner account cannot be disabled")
+        with sqlite3.connect(self.db_path) as conn:
+            cur=conn.execute(
+                "UPDATE trading_accounts SET account_label=?,enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (str(account_label or "Trading Account").strip(),1 if enabled else 0,account_id)
+            )
+            if cur.rowcount != 1: raise ValueError("Trading account not found")
+            conn.commit()
+
+    def delete_trading_account(self, account_id:int) -> dict[str,Any]:
+        account_id=int(account_id)
+        if account_id == 1: raise ValueError("Primary owner account cannot be deleted")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory=sqlite3.Row
+            row=conn.execute("SELECT id,user_id FROM trading_accounts WHERE id=?",(account_id,)).fetchone()
+            if not row: raise ValueError("Trading account not found")
+            conn.execute("DELETE FROM user_settings WHERE account_id=?",(account_id,))
+            conn.execute("DELETE FROM trading_accounts WHERE id=?",(account_id,))
+            conn.commit()
+            return dict(row)
+
+    def write_audit(self, user_id:int|None, account_id:int|None, action:str, detail:Any=None) -> None:
+        payload = json.dumps(detail, separators=(",",":"), default=str) if detail is not None else None
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT INTO audit_log(user_id,account_id,action,detail) VALUES (?,?,?,?)",
+                         (user_id,account_id,str(action),payload))
+            conn.commit()
+
+    def audit_entries(self, limit:int=200) -> list[dict[str,Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory=sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                """SELECT l.id,l.user_id,l.account_id,l.action,l.detail,l.created_at,
+                          u.email,u.display_name,a.account_label
+                   FROM audit_log l
+                   LEFT JOIN users u ON u.id=l.user_id
+                   LEFT JOIN trading_accounts a ON a.id=l.account_id
+                   ORDER BY l.id DESC LIMIT ?""",(max(1,min(int(limit),1000)),)
+            ).fetchall()]
 
     # ─── D6 OWNER USER ADMINISTRATION ────────────────────────────────
     def admin_list_users(self) -> list[dict[str, Any]]:
