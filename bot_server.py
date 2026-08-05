@@ -374,6 +374,11 @@ DEFAULT_SETTINGS = {
     "allow_short_selling": False,
     "kraken_margin_short_enabled": False,
     "kraken_margin_leverage": 2.0,
+    "kraken_margin_read_only": True,
+    "kraken_margin_max_exposure_quote": 25.0,
+    "kraken_margin_max_open_shorts": 1.0,
+    "kraken_margin_min_level_pct": 250.0,
+    "kraken_margin_test_max_quote": 10.0,
     "telegram_enabled": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
@@ -3800,12 +3805,9 @@ class PaperBot:
                 self.save_state()
             return False
 
-        return (
-            bool(settings.get("live_trading_enabled"))
-            and settings.get("asset_class", "crypto") == "crypto"
-            and settings.get("exchange") == "coinbase"
-            and coinbase_live_is_armed()
-        )
+        exchange=str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
+        armed=coinbase_live_is_armed() if exchange=="coinbase" else (kraken_live_is_armed() if exchange=="kraken" else False)
+        return bool(settings.get("live_trading_enabled")) and settings.get("asset_class","crypto")=="crypto" and exchange in {"coinbase","kraken"} and armed
 
     def coinbase_live_account_snapshot(self) -> dict[str, Any]:
         """Value the real Coinbase brokerage account in the selected quote currency.
@@ -4359,7 +4361,7 @@ class PaperBot:
             "strategy_evolution_frequency", "strategy_max_active",
             "kelly_fraction", "atr_period", "atr_multiplier", "max_hold_hours",
             "rsi_oversold", "rsi_overbought", "ma_exit_period",
-            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee", "kraken_margin_leverage",
+            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee", "kraken_margin_leverage", "kraken_margin_max_exposure_quote", "kraken_margin_max_open_shorts", "kraken_margin_min_level_pct", "kraken_margin_test_max_quote",
         }
         bool_fields = {
             "live_trading_enabled", "use_sr_filter", "use_dynamic_sr_exits",
@@ -4371,7 +4373,7 @@ class PaperBot:
             "news_guard_block_high", "news_guard_block_medium", "news_guard_block_low",
             "telegram_enabled", "telegram_alert_on_buy", "telegram_alert_on_sell",
             "telegram_alert_on_error", "telegram_alert_on_daily_summary",
-            "telegram_alert_on_drawdown", "allow_short_selling", "self_learning_enabled",
+            "telegram_alert_on_drawdown", "allow_short_selling", "kraken_margin_short_enabled", "kraken_margin_read_only", "self_learning_enabled",
             "strategy_creator_enabled", "strategy_evolution_enabled", "strategy_auto_select",
             "regime_adaptation_enabled", "strategy_switching_enabled",
         }
@@ -6566,6 +6568,13 @@ class PaperBot:
             for lp in local:
                 if not any(lp["symbol"] in str(k.get("pair") or "").upper() for k in result["positions"]):
                     result["mismatches"].append(f"Auxo SHORT {lp['symbol']} missing at Kraken")
+            shorts=[p for p in result["positions"] if str(p.get("type") or "").upper()=="SELL" and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
+            max_shorts=max(1,int(float(self.state.settings.get("kraken_margin_max_open_shorts",1))))
+            max_exp=max(0.0,float(self.state.settings.get("kraken_margin_max_exposure_quote",25)))
+            min_lvl=max(0.0,float(self.state.settings.get("kraken_margin_min_level_pct",250)))
+            if len(shorts)>max_shorts: result["mismatches"].append(f"Open shorts {len(shorts)} exceed maximum {max_shorts}")
+            if max_exp and float(result.get("open_exposure_quote") or 0)>max_exp: result["mismatches"].append("Margin exposure exceeds configured maximum")
+            if result.get("margin_level_pct") is not None and float(result["margin_level_pct"])<min_lvl: result["mismatches"].append("Margin level below configured safety floor")
             result["healthy"]=not result["mismatches"]
             result["status"]="SAFE" if result["healthy"] else "LOCKED"
         except Exception as exc:
@@ -6584,6 +6593,61 @@ class PaperBot:
         if not enabled:return {"enabled":False,"healthy":False,"status":"OFF","new_shorts_allowed":False,"message":"Kraken live margin shorts disabled"}
         r=self.reconcile_kraken_margin()
         return {**r,"enabled":True,"new_shorts_allowed":bool(r.get("healthy")),"message":"Kraken margin reconciliation healthy" if r.get("healthy") else "New live shorts locked until Kraken reconciliation is healthy"}
+
+    def validate_kraken_short_lifecycle(self)->dict[str,Any]:
+        """D8.3 deterministic SHORT tests; no network calls and no orders."""
+        tests=[]
+        def t(name,ok,detail): tests.append({"name":name,"ok":bool(ok),"detail":detail})
+        entry=100.0; qty=2.0
+        stop,target,_=self.exit_prices(entry,[],{"stop_loss_pct":2,"take_profit_pct":3,"use_atr_exits":False,"use_dynamic_sr_exits":False},position_side="SHORT")
+        t("TP/SL geometry",stop>entry and target<entry,f"{stop=}, {target=}")
+        t("Falling price profits",(entry-95)*qty>0,"100 -> 95")
+        t("Rising price loses",(entry-105)*qty<0,"100 -> 105")
+        gross=(entry-95)*qty; fees=(entry*qty*.0025)+(95*qty*.0025)
+        t("Entry + exit fees",0<gross-fees<gross,f"gross={gross:.4f}, net={gross-fees:.4f}")
+        t("Partial TP",partial_take_profit_ready(98.4,100,97,{"partial_take_profit_enabled":True,"partial_take_profit_at_target_pct":50},False,is_short=True),"short trigger")
+        trail=trailing_stop_price(100,95,{"trailing_stop_enabled":True,"trailing_activation_pct":3,"trailing_stop_pct":2},is_short=True)
+        t("Trailing stop",trail is not None and 95<trail<100,f"{trail=}")
+        passed=sum(x["ok"] for x in tests)
+        return {"ok":passed==len(tests),"stage":"D8.3","passed":passed,"total":len(tests),"tests":tests}
+
+    def kraken_margin_read_only_check(self)->dict[str,Any]:
+        """D8.4 live account inspection; never submits an order."""
+        if not kraken_api_configured(): return {"ok":False,"stage":"D8.4","error":"Kraken API credentials not configured"}
+        r=self.reconcile_kraken_margin(force=True)
+        return {"ok":bool(r.get("healthy")),"stage":"D8.4","read_only":True,"armed_for_orders":kraken_live_is_armed(),"reconciliation":r}
+
+    def kraken_emergency_close(self,symbol:str|None=None,all_positions:bool=False)->dict[str,Any]:
+        """D8.5 BUY-to-cover emergency control. This can only reduce Kraken SHORT exposure."""
+        if not kraken_live_is_armed(): raise RuntimeError("Kraken live-order interlock is not armed")
+        snap=kraken_margin_snapshot(); closed=[]; errors=[]; wanted=str(symbol or "").upper()
+        for pos in snap.get("positions",[]):
+            if str(pos.get("type") or "").upper()!="SELL": continue
+            pair=str(pos.get("pair") or ""); remaining=max(0.0,float(pos.get("volume") or 0)-float(pos.get("volume_closed") or 0))
+            if remaining<=0 or (not all_positions and wanted and wanted not in pair.upper()): continue
+            try:
+                data=kraken_private("/0/private/AddOrder",{"pair":pair,"type":"buy","ordertype":"market","volume":decimal_text(remaining,8),
+                    "leverage":str(int(float(self.state.settings.get("kraken_margin_leverage",2))))})
+                closed.append({"position_id":pos.get("position_id"),"pair":pair,"quantity":remaining,"order_ids":(data.get("result") or {}).get("txid") or []})
+            except Exception as exc: errors.append({"pair":pair,"error":str(exc)})
+        self.reconcile_kraken_margin(force=True)
+        return {"ok":bool(closed) and not errors,"stage":"D8.5","closed":closed,"errors":errors}
+
+    def kraken_tiny_live_short(self,symbol:str,quote_amount:float)->dict[str,Any]:
+        """D8.6 owner-only, independently capped real-money SHORT test."""
+        if int(self.user_id)!=1: raise RuntimeError("Owner-only test")
+        s=self.state.settings
+        if s.get("kraken_margin_read_only",True): raise RuntimeError("Disable Kraken Margin Read Only first")
+        if not s.get("kraken_margin_short_enabled",False): raise RuntimeError("Kraken Live Margin Shorts is disabled")
+        if not kraken_live_is_armed(): raise RuntimeError("Set the Kraken live confirmation interlock first")
+        cap=max(1.0,float(s.get("kraken_margin_test_max_quote",10))); amount=float(quote_amount)
+        if amount<=0 or amount>cap: raise RuntimeError(f"Test amount must be <= {cap:.2f}")
+        safety=self.kraken_margin_safety()
+        if not safety.get("new_shorts_allowed"): raise RuntimeError("Kraken margin safety is LOCKED")
+        symbol=str(symbol).upper(); quote=str(s.get("quote_currency") or "GBP").upper()
+        price=float(fetch_price("kraken",symbol,quote)); qty=amount/price
+        order=kraken_order(symbol,quote,"SELL","market",qty,leverage=float(s.get("kraken_margin_leverage",2)))
+        return {"ok":True,"stage":"D8.6","symbol":symbol,"quote_amount":amount,"reference_price":price,"quantity":qty,"order_id":order.get("order_id")}
 
     def live_status(self) -> dict[str, Any]:
         with self.lock:
@@ -6773,6 +6837,8 @@ class PaperBot:
             if not settings.get("allow_short_selling",False): raise RuntimeError("Short selling is disabled")
             if active_exchange!="kraken": raise RuntimeError("Live crypto shorting is Kraken-only")
             if not settings.get("kraken_margin_short_enabled",False): raise RuntimeError("Kraken live margin shorts are disabled")
+            if settings.get("kraken_margin_read_only",True):
+                raise RuntimeError("Kraken margin READ ONLY is enabled")
             margin_safety=self.kraken_margin_safety()
             if not margin_safety.get("new_shorts_allowed"):
                 raise RuntimeError("Kraken margin safety lock: "+str(margin_safety.get("error") or margin_safety.get("message") or margin_safety.get("mismatches") or "reconciliation failed"))
@@ -8201,6 +8267,12 @@ def kraken_round_size(v,s,q):
     d=kraken_pair_info(s,q)["lot_decimals"]; f=10**d
     return math.floor(float(v)*f)/f
 
+def kraken_api_configured()->bool:
+    return bool(os.environ.get("KRAKEN_API_KEY","").strip() and os.environ.get("KRAKEN_API_SECRET","").strip())
+
+def kraken_live_is_armed()->bool:
+    return kraken_api_configured() and os.environ.get("KRAKEN_LIVE_CONFIRM","").strip()=="I_UNDERSTAND_THIS_PLACES_REAL_MARGIN_ORDERS"
+
 def kraken_available_balance(currency:str)->float:
     raw=(kraken_private("/0/private/Balance").get("result") or {})
     aliases={"XXBT":"BTC","XBT":"BTC","XXDG":"DOGE","XDG":"DOGE","ZGBP":"GBP","ZUSD":"USD","ZEUR":"EUR","ZUSDT":"USDT"}
@@ -8234,7 +8306,11 @@ def kraken_margin_snapshot(ledger_limit:int=100)->dict[str,Any]:
         if typ=="margin": costs["margin_fees"]+=amt+fee
         if typ=="rollover" or "rollover" in sub: costs["rollover_fees"]+=amt+fee
         if typ in {"trade","margin","rollover"} or "rollover" in sub: costs["ledger_entries"]+=1
-    return {"positions":positions,"open_orders":orders,"trade_balance":tb,"costs":costs}
+    margin_used=float(tb.get("m") or 0); equity=float(tb.get("e") or tb.get("eb") or 0)
+    margin_level=(equity/margin_used*100.0) if margin_used>0 else None
+    exposure=sum(abs(float(p.get("value") or p.get("cost") or 0)) for p in positions)
+    return {"positions":positions,"open_orders":orders,"trade_balance":tb,"costs":costs,
+            "margin_level_pct":margin_level,"open_exposure_quote":exposure}
 
 def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
     info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)
@@ -11643,6 +11719,12 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                     return
                 return
 
+            if self.path == "/api/kraken-margin/validate":
+                self.send_json(self.bot.validate_kraken_short_lifecycle()); return
+            if self.path == "/api/kraken-margin/read-only-check":
+                self.send_json(self.bot.kraken_margin_read_only_check()); return
+            if self.path == "/api/kraken-margin/status":
+                self.send_json({"ok":True,"safety":self.bot.kraken_margin_safety()}); return
             if self.path == "/api/diagnostics":
                 try:
                     self.send_json(diagnostics())
@@ -12199,6 +12281,13 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
         if not self._require_owner_engine_context(): return
         try:
+            if self.path == "/api/kraken-margin/reconcile":
+                self.send_json({"ok":True,"reconciliation":self.bot.reconcile_kraken_margin(force=True)}); return
+            if self.path == "/api/kraken-margin/emergency-close":
+                p=parse_json_body(self); self.send_json(self.bot.kraken_emergency_close(p.get("symbol"),bool(p.get("all_positions",False)))); return
+            if self.path == "/api/kraken-margin/tiny-live-short":
+                if int(self.current_user_id)!=1: self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+                p=parse_json_body(self); self.send_json(self.bot.kraken_tiny_live_short(str(p.get("symbol") or ""),float(p.get("quote_amount") or 0))); return
             if self.path == "/api/start":
                 self.bot.start()
                 self.send_json({"ok": True})

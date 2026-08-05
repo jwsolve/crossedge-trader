@@ -1213,7 +1213,11 @@
         #streamingPill .dot.error { background: var(--bad); }
     </style>
 </head>
-<body>
+<body><div class="panel" style="margin:10px 0"><h3>Kraken Margin Safety · D8.3–D8.6</h3>
+<div class="group"><button id="kmValidate">D8.3 Validate</button><button id="kmRead">D8.4 Read-only Check</button><button id="kmRecon">Reconcile</button>
+<button id="kmClose" class="danger">D8.5 EMERGENCY CLOSE ALL SHORTS</button></div>
+<div class="group"><input id="kmSymbol" value="ADA" style="max-width:90px"><input id="kmAmount" type="number" value="5" min="1" style="max-width:90px">
+<button id="kmTiny">D8.6 Tiny Live SHORT</button></div><pre id="kmOut" style="white-space:pre-wrap;max-height:220px;overflow:auto"></pre></div>
     <div class="app" id="app">
 
         <!-- ─── HEADER ─── -->
@@ -1462,6 +1466,11 @@
                             <label>Allow Short Selling 🔻 <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
 <label>Kraken Live Margin Shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled (paper only)</option><option value="true">Enabled</option></select></label>
 <label>Kraken Margin Leverage <input type="number" name="kraken_margin_leverage" min="2" max="5" step="1" value="2"></label>
+<label>Kraken Margin Read Only <select name="kraken_margin_read_only"><option value="true">Enabled — safest</option><option value="false">Disabled — D8.6 only</option></select></label>
+<label>Max Margin Exposure <input type="number" name="kraken_margin_max_exposure_quote" min="1" step="1" value="25"></label>
+<label>Max Open Shorts <input type="number" name="kraken_margin_max_open_shorts" min="1" max="10" value="1"></label>
+<label>Minimum Margin Level % <input type="number" name="kraken_margin_min_level_pct" min="100" step="10" value="250"></label>
+<label>D8.6 Test Max Value <input type="number" name="kraken_margin_test_max_quote" min="1" value="10"></label>
                             <label>Short SMA <input name="short_window" type="number" value="5" step="1" /></label>
                             <label>Long SMA <input name="long_window" type="number" value="20" step="1" /></label>
                             <label>EWO buy EMA <input name="base_nb_candles_buy" type="number" value="14" step="1" /></label>
@@ -4711,5 +4720,12 @@
             }
         });
     </script>
-</body>
+<script>
+async function kmCall(path,method='GET',body=null){const o=document.getElementById('kmOut');try{const x={method,headers:{}};if(body){x.headers['Content-Type']='application/json';x.body=JSON.stringify(body)}const r=await fetch(path,x),d=await r.json();o.textContent=JSON.stringify(d,null,2)}catch(e){o.textContent=String(e)}}
+document.getElementById('kmValidate')?.addEventListener('click',()=>kmCall('/api/kraken-margin/validate'));
+document.getElementById('kmRead')?.addEventListener('click',()=>kmCall('/api/kraken-margin/read-only-check'));
+document.getElementById('kmRecon')?.addEventListener('click',()=>kmCall('/api/kraken-margin/reconcile','POST',{}));
+document.getElementById('kmClose')?.addEventListener('click',()=>confirm('BUY TO COVER ALL KRAKEN SHORTS?')&&kmCall('/api/kraken-margin/emergency-close','POST',{all_positions:true}));
+document.getElementById('kmTiny')?.addEventListener('click',()=>{const symbol=document.getElementById('kmSymbol').value,quote_amount=Number(document.getElementById('kmAmount').value);if(confirm('REAL MONEY D8.6 SHORT TEST?'))kmCall('/api/kraken-margin/tiny-live-short','POST',{symbol,quote_amount})});
+</script></body>
 </html>
