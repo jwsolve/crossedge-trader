@@ -2259,6 +2259,7 @@
         }
 
         let currentEntitlements = null;
+        let adminUsersCache = [];
         const PREMIUM_SETTING_FEATURES = {
             live_trading_enabled:'live_trading',
             coinbase_maker_first_enabled:'maker_first',
@@ -2327,6 +2328,7 @@
             try {
                 const r = await getJson('/api/admin/users');
                 if (!r.ok) throw new Error(r.error || 'Could not load users');
+                adminUsersCache = r.users || [];
                 els.adminUsersBody.innerHTML = (r.users || []).map(u => {
                     const owner = Number(u.id) === 1;
                     return `<tr data-user-id="${u.id}">
@@ -4175,6 +4177,17 @@
                         status:row.querySelector('.adm-status').value
                     });
                     if (!r.ok) throw new Error(r.error || 'Update failed');
+
+                    // D8 fix: persist the tier selected in the row too.
+                    const selectedTier=row.querySelector('.adm-tier')?.value || 'starter';
+                    const cachedUser=(adminUsersCache || []).find(u => Number(u.id)===userId);
+                    const existingOverrides=cachedUser?.entitlement_overrides || {};
+                    const tierResult=await post('/api/admin/users/entitlements',{
+                        user_id:userId,
+                        subscription_tier:selectedTier,
+                        overrides:existingOverrides
+                    });
+                    if (!tierResult.ok) throw new Error(tierResult.error || 'Tier update failed');
                     els.adminMessage.style.display='block'; els.adminMessage.textContent='User updated.';
                     await loadAdminUsers();
                 }
