@@ -8275,12 +8275,6 @@ def kraken_round_size(v,s,q):
     d=kraken_pair_info(s,q)["lot_decimals"]; f=10**d
     return math.floor(float(v)*f)/f
 
-def kraken_api_configured()->bool:
-    return bool(os.environ.get("KRAKEN_API_KEY","").strip() and os.environ.get("KRAKEN_API_SECRET","").strip())
-
-def kraken_live_is_armed()->bool:
-    return kraken_api_configured() and os.environ.get("KRAKEN_LIVE_CONFIRM","").strip()=="I_UNDERSTAND_THIS_PLACES_REAL_MARGIN_ORDERS"
-
 def kraken_available_balance(currency:str)->float:
     raw=(kraken_private("/0/private/Balance").get("result") or {})
     aliases={"XXBT":"BTC","XBT":"BTC","XXDG":"DOGE","XDG":"DOGE","ZGBP":"GBP","ZUSD":"USD","ZEUR":"EUR","ZUSDT":"USDT"}
