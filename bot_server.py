@@ -6835,25 +6835,91 @@ class PaperBot:
                                   "owned_positions":post.get("owned_positions",[])}}
 
     def kraken_emergency_close(self,symbol:str|None=None,all_positions:bool=False)->dict[str,Any]:
-        """D8.5 BUY-to-cover emergency control. This can only reduce Kraken SHORT exposure."""
-        if not kraken_live_is_armed(): raise RuntimeError("Kraken live-order interlock is not armed")
-        snap=kraken_margin_snapshot(); closed=[]; errors=[]; wanted=str(symbol or "").upper()
+        """D8.6.10 ownership-aware BUY-to-cover. Default path closes only Auxo-owned Kraken SHORT quantity."""
+        if not kraken_live_is_armed():
+            raise RuntimeError("Kraken live-order interlock is not armed")
+        wanted=str(symbol or "").upper()
+        snap=kraken_margin_snapshot()
+        owned=getattr(self.state,"kraken_margin_owned",{}) or {}
+        closed=[]; errors=[]; skipped=[]
+
+        # Build currently-open Kraken SELL exposure by pair.
+        open_by_pair={}
         for pos in snap.get("positions",[]):
             if str(pos.get("type") or "").upper()!="SELL": continue
-            pair=str(pos.get("pair") or ""); remaining=max(0.0,float(pos.get("volume") or 0)-float(pos.get("volume_closed") or 0))
-            if remaining<=0 or (not all_positions and wanted and wanted not in pair.upper()): continue
+            pair=str(pos.get("pair") or "").upper()
+            remaining=max(0.0,float(pos.get("volume") or 0)-float(pos.get("volume_closed") or 0))
+            if remaining>0:
+                open_by_pair[pair]=open_by_pair.get(pair,0.0)+remaining
+
+        candidates=[]
+        for oid,rec in owned.items():
+            if str(rec.get("status") or "").lower() not in {"open","pending","adopted"}: continue
+            sym=str(rec.get("symbol") or "").upper()
+            if wanted and sym!=wanted: continue
+            pair=str(rec.get("pair") or f"{sym}{rec.get('quote') or ''}").upper()
+            qty=max(0.0,float(rec.get("quantity") or 0))
+            if qty<=0: continue
+            candidates.append((oid,rec,pair,qty))
+
+        if not candidates:
+            return {"ok":False,"stage":"D8.6.10","closed":[],"errors":[],
+                    "skipped":[],"message":"No Auxo-owned Kraken margin SHORT matched the request"}
+
+        # Never close more than Kraken currently reports open for that pair.
+        reserved={}
+        for oid,rec,pair,owned_qty in candidates:
+            available=max(0.0,open_by_pair.get(pair,0.0)-reserved.get(pair,0.0))
+            cover_qty=min(owned_qty,available)
+            if cover_qty<=0:
+                skipped.append({"order_id":oid,"pair":pair,"reason":"No matching open Kraken SHORT exposure"})
+                continue
             try:
-                data=kraken_private("/0/private/AddOrder",{"pair":pair,"type":"buy","ordertype":"market","volume":decimal_text(remaining,8),
-                    "leverage":str(int(float(self.state.settings.get("kraken_margin_leverage",2))))})
+                leverage=rec.get("leverage") or self.state.settings.get("kraken_margin_leverage",2)
+                lev=str(leverage).split(":")[0]
+                data=kraken_private("/0/private/AddOrder",{
+                    "pair":pair,"type":"buy","ordertype":"market",
+                    "volume":decimal_text(cover_qty,8),"leverage":str(int(float(lev)))
+                })
                 cover_ids=(data.get("result") or {}).get("txid") or []
-                closed.append({"position_id":pos.get("position_id"),"pair":pair,"quantity":remaining,"order_ids":cover_ids})
-                for oid,rec in (getattr(self.state,"kraken_margin_owned",{}) or {}).items():
-                    if str(rec.get("symbol") or "").upper() in pair.upper() and str(rec.get("status") or "").lower() in {"open","pending","adopted"}:
-                        rec["status"]="closing"; rec["close_order_ids"]=cover_ids; rec["closing_ts"]=time.time()
+                rec["status"]="closing"
+                rec["close_order_ids"]=cover_ids
+                rec["closing_ts"]=time.time()
+                rec["requested_cover_quantity"]=cover_qty
+                reserved[pair]=reserved.get(pair,0.0)+cover_qty
+                closed.append({"owned_order_id":oid,"pair":pair,"quantity":cover_qty,
+                               "cover_order_ids":cover_ids})
                 self.save_state()
-            except Exception as exc: errors.append({"pair":pair,"error":str(exc)})
-        self.reconcile_kraken_margin(force=True)
-        return {"ok":bool(closed) and not errors,"stage":"D8.5","closed":closed,"errors":errors}
+            except Exception as exc:
+                errors.append({"owned_order_id":oid,"pair":pair,"error":str(exc)})
+
+        # Reconcile after cover submission. Mark ownership closed only when Kraken's remaining
+        # exposure is no greater than non-Auxo residual/dust that existed outside owned quantity.
+        time.sleep(1.0)
+        post=self.reconcile_kraken_margin(force=True)
+        post_positions=post.get("positions",[])
+        for oid,rec,pair,owned_qty in candidates:
+            if str(rec.get("status") or "").lower()!="closing": continue
+            remaining=sum(max(0.0,float(p.get("volume") or 0)-float(p.get("volume_closed") or 0))
+                          for p in post_positions
+                          if str(p.get("pair") or "").upper()==pair and str(p.get("type") or "").upper()=="SELL")
+            # Pre-existing non-owned residue is the amount Kraken had above Auxo ownership.
+            original_open=open_by_pair.get(pair,0.0)
+            non_owned_residual=max(0.0,original_open-owned_qty)
+            tolerance=1e-8
+            if remaining<=non_owned_residual+tolerance:
+                rec["status"]="closed"; rec["closed_ts"]=time.time()
+                rec["remaining_kraken_residual"]=remaining
+        self.save_state()
+
+        # Reconcile once more so normal dust handling can classify any old residual.
+        self._kraken_margin_reconciliation=None
+        final=self.reconcile_kraken_margin(force=True)
+        return {"ok":bool(closed) and not errors,"stage":"D8.6.10",
+                "closed":closed,"errors":errors,"skipped":skipped,
+                "reconciliation":{"healthy":final.get("healthy"),"status":final.get("status"),
+                                  "mismatches":final.get("mismatches",[]),
+                                  "ignored_dust":final.get("ignored_dust",[])}}
 
     def kraken_margin_order_diagnostics(self,symbol:str,quote_amount:float,validate_with_kraken:bool=True,quote_override:str|None=None)->dict[str,Any]:
         """D8.6.1 diagnostic: inspect exact pair/order params. validate=true cannot execute an order."""
