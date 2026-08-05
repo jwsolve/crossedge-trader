@@ -1213,7 +1213,7 @@
         #streamingPill .dot.error { background: var(--bad); }
     </style>
 </head>
-<body><div class="panel" style="margin:10px 0"><h3>Kraken Margin Safety · D8.3–D8.6</h3>
+<body><div class="panel" style="margin:10px 0"><h3>Kraken Margin Safety · Pair-aware D8.6.3</h3>
 <div class="group"><button id="kmValidate">D8.3 Validate</button><button id="kmRead">D8.4 Read-only Check</button><button id="kmRecon">Reconcile</button>
 <button id="kmClose" class="danger">D8.5 EMERGENCY CLOSE ALL SHORTS</button></div>
 <div class="group"><input id="kmSymbol" value="ADA" style="max-width:90px"><input id="kmAmount" type="number" value="5" min="1" style="max-width:90px">
@@ -1466,6 +1466,7 @@
                             <label>Allow Short Selling 🔻 <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
 <label>Kraken Live Margin Shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled (paper only)</option><option value="true">Enabled</option></select></label>
 <label>Kraken Margin Leverage <input type="number" name="kraken_margin_leverage" min="2" max="5" step="1" value="2"></label>
+<label>Kraken Margin Quote Currency <select name="kraken_margin_quote_currency"><option value="USDT">USDT</option><option value="USD">USD</option><option value="GBP">GBP</option><option value="EUR">EUR</option></select></label>
 <label>Kraken Margin Read Only <select name="kraken_margin_read_only"><option value="true">Enabled — safest</option><option value="false">Disabled — D8.6 only</option></select></label>
 <label>Max Margin Exposure <input type="number" name="kraken_margin_max_exposure_quote" min="1" step="1" value="25"></label>
 <label>Max Open Shorts <input type="number" name="kraken_margin_max_open_shorts" min="1" max="10" value="1"></label>

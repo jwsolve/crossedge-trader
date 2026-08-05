@@ -374,6 +374,7 @@ DEFAULT_SETTINGS = {
     "allow_short_selling": False,
     "kraken_margin_short_enabled": False,
     "kraken_margin_leverage": 2.0,
+    "kraken_margin_quote_currency": "USDT",
     "kraken_margin_read_only": True,
     "kraken_margin_max_exposure_quote": 25.0,
     "kraken_margin_max_open_shorts": 1.0,
@@ -4378,7 +4379,7 @@ class PaperBot:
             "regime_adaptation_enabled", "strategy_switching_enabled",
         }
         text_fields = {
-            "asset_class", "exchange", "active_exchange", "symbol", "quote_currency", "strategy",
+            "asset_class", "exchange", "active_exchange", "symbol", "quote_currency", "kraken_margin_quote_currency", "strategy",
             "position_sizing_mode", "live_order_type", "risk_sizing_mode",
         }
         sensitive_fields = {
@@ -6551,48 +6552,147 @@ class PaperBot:
         )
 
     def reconcile_kraken_margin(self,force:bool=False)->dict[str,Any]:
-        now=time.time(); cached=getattr(self,"_kraken_margin_reconciliation",None)
-        if cached and not force and now-float(cached.get("_ts",0))<15:return cached
-        result={"healthy":False,"status":"LOCKED","positions":[],"open_orders":[],"trade_balance":{},"costs":{},"mismatches":[],"error":None,"_ts":now}
+        """D8.6.5: cached reconciliation with Kraken rate-limit backoff."""
+        now=time.time()
+        cached=getattr(self,"_kraken_margin_reconciliation",None)
+        good=getattr(self,"_kraken_margin_last_good",None)
+        backoff_until=float(getattr(self,"_kraken_margin_backoff_until",0) or 0)
+
+        # Normal status/safety polling reuses a recent snapshot instead of spending private API quota.
+        if cached and not force and now-float(cached.get("_ts",0))<30:
+            return {**cached,"cache":{"used":True,"age_seconds":round(now-float(cached.get("_ts",0)),2),"ttl_seconds":30}}
+
+        # During Kraken backoff, do not retry private endpoints. A recent known-good snapshot may
+        # be displayed, but it is explicitly NOT allowed to authorise a new live short.
+        if now<backoff_until:
+            remaining=max(0,int(math.ceil(backoff_until-now)))
+            if good and now-float(good.get("_ts",0))<120:
+                return {**good,"status":"RATE_LIMITED","rate_limited":True,
+                        "rate_limit_retry_after_seconds":remaining,
+                        "cache":{"used":True,"age_seconds":round(now-float(good.get("_ts",0)),2),"ttl_seconds":120},
+                        "message":f"Kraken API rate limited; using recent read-only snapshot. Retry in ~{remaining}s"}
+            return {"healthy":False,"status":"RATE_LIMITED","positions":[],"open_orders":[],
+                    "trade_balance":{},"costs":{},"mismatches":[],"error":"Kraken API rate limit backoff active",
+                    "_ts":now,"rate_limited":True,"rate_limit_retry_after_seconds":remaining}
+
+        result={"healthy":False,"status":"LOCKED","positions":[],"open_orders":[],"trade_balance":{},
+                "costs":{},"mismatches":[],"error":None,"_ts":now,"rate_limited":False}
         try:
             snap=kraken_margin_snapshot(); result.update(snap)
             local=[]
             for sym,p in self.state.positions.items():
                 if p.get("is_short"):
                     local.append({"symbol":str(sym).upper(),"quantity":abs(float(p.get("quantity") or 0))})
-            # A live Kraken margin position unknown to Auxo is a hard safety mismatch.
             for kp in result["positions"]:
-                pair=str(kp.get("pair") or "").upper(); qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
-                if qty<=0:continue
-                if not any(x["symbol"] in pair for x in local): result["mismatches"].append(f"Unknown Kraken margin position {kp.get('position_id')} {pair}")
+                pair=str(kp.get("pair") or "").upper()
+                qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
+                if qty<=0: continue
+                if not any(x["symbol"] in pair for x in local):
+                    result["mismatches"].append(f"Unknown Kraken margin position {kp.get('position_id')} {pair}")
             for lp in local:
                 if not any(lp["symbol"] in str(k.get("pair") or "").upper() for k in result["positions"]):
                     result["mismatches"].append(f"Auxo SHORT {lp['symbol']} missing at Kraken")
-            shorts=[p for p in result["positions"] if str(p.get("type") or "").upper()=="SELL" and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
+            shorts=[p for p in result["positions"] if str(p.get("type") or "").upper()=="SELL"
+                    and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
             max_shorts=max(1,int(float(self.state.settings.get("kraken_margin_max_open_shorts",1))))
             max_exp=max(0.0,float(self.state.settings.get("kraken_margin_max_exposure_quote",25)))
             min_lvl=max(0.0,float(self.state.settings.get("kraken_margin_min_level_pct",250)))
             if len(shorts)>max_shorts: result["mismatches"].append(f"Open shorts {len(shorts)} exceed maximum {max_shorts}")
-            if max_exp and float(result.get("open_exposure_quote") or 0)>max_exp: result["mismatches"].append("Margin exposure exceeds configured maximum")
-            if result.get("margin_level_pct") is not None and float(result["margin_level_pct"])<min_lvl: result["mismatches"].append("Margin level below configured safety floor")
+            if max_exp and float(result.get("open_exposure_quote") or 0)>max_exp:
+                result["mismatches"].append("Margin exposure exceeds configured maximum")
+            if result.get("margin_level_pct") is not None and float(result["margin_level_pct"])<min_lvl:
+                result["mismatches"].append("Margin level below configured safety floor")
             result["healthy"]=not result["mismatches"]
             result["status"]="SAFE" if result["healthy"] else "LOCKED"
+            result["cache"]={"used":False,"age_seconds":0,"ttl_seconds":30}
+            self._kraken_margin_backoff_until=0
+            if result["healthy"]:
+                self._kraken_margin_last_good=dict(result)
         except Exception as exc:
-            result["error"]=str(exc); result["status"]="LOCKED"; result["healthy"]=False
+            err=str(exc)
+            result["error"]=err
+            if "rate limit" in err.lower() or "eapi:rate limit exceeded" in err.lower():
+                # Conservative one-minute cool-off. Do not hammer Kraken while it is rejecting calls.
+                self._kraken_margin_backoff_until=now+60
+                result["status"]="RATE_LIMITED"; result["rate_limited"]=True
+                result["rate_limit_retry_after_seconds"]=60
+            else:
+                result["status"]="LOCKED"
+            result["healthy"]=False
+
         self._kraken_margin_reconciliation=result
         try:
             self.db.save_kraken_margin_reconciliation(self.user_id,self.account_id,result)
             if result["mismatches"] or result["error"]:
-                self.db.write_audit(self.user_id,self.account_id,"kraken_margin_reconciliation_failed",{"mismatches":result["mismatches"],"error":result["error"]})
-        except Exception as exc: logger.warning(f"Could not persist Kraken margin reconciliation: {exc}")
+                self.db.write_audit(self.user_id,self.account_id,"kraken_margin_reconciliation_failed",
+                                    {"mismatches":result["mismatches"],"error":result["error"],
+                                     "status":result.get("status")})
+        except Exception as exc:
+            logger.warning(f"Could not persist Kraken margin reconciliation: {exc}")
         return result
 
-    def kraken_margin_safety(self)->dict[str,Any]:
-        settings=self.state.settings; exchange=str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
-        enabled=bool(settings.get("kraken_margin_short_enabled")) and exchange=="kraken" and bool(settings.get("live_trading_enabled"))
-        if not enabled:return {"enabled":False,"healthy":False,"status":"OFF","new_shorts_allowed":False,"message":"Kraken live margin shorts disabled"}
-        r=self.reconcile_kraken_margin()
-        return {**r,"enabled":True,"new_shorts_allowed":bool(r.get("healthy")),"message":"Kraken margin reconciliation healthy" if r.get("healthy") else "New live shorts locked until Kraken reconciliation is healthy"}
+    def kraken_margin_safety(self,symbol:str|None=None)->dict[str,Any]:
+        """Authoritative D8.6.4 gate for NEW Kraken margin shorts, with an explicit lock reason."""
+        settings=self.state.settings
+        exchange=str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
+        symbol=str(symbol or settings.get("symbol") or "ADA").upper()
+        quote=kraken_margin_quote(settings)
+        requested=float(settings.get("kraken_margin_leverage",2))
+
+        def locked(state:str,reason:str,**extra)->dict[str,Any]:
+            return {"enabled":bool(settings.get("kraken_margin_short_enabled")),
+                    "healthy":False,"status":"LOCKED","margin_state":state,
+                    "new_shorts_allowed":False,"reason":reason,"message":reason,
+                    "margin_pair":f"{symbol}/{quote}",**extra}
+
+        if exchange!="kraken":
+            return locked("EXCHANGE_NOT_KRAKEN","Kraken is not the active exchange")
+        if not bool(settings.get("live_trading_enabled")):
+            return locked("LIVE_DISABLED","Live trading is disabled")
+        if not bool(settings.get("kraken_margin_short_enabled")):
+            return locked("MARGIN_SHORTS_DISABLED","Kraken live margin shorts are disabled")
+        if bool(settings.get("kraken_margin_read_only",True)):
+            return locked("READ_ONLY","Kraken margin read-only mode is enabled")
+        if not kraken_api_configured():
+            return locked("API_NOT_CONFIGURED","Kraken API credentials are not configured")
+        if not kraken_live_is_armed():
+            return locked("LIVE_INTERLOCK","LIVE_TRADING_CONFIRM is not armed")
+
+        r=self.reconcile_kraken_margin(force=False)
+        if r.get("rate_limited") or r.get("status")=="RATE_LIMITED":
+            return {**r,"enabled":True,"status":"RATE_LIMITED","margin_state":"RATE_LIMITED",
+                    "new_shorts_allowed":False,
+                    "reason":r.get("message") or r.get("error") or "Kraken API rate limited",
+                    "message":r.get("message") or "Kraken API rate limited",
+                    "margin_pair":f"{symbol}/{quote}"}
+        if not bool(r.get("healthy")):
+            return {**r,"enabled":True,"status":"LOCKED","margin_state":"RECONCILIATION_LOCK",
+                    "new_shorts_allowed":False,"reason":"Kraken margin reconciliation is not healthy",
+                    "message":"Kraken margin reconciliation is not healthy","margin_pair":f"{symbol}/{quote}"}
+
+        try:
+            pair=kraken_margin_pair_diagnostics(symbol,quote)
+        except Exception as exc:
+            return {**r,"enabled":True,"status":"LOCKED","margin_state":"PAIR_ERROR",
+                    "new_shorts_allowed":False,"reason":str(exc),"message":str(exc),
+                    "margin_pair":f"{symbol}/{quote}"}
+
+        allowed=[float(x) for x in (pair.get("leverage_sell") or [])]
+        if not allowed:
+            reason=f"{symbol}/{quote} does not advertise SHORT margin leverage"
+            return {**r,"enabled":True,"status":"LOCKED","margin_state":"PAIR_UNSUPPORTED",
+                    "new_shorts_allowed":False,"reason":reason,"message":reason,
+                    "margin_pair":f"{symbol}/{quote}","pair":pair}
+        if requested not in allowed:
+            reason=f"{symbol}/{quote} does not support requested {requested:g}x leverage; allowed={allowed}"
+            return {**r,"enabled":True,"status":"LOCKED","margin_state":"LEVERAGE_UNSUPPORTED",
+                    "new_shorts_allowed":False,"reason":reason,"message":reason,
+                    "margin_pair":f"{symbol}/{quote}","pair":pair}
+
+        return {**r,"enabled":True,"healthy":True,"status":"SAFE","margin_state":"READY",
+                "new_shorts_allowed":True,"reason":None,
+                "message":f"{symbol}/{quote} ready for {requested:g}x SHORT margin",
+                "margin_pair":f"{symbol}/{quote}","pair":pair}
 
     def validate_kraken_short_lifecycle(self)->dict[str,Any]:
         """D8.3 deterministic SHORT tests; no network calls and no orders."""
@@ -6633,10 +6733,10 @@ class PaperBot:
         self.reconcile_kraken_margin(force=True)
         return {"ok":bool(closed) and not errors,"stage":"D8.5","closed":closed,"errors":errors}
 
-    def kraken_margin_order_diagnostics(self,symbol:str,quote_amount:float,validate_with_kraken:bool=True)->dict[str,Any]:
+    def kraken_margin_order_diagnostics(self,symbol:str,quote_amount:float,validate_with_kraken:bool=True,quote_override:str|None=None)->dict[str,Any]:
         """D8.6.1 diagnostic: inspect exact pair/order params. validate=true cannot execute an order."""
         s=self.state.settings
-        symbol=str(symbol or "").upper(); quote=str(s.get("quote_currency") or "GBP").upper()
+        symbol=str(symbol or "").upper(); quote=str(quote_override or kraken_margin_quote(s)).upper()
         amount=float(quote_amount or 0)
         pair_diag=kraken_margin_pair_diagnostics(symbol,quote)
         candles=fetch_kraken_candles(symbol,quote,60,20)
@@ -6672,10 +6772,24 @@ class PaperBot:
         if not kraken_live_is_armed(): raise RuntimeError("Set the Kraken live confirmation interlock first")
         cap=max(1.0,float(s.get("kraken_margin_test_max_quote",10))); amount=float(quote_amount)
         if amount<=0 or amount>cap: raise RuntimeError(f"Test amount must be <= {cap:.2f}")
-        safety=self.kraken_margin_safety()
-        if not safety.get("new_shorts_allowed"): raise RuntimeError("Kraken margin safety is LOCKED")
-        symbol=str(symbol).upper(); quote=str(s.get("quote_currency") or "GBP").upper()
+        safety=self.kraken_margin_safety(symbol)
+        if not safety.get("new_shorts_allowed"):
+            raise RuntimeError(f"Kraken margin safety is LOCKED: {safety.get('reason') or safety.get('message') or safety.get('margin_state')}")
+        # Final pre-trade check must be fresh. If Kraken rate-limits this, the live order remains locked.
+        fresh=self.reconcile_kraken_margin(force=True)
+        if fresh.get("rate_limited") or fresh.get("status")=="RATE_LIMITED":
+            raise RuntimeError(f"Kraken margin safety is RATE_LIMITED: retry in ~{fresh.get('rate_limit_retry_after_seconds',60)}s")
+        if not fresh.get("healthy"):
+            raise RuntimeError("Kraken margin safety is LOCKED: fresh pre-trade reconciliation failed")
+        symbol=str(symbol).upper(); quote=kraken_margin_quote(s)
         # Use Auxo's existing Kraken market-data path rather than a nonexistent fetch_price helper.
+        pair_diag=kraken_margin_pair_diagnostics(symbol,quote)
+        allowed=[float(x) for x in (pair_diag.get("leverage_sell") or [])]
+        requested=float(s.get("kraken_margin_leverage",2))
+        if not allowed:
+            raise RuntimeError(f"Kraken margin pair {symbol}/{quote} does not advertise SHORT leverage")
+        if requested not in allowed:
+            raise RuntimeError(f"Kraken margin pair {symbol}/{quote} does not support requested {requested:g}x leverage; allowed={allowed}")
         candles=fetch_kraken_candles(symbol,quote,60,20)
         if not candles:
             raise RuntimeError(f"No Kraken market price available for {symbol}/{quote}")
@@ -8311,6 +8425,9 @@ def kraken_pair_info(symbol:str, quote:str)->dict[str,Any]:
             _KRAKEN_PAIRS[key]=x;return x
     raise RuntimeError(f"Kraken pair unavailable: {key}")
 
+
+def kraken_margin_quote(settings:dict[str,Any])->str:
+    return str(settings.get("kraken_margin_quote_currency") or "USDT").upper().strip()
 
 def kraken_margin_pair_diagnostics(symbol:str,quote:str)->dict[str,Any]:
     """Public/read-only diagnostics for the exact Kraken pair Auxo will submit."""
@@ -11807,7 +11924,8 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/kraken-margin/read-only-check":
                 self.send_json(self.bot.kraken_margin_read_only_check()); return
             if self.path == "/api/kraken-margin/status":
-                self.send_json({"ok":True,"safety":self.bot.kraken_margin_safety()}); return
+                safety=self.bot.kraken_margin_safety()
+                self.send_json({"ok":True,**safety}); return
             if self.path == "/api/diagnostics":
                 try:
                     self.send_json(diagnostics())
@@ -12368,7 +12486,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         try:
             if self.path == "/api/kraken-margin/diagnose-order":
                 p=parse_json_body(self)
-                self.send_json(self.bot.kraken_margin_order_diagnostics(str(p.get("symbol") or "ADA"),float(p.get("quote_amount") or 5),True)); return
+                self.send_json(self.bot.kraken_margin_order_diagnostics(str(p.get("symbol") or "ADA"),float(p.get("quote_amount") or 5),True,p.get("quote"))); return
             if self.path == "/api/kraken-margin/reconcile":
                 self.send_json({"ok":True,"reconciliation":self.bot.reconcile_kraken_margin(force=True)}); return
             if self.path == "/api/kraken-margin/emergency-close":
