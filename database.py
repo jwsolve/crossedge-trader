@@ -685,57 +685,47 @@ class BotDatabase:
                 item["learning_context"] = {}
         return rows
 
-    def get_trade_stats(self, symbol: Optional[str] = None) -> dict:
+    def get_trade_stats(
+        self,
+        symbol: Optional[str] = None,
+        user_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+        exchange: Optional[str] = None,
+    ) -> dict:
+        clauses = []
+        params: list[Any] = []
+        if symbol:
+            clauses.append("symbol = ?"); params.append(symbol)
+        if user_id is not None:
+            clauses.append("user_id = ?"); params.append(int(user_id))
+        if account_id is not None:
+            clauses.append("account_id = ?"); params.append(int(account_id))
+        if exchange:
+            clauses.append("LOWER(COALESCE(exchange, '')) = ?"); params.append(str(exchange).lower())
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END),
+                   SUM(pnl), AVG(pnl),
+                   AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END),
+                   AVG(CASE WHEN pnl <= 0 THEN pnl ELSE NULL END)
+            FROM trades {where}
+        """
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-
-            if symbol:
-                cursor.execute('''
-                    SELECT
-                        COUNT(*) as total_trades,
-                        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                        SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
-                        SUM(pnl) as total_pnl,
-                        AVG(pnl) as avg_pnl,
-                        AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END) as avg_win,
-                        AVG(CASE WHEN pnl <= 0 THEN pnl ELSE NULL END) as avg_loss
-                    FROM trades
-                    WHERE symbol = ?
-                ''', (symbol,))
-            else:
-                cursor.execute('''
-                    SELECT
-                        COUNT(*) as total_trades,
-                        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                        SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
-                        SUM(pnl) as total_pnl,
-                        AVG(pnl) as avg_pnl,
-                        AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END) as avg_win,
-                        AVG(CASE WHEN pnl <= 0 THEN pnl ELSE NULL END) as avg_loss
-                    FROM trades
-                ''')
-
-            result = cursor.fetchone()
-            if result:
-                total = result[0] or 0
-                wins = result[1] or 0
-                losses = result[2] or 0
-                return {
-                    'total_trades': total,
-                    'winning_trades': wins,
-                    'losing_trades': losses,
-                    'total_pnl': result[3] or 0.0,
-                    'avg_pnl': result[4] or 0.0,
-                    'avg_win': result[5] or 0.0,
-                    'avg_loss': result[6] or 0.0,
-                    'win_rate': (wins / total * 100) if total > 0 else 0.0,
-                    # AVG() returns NULL when there are no winning (or losing)
-                    # rows. Use the already-normalised values above so a symbol
-                    # with losses but no wins cannot raise None / float here.
-                    'profit_factor': abs((result[5] or 0.0) / (result[6] or 0.0))
-                    if (result[6] or 0.0) != 0 else 0.0,
-                }
+            result = conn.execute(sql, params).fetchone()
+        if not result:
             return {}
+        total=result[0] or 0; wins=result[1] or 0; losses=result[2] or 0
+        avg_win=result[5] or 0.0; avg_loss=result[6] or 0.0
+        return {
+            "total_trades": total, "winning_trades": wins, "losing_trades": losses,
+            "total_pnl": result[3] or 0.0, "avg_pnl": result[4] or 0.0,
+            "avg_win": avg_win, "avg_loss": avg_loss,
+            "win_rate": (wins/total*100) if total else 0.0,
+            "profit_factor": abs(avg_win/avg_loss) if avg_loss != 0 else 0.0,
+        }
 
     def update_performance_metrics(self, symbol: Optional[str] = None) -> None:
         stats = self.get_trade_stats(symbol)

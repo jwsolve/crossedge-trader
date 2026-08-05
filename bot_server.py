@@ -4491,6 +4491,11 @@ class PaperBot:
 
     # ─── Snapshot ────────────────────────────────────────────────────
 
+    def performance_scope_label(self) -> str:
+        exchange = str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+        mode = "live" if bool(self.state.settings.get("live_trading_enabled", False)) else "paper"
+        return f"{exchange}_{mode}_account_only_net_fees"
+
     def live_trade_performance_stats(self) -> dict[str, Any]:
         """Return completed LIVE-trade performance from trades.db, net of fees.
 
@@ -4501,11 +4506,11 @@ class PaperBot:
         win/loss, win rate, profit factor and average P/L all use the same net result.
         """
         try:
-            rows = self.db.get_trades(limit=999999)
+            rows = self.db.get_trades(limit=999999, user_id=self.user_id, account_id=self.account_id)
         except Exception as exc:
             logger.warning(f"Could not read live performance from trades.db: {exc}")
             return {
-                "source": "trades.db", "scope": "coinbase_live_only_net_fees", "closed_trades": 0,
+                "source": "trades.db", "scope": self.performance_scope_label(), "closed_trades": 0,
                 "winning_trades": 0, "losing_trades": 0, "breakeven_trades": 0,
                 "win_rate": None, "profit_factor": None, "average_win": None,
                 "average_loss": None, "gross_profit": 0.0, "gross_loss": 0.0,
@@ -4521,19 +4526,30 @@ class PaperBot:
             if not row.get("exchange_order_id"):
                 continue
 
-            # Performance cards are deliberately Coinbase-only. OANDA also records
-            # exchange_order_id values, so that field alone is NOT enough to identify
-            # a Coinbase live trade. Coinbase-generated trade reasons contain either
-            # the LIVE fill marker or an explicit Coinbase manual-close marker.
+            # Rows are already user/account scoped. Keep the card population
+            # aligned with this account's configured exchange and execution mode.
             reason_text = str(row.get("reason") or "")
             reason_upper = reason_text.upper()
-            is_coinbase_live = (
-                "LIVE " in reason_upper
-                or "COINBASE" in reason_upper
-                or "EMERGENCY MARKET EXIT" in reason_upper
-            )
-            if "OANDA" in reason_upper or not is_coinbase_live:
-                continue
+            row_exchange = str(row.get("exchange") or "").lower()
+            active_exchange = str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+            is_live = bool(self.state.settings.get("live_trading_enabled", False))
+
+            if active_exchange == "coinbase":
+                is_coinbase_live = (
+                    row_exchange == "coinbase"
+                    or "LIVE " in reason_upper
+                    or "COINBASE" in reason_upper
+                    or "EMERGENCY MARKET EXIT" in reason_upper
+                )
+                if "OANDA" in reason_upper or not is_coinbase_live:
+                    continue
+            elif active_exchange == "kraken":
+                if row_exchange and row_exchange != "kraken":
+                    continue
+                if is_live and "PAPER" in reason_upper:
+                    continue
+                if not is_live and ("LIVE " in reason_upper or "EMERGENCY MARKET EXIT" in reason_upper):
+                    continue
 
             side = str(row.get("side") or "").upper()
             symbol = str(row.get("symbol") or "").upper()
@@ -4613,7 +4629,7 @@ class PaperBot:
 
         return {
             "source": "trades.db",
-            "scope": "coinbase_live_only_net_fees",
+            "scope": self.performance_scope_label(),
             "closed_trades": len(closed),
             "winning_trades": len(wins),
             "losing_trades": len(losses),
