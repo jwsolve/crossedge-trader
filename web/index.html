@@ -236,6 +236,13 @@
             color: var(--text);
         }
 
+        .entitlement-locked { position:relative; }
+        .entitlement-lock-icon {
+            display:inline-flex; align-items:center; justify-content:center;
+            margin-left:6px; font-size:12px; line-height:1;
+            vertical-align:middle; cursor:help;
+        }
+
         /* ─── User Administration ─── */
         .admin-section { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); }
         .admin-toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:14px; }
@@ -2292,13 +2299,36 @@
                 if (holder) {
                     holder.style.opacity=locked?'0.55':'';
                     holder.title=locked?`Locked on ${currentEntitlements.tier} tier`:'';
+                    holder.classList.toggle('entitlement-locked', locked);
+
+                    let lock=holder.querySelector(':scope > .entitlement-lock-icon');
+                    if (locked && !lock) {
+                        lock=document.createElement('span');
+                        lock.className='entitlement-lock-icon';
+                        lock.textContent='🔒';
+                        lock.setAttribute('aria-label', `Locked on ${currentEntitlements.tier} tier`);
+                        lock.title=`Locked on ${currentEntitlements.tier} tier`;
+                        holder.appendChild(lock);
+                    } else if (!locked && lock) {
+                        lock.remove();
+                    }
                 }
             });
             if (els.optimizerBtn) {
-                els.optimizerBtn.disabled=!Boolean(f.optimizer);
-                els.optimizerBtn.title=f.optimizer?'':'Optimizer requires Pro or Elite';
+                const locked=!Boolean(f.optimizer);
+                els.optimizerBtn.disabled=locked;
+                els.optimizerBtn.title=locked?'🔒 Optimizer requires Pro or Elite':'';
+                if (!els.optimizerBtn.dataset.baseLabel) els.optimizerBtn.dataset.baseLabel=els.optimizerBtn.textContent.replace(/^🔒\s*/, '');
+                els.optimizerBtn.textContent=locked ? `🔒 ${els.optimizerBtn.dataset.baseLabel}` : els.optimizerBtn.dataset.baseLabel;
             }
-            document.getElementById('evolveStrategiesBtn')?.toggleAttribute('disabled',!Boolean(f.strategy_evolution));
+            const evolveBtn=document.getElementById('evolveStrategiesBtn');
+            if (evolveBtn) {
+                const locked=!Boolean(f.strategy_evolution);
+                evolveBtn.disabled=locked;
+                evolveBtn.title=locked?'🔒 Strategy evolution requires Elite':'';
+                if (!evolveBtn.dataset.baseLabel) evolveBtn.dataset.baseLabel=evolveBtn.textContent.replace(/^🔒\s*/, '');
+                evolveBtn.textContent=locked ? `🔒 ${evolveBtn.dataset.baseLabel}` : evolveBtn.dataset.baseLabel;
+            }
         }
 
         async function loadCurrentUser() {
