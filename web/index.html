@@ -1213,11 +1213,20 @@
         #streamingPill .dot.error { background: var(--bad); }
     </style>
 </head>
-<body><div class="panel" style="margin:10px 0"><h3>Kraken Margin Safety · Pair-aware D8.6.3</h3>
-<div class="group"><button id="kmValidate">D8.3 Validate</button><button id="kmRead">D8.4 Read-only Check</button><button id="kmRecon">Reconcile</button>
-<button id="kmClose" class="danger">D8.5 EMERGENCY CLOSE ALL SHORTS</button></div>
-<div class="group"><input id="kmSymbol" value="ADA" style="max-width:90px"><input id="kmAmount" type="number" value="5" min="1" style="max-width:90px">
-<button id="kmTiny">D8.6 Tiny Live SHORT</button></div><pre id="kmOut" style="white-space:pre-wrap;max-height:220px;overflow:auto"></pre></div>
+<body><details class="panel" id="krakenMarginDiagnostics" data-admin-diagnostic="true" style="margin:10px 0">
+<summary style="cursor:pointer;font-weight:700;">Kraken Margin Diagnostics · D8.7</summary>
+<div style="padding-top:10px;">
+<div class="message-box" style="display:block;margin:0 0 10px;">
+<strong>Diagnostic controls.</strong> Normal D8.7 automated trading does not require these buttons.
+Live test actions can place or close real Kraken margin orders when live trading is armed.
+</div>
+<div class="group"><button id="kmValidate">Validate Margin Pair</button><button id="kmRead">Read-only Safety Check</button><button id="kmRecon">Reconcile Kraken Margin</button>
+<button id="kmClose" class="danger">Close Auxo-Owned Margin Position</button></div>
+<div class="group" style="margin-top:8px;"><label>Symbol <input id="kmSymbol" value="ADA" style="max-width:90px"></label>
+<label>Test amount <input id="kmAmount" type="number" value="5" min="1" style="max-width:90px"></label>
+<button id="kmTiny">Tiny Live SHORT Test</button></div>
+<pre id="kmOut" style="white-space:pre-wrap;max-height:220px;overflow:auto"></pre>
+</div></details>
     <div class="app" id="app">
 
         <!-- ─── HEADER ─── -->
