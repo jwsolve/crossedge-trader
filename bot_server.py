@@ -2521,6 +2521,11 @@ class PaperBot:
                     for symbol, item in raw.get("positions", {}).items()
                     if isinstance(item, dict) and abs(float(item.get("quantity", 0.0))) > 0
                 },
+                kraken_margin_owned={
+                    str(order_id): dict(item)
+                    for order_id,item in (raw.get("kraken_margin_owned", {}) or {}).items()
+                    if isinstance(item,dict)
+                },
                 scan_rows=raw.get("scan_rows", []),
                 trades=[
                     Trade(
@@ -2792,7 +2797,8 @@ class PaperBot:
         with self.lock:
             running = self.state.running
             settings = dict(self.state.settings)
-            self.state = BotState(settings=settings)
+            kraken_margin_owned = dict(getattr(self.state,"kraken_margin_owned",{}) or {})
+            self.state = BotState(settings=settings,kraken_margin_owned=kraken_margin_owned)
             self.state.cash = float(settings["starting_cash"])
             self.state.day_start_equity = self.state.cash
             self.state.day_start_date = today_key()
@@ -12169,7 +12175,10 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json(self.bot.kraken_margin_read_only_check()); return
             if self.path == "/api/kraken-margin/status":
                 safety=self.bot.kraken_margin_safety()
-                self.send_json({"ok":True,**safety}); return
+                owned=getattr(self.bot.state,"kraken_margin_owned",{}) or {}
+                self.send_json({"ok":True,**safety,
+                    "kraken_margin_owned":owned,
+                    "ownership_count":len(owned)}); return
             if self.path == "/api/diagnostics":
                 try:
                     self.send_json(diagnostics())
