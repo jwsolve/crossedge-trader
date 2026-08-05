@@ -6756,6 +6756,84 @@ class PaperBot:
         r=self.reconcile_kraken_margin(force=True)
         return {"ok":bool(r.get("healthy")),"stage":"D8.4","read_only":True,"armed_for_orders":kraken_live_is_armed(),"reconciliation":r}
 
+    def kraken_adopt_margin_order(self,order_id:str)->dict[str,Any]:
+        """D8.6.9 owner-only recovery: adopt a specific verified Kraken margin SELL created before ownership persistence."""
+        if int(self.user_id)!=1:
+            raise RuntimeError("Owner-only adoption")
+        oid=str(order_id or "").strip().upper()
+        if not oid:
+            raise RuntimeError("Kraken order_id is required")
+
+        # Verify the exact historical order at Kraken. Adoption itself places no order.
+        raw=kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}
+        row=raw.get(oid) if isinstance(raw,dict) else None
+        if not isinstance(row,dict):
+            raise RuntimeError(f"Kraken order {oid} was not found")
+        descr=row.get("descr") if isinstance(row.get("descr"),dict) else {}
+        side=str(descr.get("type") or "").lower()
+        pair=str(descr.get("pair") or "").upper()
+        leverage_text=str(descr.get("leverage") or row.get("leverage") or "")
+        filled=float(row.get("vol_exec") or 0)
+        status=str(row.get("status") or "").lower()
+        if side!="sell":
+            raise RuntimeError(f"Refusing adoption: Kraken order {oid} is {side or 'unknown'}, not SELL")
+        if filled<=0:
+            raise RuntimeError(f"Refusing adoption: Kraken order {oid} has no executed volume")
+        if leverage_text in {"","none","0","1","1:1"}:
+            raise RuntimeError(f"Refusing adoption: Kraken order {oid} does not show margin leverage")
+        if status not in {"closed","open","pending"}:
+            raise RuntimeError(f"Refusing adoption: Kraken order {oid} status is {status or 'unknown'}")
+
+        # Match the verified order to a currently open Kraken SELL position.
+        snap=kraken_margin_snapshot()
+        candidates=[]
+        for pos in snap.get("positions",[]):
+            p=str(pos.get("pair") or "").upper()
+            remaining=max(0.0,float(pos.get("volume") or 0)-float(pos.get("volume_closed") or 0))
+            if p==pair and str(pos.get("type") or "").upper()=="SELL" and remaining>0:
+                candidates.append((pos,remaining))
+        if not candidates:
+            raise RuntimeError(f"Refusing adoption: no open Kraken SHORT position matches {pair}")
+
+        # Resolve symbol/quote from Kraken pair diagnostics/settings without guessing ownership of other pairs.
+        s=self.state.settings
+        quote=kraken_margin_quote(s)
+        symbol=str(s.get("symbol") or "").upper()
+        diag=kraken_margin_pair_diagnostics(symbol,quote)
+        resolved=str(diag.get("resolved_pair") or "").upper()
+        if resolved!=pair:
+            raise RuntimeError(f"Refusing adoption: verified order pair {pair} does not match configured margin pair {resolved}")
+
+        pos,remaining=candidates[0]
+        # The consolidated Kraken position may contain earlier dust/manual fills. Own only this order's fill.
+        owned_qty=min(filled,remaining)
+        self.state.kraken_margin_owned[oid]={
+            "order_id":oid,"symbol":symbol,"quote":quote,"pair":pair,"side":"SHORT",
+            "quantity":owned_qty,"verified_filled_quantity":filled,
+            "kraken_position_id":pos.get("position_id"),"status":"adopted",
+            "adopted_ts":time.time(),"source":"verified_queryorders_recovery",
+            "kraken_order_status":status,"leverage":leverage_text
+        }
+        self.save_state()
+        try:
+            self.db.write_audit(self.user_id,self.account_id,"kraken_margin_order_adopted",
+                {"order_id":oid,"symbol":symbol,"quote":quote,"pair":pair,
+                 "quantity":owned_qty,"verified_filled_quantity":filled,
+                 "position_id":pos.get("position_id")})
+        except Exception as exc:
+            logger.warning(f"Could not audit Kraken margin adoption: {exc}")
+
+        # Clear stale reconciliation cache and verify ownership against Kraken.
+        self._kraken_margin_reconciliation=None
+        post=self.reconcile_kraken_margin(force=True)
+        return {"ok":bool(post.get("healthy")),"stage":"D8.6.9","adopted":{
+                    "order_id":oid,"pair":pair,"quantity":owned_qty,
+                    "verified_filled_quantity":filled,"position_id":pos.get("position_id"),
+                    "order_status":status,"leverage":leverage_text},
+                "reconciliation":{"healthy":post.get("healthy"),"status":post.get("status"),
+                                  "mismatches":post.get("mismatches",[]),
+                                  "owned_positions":post.get("owned_positions",[])}}
+
     def kraken_emergency_close(self,symbol:str|None=None,all_positions:bool=False)->dict[str,Any]:
         """D8.5 BUY-to-cover emergency control. This can only reduce Kraken SHORT exposure."""
         if not kraken_live_is_armed(): raise RuntimeError("Kraken live-order interlock is not armed")
@@ -12591,6 +12669,10 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok":True,"reconciliation":self.bot.reconcile_kraken_margin(force=True)}); return
             if self.path == "/api/kraken-margin/emergency-close":
                 p=parse_json_body(self); self.send_json(self.bot.kraken_emergency_close(p.get("symbol"),bool(p.get("all_positions",False)))); return
+            if self.path == "/api/kraken-margin/adopt-order":
+                if int(self.current_user_id)!=1: self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+                p=parse_json_body(self)
+                self.send_json(self.bot.kraken_adopt_margin_order(str(p.get("order_id") or ""))); return
             if self.path == "/api/kraken-margin/tiny-live-short":
                 if int(self.current_user_id)!=1: self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
                 p=parse_json_body(self); self.send_json(self.bot.kraken_tiny_live_short(str(p.get("symbol") or ""),float(p.get("quote_amount") or 0))); return
