@@ -4945,6 +4945,7 @@ class PaperBot:
                 "open_orders": [asdict(item) for item in self.state.open_orders[-40:]][::-1],
                 "chart_regime": chart_row.get("regime"),
                 "live_status": self.live_status(),
+                "kraken_margin": self.kraken_margin_safety(),
                 "news_guard": self.news_guard_status(),
                 "opening_range_analysis": self.state.opening_range_analysis,
                 "peak_equity": self.state.peak_equity,
@@ -6547,6 +6548,43 @@ class PaperBot:
             and coinbase_live_is_armed()
         )
 
+    def reconcile_kraken_margin(self,force:bool=False)->dict[str,Any]:
+        now=time.time(); cached=getattr(self,"_kraken_margin_reconciliation",None)
+        if cached and not force and now-float(cached.get("_ts",0))<15:return cached
+        result={"healthy":False,"status":"LOCKED","positions":[],"open_orders":[],"trade_balance":{},"costs":{},"mismatches":[],"error":None,"_ts":now}
+        try:
+            snap=kraken_margin_snapshot(); result.update(snap)
+            local=[]
+            for sym,p in self.state.positions.items():
+                if p.get("is_short"):
+                    local.append({"symbol":str(sym).upper(),"quantity":abs(float(p.get("quantity") or 0))})
+            # A live Kraken margin position unknown to Auxo is a hard safety mismatch.
+            for kp in result["positions"]:
+                pair=str(kp.get("pair") or "").upper(); qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
+                if qty<=0:continue
+                if not any(x["symbol"] in pair for x in local): result["mismatches"].append(f"Unknown Kraken margin position {kp.get('position_id')} {pair}")
+            for lp in local:
+                if not any(lp["symbol"] in str(k.get("pair") or "").upper() for k in result["positions"]):
+                    result["mismatches"].append(f"Auxo SHORT {lp['symbol']} missing at Kraken")
+            result["healthy"]=not result["mismatches"]
+            result["status"]="SAFE" if result["healthy"] else "LOCKED"
+        except Exception as exc:
+            result["error"]=str(exc); result["status"]="LOCKED"; result["healthy"]=False
+        self._kraken_margin_reconciliation=result
+        try:
+            self.db.save_kraken_margin_reconciliation(self.user_id,self.account_id,result)
+            if result["mismatches"] or result["error"]:
+                self.db.write_audit(self.user_id,self.account_id,"kraken_margin_reconciliation_failed",{"mismatches":result["mismatches"],"error":result["error"]})
+        except Exception as exc: logger.warning(f"Could not persist Kraken margin reconciliation: {exc}")
+        return result
+
+    def kraken_margin_safety(self)->dict[str,Any]:
+        settings=self.state.settings; exchange=str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
+        enabled=bool(settings.get("kraken_margin_short_enabled")) and exchange=="kraken" and bool(settings.get("live_trading_enabled"))
+        if not enabled:return {"enabled":False,"healthy":False,"status":"OFF","new_shorts_allowed":False,"message":"Kraken live margin shorts disabled"}
+        r=self.reconcile_kraken_margin()
+        return {**r,"enabled":True,"new_shorts_allowed":bool(r.get("healthy")),"message":"Kraken margin reconciliation healthy" if r.get("healthy") else "New live shorts locked until Kraken reconciliation is healthy"}
+
     def live_status(self) -> dict[str, Any]:
         with self.lock:
             account_type = self.state.settings.get("oanda_account_type", "standard")
@@ -6735,6 +6773,9 @@ class PaperBot:
             if not settings.get("allow_short_selling",False): raise RuntimeError("Short selling is disabled")
             if active_exchange!="kraken": raise RuntimeError("Live crypto shorting is Kraken-only")
             if not settings.get("kraken_margin_short_enabled",False): raise RuntimeError("Kraken live margin shorts are disabled")
+            margin_safety=self.kraken_margin_safety()
+            if not margin_safety.get("new_shorts_allowed"):
+                raise RuntimeError("Kraken margin safety lock: "+str(margin_safety.get("error") or margin_safety.get("message") or margin_safety.get("mismatches") or "reconciliation failed"))
 
         if candles is None:
             with self.lock:
@@ -8169,6 +8210,31 @@ def kraken_available_balance(currency:str)->float:
         if clean.startswith(("X","Z")) and len(clean)==4: clean=clean[1:]
         if clean.upper()==currency.upper(): total+=float(v or 0)
     return total
+
+def kraken_margin_snapshot(ledger_limit:int=100)->dict[str,Any]:
+    """Fetch Kraken's authoritative margin/open-order/account state and recent ledger costs."""
+    positions_raw=kraken_private("/0/private/OpenPositions",{"docalcs":"true","consolidation":"market"}).get("result") or {}
+    orders_raw=(kraken_private("/0/private/OpenOrders",{"trades":"true"}).get("result") or {}).get("open") or {}
+    tb=kraken_private("/0/private/TradeBalance",{"asset":"ZUSD"}).get("result") or {}
+    ledgers=(kraken_private("/0/private/Ledgers",{"type":"all"}).get("result") or {}).get("ledger") or {}
+    positions=[]
+    for pid,row in positions_raw.items():
+        positions.append({"position_id":pid,"pair":row.get("pair"),"type":str(row.get("type") or "").upper(),
+            "volume":float(row.get("vol") or 0),"volume_closed":float(row.get("vol_closed") or 0),
+            "cost":float(row.get("cost") or 0),"fee":float(row.get("fee") or 0),"margin":float(row.get("margin") or 0),
+            "value":float(row.get("value") or 0),"net":float(row.get("net") or 0),"terms":row.get("terms"),
+            "rollover_time":row.get("rollovertm"),"raw":row})
+    orders=[{"order_id":oid,"pair":(r.get("descr") or {}).get("pair"),"type":str((r.get("descr") or {}).get("type") or "").upper(),
+             "volume":float(r.get("vol") or 0),"executed":float(r.get("vol_exec") or 0),"status":r.get("status"),
+             "leverage":(r.get("descr") or {}).get("leverage")} for oid,r in orders_raw.items()]
+    costs={"trade_fees":0.0,"margin_fees":0.0,"rollover_fees":0.0,"ledger_entries":0}
+    for _,r in list(ledgers.items())[:max(1,int(ledger_limit))]:
+        typ=str(r.get("type") or "").lower(); sub=str(r.get("subtype") or "").lower(); fee=abs(float(r.get("fee") or 0)); amt=abs(float(r.get("amount") or 0))
+        if typ in {"trade","margin"}: costs["trade_fees"]+=fee
+        if typ=="margin": costs["margin_fees"]+=amt+fee
+        if typ=="rollover" or "rollover" in sub: costs["rollover_fees"]+=amt+fee
+        if typ in {"trade","margin","rollover"} or "rollover" in sub: costs["ledger_entries"]+=1
+    return {"positions":positions,"open_orders":orders,"trade_balance":tb,"costs":costs}
 
 def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
     info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)

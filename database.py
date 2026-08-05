@@ -294,6 +294,17 @@ class BotDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_log(user_id, created_at DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_account_time ON audit_log(account_id, created_at DESC)")
 
+            # D8.2 Kraken margin reconciliation snapshots. Exchange data is authoritative.
+            cursor.execute("""CREATE TABLE IF NOT EXISTS kraken_margin_reconciliation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+                healthy INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+                positions_json TEXT, open_orders_json TEXT, trade_balance_json TEXT,
+                costs_json TEXT, mismatches_json TEXT, error TEXT,
+                reconciled_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_kraken_margin_recon_account ON kraken_margin_reconciliation(account_id,id DESC)")
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -588,6 +599,28 @@ class BotDatabase:
                    LEFT JOIN trading_accounts a ON a.id=l.account_id
                    ORDER BY l.id DESC LIMIT ?""",(max(1,min(int(limit),1000)),)
             ).fetchall()]
+
+    # ─── D8.2 KRAKEN MARGIN RECONCILIATION ─────────────────────────
+    def save_kraken_margin_reconciliation(self,user_id:int,account_id:int,snapshot:dict[str,Any])->None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""INSERT INTO kraken_margin_reconciliation
+                (user_id,account_id,healthy,status,positions_json,open_orders_json,trade_balance_json,costs_json,mismatches_json,error)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",(int(user_id),int(account_id),1 if snapshot.get("healthy") else 0,
+                str(snapshot.get("status") or "UNKNOWN"),json.dumps(snapshot.get("positions",[]),default=str),
+                json.dumps(snapshot.get("open_orders",[]),default=str),json.dumps(snapshot.get("trade_balance",{}),default=str),
+                json.dumps(snapshot.get("costs",{}),default=str),json.dumps(snapshot.get("mismatches",[]),default=str),snapshot.get("error")))
+            conn.commit()
+
+    def latest_kraken_margin_reconciliation(self,account_id:int)->dict[str,Any]|None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory=sqlite3.Row
+            row=conn.execute("SELECT * FROM kraken_margin_reconciliation WHERE account_id=? ORDER BY id DESC LIMIT 1",(int(account_id),)).fetchone()
+        if not row:return None
+        x=dict(row)
+        for k in ("positions_json","open_orders_json","trade_balance_json","costs_json","mismatches_json"):
+            try:x[k[:-5]]=json.loads(x.get(k) or ("{}" if k in {"trade_balance_json","costs_json"} else "[]"))
+            except Exception:x[k[:-5]]={} if k in {"trade_balance_json","costs_json"} else []
+        x["healthy"]=bool(x.get("healthy")); return x
 
     # ─── D6 OWNER USER ADMINISTRATION ────────────────────────────────
     def admin_list_users(self) -> list[dict[str, Any]]:

@@ -1228,6 +1228,7 @@
                 <span class="pill" id="runPill"><span class="dot gray" id="runDot"></span><span id="runText">Stopped</span></span>
                 <span class="pill" id="tradingPill">Trading Disabled</span>
                 <span class="pill" id="armedPill">🔒 Locked</span>
+                <span class="pill" id="krakenMarginPill" title="Kraken margin reconciliation">Margin: Off</span>
                 <span class="pill" id="streamingPill">
                     <span class="dot off" id="streamingDot"></span>
                     <span id="streamingText">Streaming: Off</span>
@@ -3709,6 +3710,16 @@
             els.armedPill.textContent = armed ? '🔓 Armed' : '🔒 Locked';
             els.armedPill.className = 'pill ' + (armed ? 'warn' : '');
 
+            const km = data.kraken_margin || {};
+            const kmPill = document.getElementById('krakenMarginPill');
+            if (kmPill) {
+                const ks = km.status || 'OFF';
+                kmPill.textContent = `Margin: ${ks}`;
+                kmPill.className = 'pill ' + (ks === 'SAFE' ? 'good' : (ks === 'LOCKED' ? 'bad' : ''));
+                const c = km.costs || {};
+                kmPill.title = km.enabled ? `Kraken reconciliation ${ks} | positions ${(km.positions||[]).length} | margin costs ${Number(c.margin_fees||0).toFixed(4)} | rollover ${Number(c.rollover_fees||0).toFixed(4)}${km.error ? ' | '+km.error : ''}` : 'Kraken live margin shorts disabled';
+            }
+
             els.pairDisplay.textContent = activeSymbol + (settings.asset_class === 'forex' ? ' forex' : '');
             els.lastPrice.textContent = data.last_price ? priceText(data.last_price, activeSymbol) : '—';
             els.signalText.textContent = data.last_signal || 'Waiting';
@@ -3732,6 +3743,7 @@
                 'Daily Loss OK': ls.daily_loss_ok !== false ? '✓' : '✗',
                 'API Connected': ls.api_connected !== false ? '✓' : '✗',
                 'Websocket': ls.websocket_connected !== false ? '✓' : '✗',
+                'Kraken Margin': !data.kraken_margin?.enabled || data.kraken_margin?.healthy ? '✓' : '✗',
             };
             const allHealthy = Object.values(healthItems).every(v => v === '✓');
             const healthSummary = allHealthy ? '🟢 Healthy' : '🟡 Issues';
