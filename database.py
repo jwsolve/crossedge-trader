@@ -574,6 +574,23 @@ class BotDatabase:
         if not exists:
             self.save_user_settings(user_id, account_id, settings)
 
+    def create_user_with_account(self, email: str, display_name: str, password_hash: str, exchange: str = "kraken", account_label: str = "Kraken Paper") -> dict[str, int]:
+        """Create an isolated Auxo user and first trading account atomically."""
+        email = str(email or "").strip().lower()
+        exchange = str(exchange or "kraken").strip().lower()
+        if exchange not in {"coinbase", "kraken"}:
+            raise ValueError("Exchange must be coinbase or kraken")
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO users(email,display_name,password_hash,status) VALUES (?,?,?,'active')",
+                        (email, str(display_name or "Auxo User").strip(), password_hash))
+            user_id = int(cur.lastrowid)
+            cur.execute("INSERT INTO trading_accounts(user_id,exchange,account_label,enabled) VALUES (?,?,?,1)",
+                        (user_id, exchange, str(account_label or "Kraken Paper").strip()))
+            account_id = int(cur.lastrowid)
+            conn.commit()
+        return {"user_id": user_id, "account_id": account_id}
+
     def save_trade(self, trade) -> int:
         trade_id = getattr(trade, 'trade_id', None) or str(uuid.uuid4())
 

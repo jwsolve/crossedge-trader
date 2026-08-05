@@ -33,6 +33,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import ssl
+import sqlite3
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -245,6 +246,8 @@ DEFAULT_SETTINGS = {
     "kraken_maker_first_enabled": True,
     "kraken_maker_offset_pct": 0.00,
     "kraken_maker_market_fallback": True,
+    "kraken_paper_maker_fee": 0.0025,
+    "kraken_paper_taker_fee": 0.0040,
     "native_stop_enabled": False,
     "max_live_order_gbp": 5.0,
     "max_daily_live_loss_gbp": 25.0,  # legacy key: now means max DAILY P/L loss in quote currency
@@ -1762,8 +1765,9 @@ def rsi_series(values: list[float], window: int) -> list[float | None]:
 
 # ─── PAPER BOT CLASS ──────────────────────────────────────────────
 class PaperBot:
-    def __init__(self, account_id: int = 1, state_file: Path | None = None) -> None:
+    def __init__(self, account_id: int = 1, state_file: Path | None = None, user_id: int = 1) -> None:
         self.account_id = int(account_id)
+        self.user_id = int(user_id)
         self.state_file = Path(state_file) if state_file is not None else account_state_file(self.account_id)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -2618,7 +2622,7 @@ class PaperBot:
             valid = {f.name for f in fields(cls)}
             return {k: v for k, v in data.items() if k in valid}
 
-        db_trades = self.db.get_trades(limit=999999)
+        db_trades = self.db.get_trades(limit=999999, user_id=self.user_id, account_id=self.account_id)
         if db_trades:
             self.state.trades = [Trade(**filter_fields(t, Trade)) for t in db_trades]
             self.state.trades = self.state.trades[-500:]
@@ -2956,6 +2960,11 @@ class PaperBot:
     def record_trade(self, trade: Trade, pnl: float = 0.0) -> None:
         with self.lock:
             trade.pnl = pnl
+            # D5: every persisted trade is stamped by the engine, never by dataclass defaults.
+            trade.user_id = self.user_id
+            trade.account_id = self.account_id
+            trade.exchange = str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
+            trade.engine_version = "D5-kraken-paper"
             if trade.learning_context.get("exit", {}).get("net_pnl_pct") is not None:
                 trade.pnl_pct = float(trade.learning_context["exit"]["net_pnl_pct"])
             elif trade.entry_price and trade.exit_price and trade.entry_price > 0:
@@ -4295,7 +4304,7 @@ class PaperBot:
             "strategy_evolution_frequency", "strategy_max_active",
             "kelly_fraction", "atr_period", "atr_multiplier", "max_hold_hours",
             "rsi_oversold", "rsi_overbought", "ma_exit_period",
-            "min_regime_confidence",
+            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee",
         }
         bool_fields = {
             "live_trading_enabled", "use_sr_filter", "use_dynamic_sr_exits",
@@ -4312,7 +4321,7 @@ class PaperBot:
             "regime_adaptation_enabled", "strategy_switching_enabled",
         }
         text_fields = {
-            "asset_class", "exchange", "symbol", "quote_currency", "strategy",
+            "asset_class", "exchange", "active_exchange", "symbol", "quote_currency", "strategy",
             "position_sizing_mode", "live_order_type", "risk_sizing_mode",
         }
         sensitive_fields = {
@@ -5744,6 +5753,12 @@ class PaperBot:
             settings = dict(self.state.settings)
 
         trade_fee = float(settings["trade_fee"])
+        if (str(settings.get("exchange", "")).lower() == "kraken"
+                and not bool(settings.get("live_trading_enabled"))):
+            trade_fee = float(settings.get(
+                "kraken_paper_maker_fee" if settings.get("kraken_maker_first_enabled", True) else "kraken_paper_taker_fee",
+                trade_fee,
+            ))
         spend_reason = "manual override"
 
         regime_adapt = self.get_regime_adaptations()
@@ -11314,13 +11329,7 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if not u:self.send_json({"ok":False,"error":"Unauthorized"},HTTPStatus.UNAUTHORIZED); return False
         self.current_user=u; self.current_user_id=int(u["id"]); return True
     def _require_owner_engine_context(self) -> bool:
-        if int(getattr(self, "current_user_id", 0)) != 1:
-            self.send_json(
-                {"ok": False, "error": "Trading engine is not yet provisioned for this user"},
-                HTTPStatus.FORBIDDEN,
-            )
-            return False
-
+        # D5: resolve only the authenticated user's own provisioned account engine.
         account = db.default_account_for_user(self.current_user_id)
         if not account:
             self.send_json(
@@ -11757,6 +11766,28 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._clear_auth_cookie(); self.end_headers(); self.wfile.write(b'{"ok":true}'); return
         if not self._check_auth(): return
 
+        if self.path == "/api/admin/create-paper-user":
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"}, HTTPStatus.FORBIDDEN); return
+            p=parse_json_body(self); email=str(p.get("email") or "").strip().lower(); password=str(p.get("password") or ""); name=str(p.get("display_name") or "Kraken Paper User").strip()
+            if "@" not in email or len(password)<10:
+                self.send_json({"ok":False,"error":"Use a valid email and password of at least 10 characters"}, HTTPStatus.BAD_REQUEST); return
+            try:
+                ids=db.create_user_with_account(email,name,_password_hash(password),"kraken","Kraken Paper")
+                settings=dict(DEFAULT_SETTINGS)
+                settings.update({"exchange":"kraken","active_exchange":"kraken","live_trading_enabled":False,"oanda_demo_trading_enabled":False,"quote_currency":"GBP"})
+                db.save_user_settings(ids["user_id"],ids["account_id"],settings)
+                engine=PaperBot(account_id=ids["account_id"], user_id=ids["user_id"], state_file=account_state_file(ids["account_id"]))
+                with engine.lock:
+                    engine.state.settings.update(settings); engine.state.cash=float(settings["starting_cash"]); engine.state.db_initialized=True; engine.save_state()
+                self.engine_manager.register_engine(ids["account_id"],engine)
+                self.send_json({"ok":True,**ids,"exchange":"kraken","mode":"paper"})
+            except sqlite3.IntegrityError:
+                self.send_json({"ok":False,"error":"A user with that email already exists"},HTTPStatus.CONFLICT)
+            except Exception as exc:
+                self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST)
+            return
+
         if self.path == "/api/user-settings":
             ctx = self._request_account_context()
             if ctx is None:
@@ -11765,7 +11796,13 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if not isinstance(payload, dict):
                 self.send_json({"ok": False, "error": "Settings payload must be an object"}, HTTPStatus.BAD_REQUEST)
                 return
+            if int(ctx["user_id"]) != 1:
+                payload["live_trading_enabled"] = False
+                payload["oanda_demo_trading_enabled"] = False
             db.save_user_settings(ctx["user_id"], ctx["account_id"], payload)
+            engine = self.engine_manager.get_engine(ctx["account_id"])
+            if engine is not None:
+                engine.update_settings(payload)
             self.send_json({"ok": True, "context": ctx})
             return
 
@@ -11808,6 +11845,9 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
             if self.path == "/api/settings":
                 payload = parse_json_body(self)
+                if int(self.current_user_id) != 1:
+                    payload["live_trading_enabled"] = False
+                    payload["oanda_demo_trading_enabled"] = False
                 self.bot.update_settings(payload)
                 # Milestone C mirrors the authoritative owner engine settings
                 # into account-scoped storage without changing trading behaviour.
@@ -12002,7 +12042,7 @@ def main() -> None:
     global db
     port = int(os.environ.get("PORT", "8080"))
     owner_state_file = migrate_legacy_state_to_account(1)
-    bot = PaperBot(account_id=1, state_file=owner_state_file)
+    bot = PaperBot(account_id=1, state_file=owner_state_file, user_id=1)
 
     # Authentication and trading share the same database.
     db = bot.db
@@ -12011,6 +12051,26 @@ def main() -> None:
     # provisioned, so no second live engine can start yet.
     engine_manager = EngineManager()
     engine_manager.register_engine(1, bot)
+
+    # D5: provision existing non-owner accounts. They are forcibly PAPER on startup;
+    # a second user's engine can therefore never place a private exchange order.
+    with sqlite3.connect(db.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        extra_accounts = conn.execute("SELECT id,user_id,exchange FROM trading_accounts WHERE enabled=1 AND id<>1 ORDER BY id").fetchall()
+    for row in extra_accounts:
+        aid, uid = int(row["id"]), int(row["user_id"])
+        engine = PaperBot(account_id=aid, user_id=uid, state_file=account_state_file(aid))
+        saved = db.get_user_settings(uid, aid)
+        with engine.lock:
+            engine.state.settings.update(saved or {})
+            engine.state.settings["exchange"] = str(row["exchange"] or "kraken").lower()
+            engine.state.settings["active_exchange"] = engine.state.settings["exchange"]
+            engine.state.settings["live_trading_enabled"] = False
+            engine.state.settings["oanda_demo_trading_enabled"] = False
+            engine.state.db_initialized = True
+            engine.save_state()
+        engine_manager.register_engine(aid, engine)
+        logger.info("Provisioned PAPER engine for user=%s account=%s exchange=%s", uid, aid, engine.state.settings["exchange"])
 
     # state/account_1.json is authoritative in D2; trading behaviour is unchanged.
     try:
