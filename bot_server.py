@@ -377,6 +377,7 @@ DEFAULT_SETTINGS = {
     "kraken_margin_quote_currency": "USDT",
     "kraken_margin_read_only": True,
     "kraken_margin_max_exposure_quote": 25.0,
+    "kraken_margin_dust_quote": 0.10,
     "kraken_margin_max_open_shorts": 1.0,
     "kraken_margin_min_level_pct": 250.0,
     "kraken_margin_test_max_quote": 10.0,
@@ -4362,7 +4363,7 @@ class PaperBot:
             "strategy_evolution_frequency", "strategy_max_active",
             "kelly_fraction", "atr_period", "atr_multiplier", "max_hold_hours",
             "rsi_oversold", "rsi_overbought", "ma_exit_period",
-            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee", "kraken_margin_leverage", "kraken_margin_max_exposure_quote", "kraken_margin_max_open_shorts", "kraken_margin_min_level_pct", "kraken_margin_test_max_quote",
+            "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee", "kraken_margin_leverage", "kraken_margin_max_exposure_quote", "kraken_margin_dust_quote", "kraken_margin_max_open_shorts", "kraken_margin_min_level_pct", "kraken_margin_test_max_quote",
         }
         bool_fields = {
             "live_trading_enabled", "use_sr_filter", "use_dynamic_sr_exits",
@@ -6583,12 +6584,27 @@ class PaperBot:
             for sym,p in self.state.positions.items():
                 if p.get("is_short"):
                     local.append({"symbol":str(sym).upper(),"quantity":abs(float(p.get("quantity") or 0))})
+            result["ignored_dust"]=[]
+            dust_limit=max(0.0,float(self.state.settings.get("kraken_margin_dust_quote",0.10)))
             for kp in result["positions"]:
                 pair=str(kp.get("pair") or "").upper()
                 qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
                 if qty<=0: continue
                 if not any(x["symbol"] in pair for x in local):
-                    result["mismatches"].append(f"Unknown Kraken margin position {kp.get('position_id')} {pair}")
+                    # Dust is judged by remaining quote value, never by token quantity.
+                    value=abs(float(kp.get("value") or 0))
+                    if value<=dust_limit:
+                        result["ignored_dust"].append({
+                            "position_id":kp.get("position_id"),"pair":pair,
+                            "remaining_quantity":qty,"quote_value":value,
+                            "threshold":dust_limit,
+                            "reason":"Unknown Kraken margin residual below configured dust threshold"
+                        })
+                    else:
+                        result["mismatches"].append(
+                            f"Unknown Kraken margin position {kp.get('position_id')} {pair} "
+                            f"value {value:.8f} exceeds dust threshold {dust_limit:.8f}"
+                        )
             for lp in local:
                 if not any(lp["symbol"] in str(k.get("pair") or "").upper() for k in result["positions"]):
                     result["mismatches"].append(f"Auxo SHORT {lp['symbol']} missing at Kraken")
@@ -6602,6 +6618,7 @@ class PaperBot:
                 result["mismatches"].append("Margin exposure exceeds configured maximum")
             if result.get("margin_level_pct") is not None and float(result["margin_level_pct"])<min_lvl:
                 result["mismatches"].append("Margin level below configured safety floor")
+            result["dust_threshold_quote"]=dust_limit
             result["healthy"]=not result["mismatches"]
             result["status"]="SAFE" if result["healthy"] else "LOCKED"
             result["cache"]={"used":False,"age_seconds":0,"ttl_seconds":30}
