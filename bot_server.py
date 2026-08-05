@@ -8475,33 +8475,65 @@ def kraken_available_balance(currency:str)->float:
     return total
 
 def kraken_margin_snapshot(ledger_limit:int=100)->dict[str,Any]:
-    """Fetch Kraken's authoritative margin/open-order/account state and recent ledger costs."""
-    positions_raw=kraken_private("/0/private/OpenPositions",{"docalcs":"true","consolidation":"market"}).get("result") or {}
-    orders_raw=(kraken_private("/0/private/OpenOrders",{"trades":"true"}).get("result") or {}).get("open") or {}
+    """Fetch Kraken margin state defensively across dict/list response shapes."""
+    def rows(raw):
+        if isinstance(raw,dict): return list(raw.items())
+        if isinstance(raw,list): return [(str(i),r) for i,r in enumerate(raw) if isinstance(r,dict)]
+        return []
+
+    positions_result=kraken_private("/0/private/OpenPositions",{"docalcs":"true","consolidation":"market"}).get("result")
+    positions_raw=positions_result or {}
+
+    orders_result=kraken_private("/0/private/OpenOrders",{"trades":"true"}).get("result") or {}
+    if isinstance(orders_result,dict):
+        orders_raw=orders_result.get("open") or {}
+    elif isinstance(orders_result,list):
+        orders_raw=orders_result
+    else:
+        orders_raw={}
+
     tb=kraken_private("/0/private/TradeBalance",{"asset":"ZUSD"}).get("result") or {}
-    ledgers=(kraken_private("/0/private/Ledgers",{"type":"all"}).get("result") or {}).get("ledger") or {}
+    if not isinstance(tb,dict): tb={}
+
+    ledger_result=kraken_private("/0/private/Ledgers",{"type":"all"}).get("result") or {}
+    if isinstance(ledger_result,dict):
+        ledgers=ledger_result.get("ledger") or {}
+    elif isinstance(ledger_result,list):
+        ledgers=ledger_result
+    else:
+        ledgers={}
+
     positions=[]
-    for pid,row in positions_raw.items():
+    for pid,row in rows(positions_raw):
         positions.append({"position_id":pid,"pair":row.get("pair"),"type":str(row.get("type") or "").upper(),
             "volume":float(row.get("vol") or 0),"volume_closed":float(row.get("vol_closed") or 0),
             "cost":float(row.get("cost") or 0),"fee":float(row.get("fee") or 0),"margin":float(row.get("margin") or 0),
             "value":float(row.get("value") or 0),"net":float(row.get("net") or 0),"terms":row.get("terms"),
             "rollover_time":row.get("rollovertm"),"raw":row})
-    orders=[{"order_id":oid,"pair":(r.get("descr") or {}).get("pair"),"type":str((r.get("descr") or {}).get("type") or "").upper(),
+
+    orders=[]
+    for oid,r in rows(orders_raw):
+        descr=r.get("descr") if isinstance(r.get("descr"),dict) else {}
+        orders.append({"order_id":oid,"pair":descr.get("pair"),"type":str(descr.get("type") or "").upper(),
              "volume":float(r.get("vol") or 0),"executed":float(r.get("vol_exec") or 0),"status":r.get("status"),
-             "leverage":(r.get("descr") or {}).get("leverage")} for oid,r in orders_raw.items()]
+             "leverage":descr.get("leverage")})
+
     costs={"trade_fees":0.0,"margin_fees":0.0,"rollover_fees":0.0,"ledger_entries":0}
-    for _,r in list(ledgers.items())[:max(1,int(ledger_limit))]:
-        typ=str(r.get("type") or "").lower(); sub=str(r.get("subtype") or "").lower(); fee=abs(float(r.get("fee") or 0)); amt=abs(float(r.get("amount") or 0))
+    for _,r in rows(ledgers)[:max(1,int(ledger_limit))]:
+        typ=str(r.get("type") or "").lower(); sub=str(r.get("subtype") or "").lower()
+        fee=abs(float(r.get("fee") or 0)); amt=abs(float(r.get("amount") or 0))
         if typ in {"trade","margin"}: costs["trade_fees"]+=fee
         if typ=="margin": costs["margin_fees"]+=amt+fee
         if typ=="rollover" or "rollover" in sub: costs["rollover_fees"]+=amt+fee
         if typ in {"trade","margin","rollover"} or "rollover" in sub: costs["ledger_entries"]+=1
+
     margin_used=float(tb.get("m") or 0); equity=float(tb.get("e") or tb.get("eb") or 0)
     margin_level=(equity/margin_used*100.0) if margin_used>0 else None
     exposure=sum(abs(float(p.get("value") or p.get("cost") or 0)) for p in positions)
     return {"positions":positions,"open_orders":orders,"trade_balance":tb,"costs":costs,
-            "margin_level_pct":margin_level,"open_exposure_quote":exposure}
+            "margin_level_pct":margin_level,"open_exposure_quote":exposure,
+            "response_shapes":{"positions":type(positions_raw).__name__,"orders":type(orders_raw).__name__,
+                               "trade_balance":type(tb).__name__,"ledgers":type(ledgers).__name__}}
 
 def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
     if not kraken_live_is_armed():
