@@ -3733,10 +3733,22 @@ Live test actions can place or close real Kraken margin orders when live trading
             const kmPill = document.getElementById('krakenMarginPill');
             if (kmPill) {
                 const ks = km.status || 'OFF';
-                kmPill.textContent = `Margin: ${ks}`;
-                kmPill.className = 'pill ' + (ks === 'SAFE' ? 'good' : (ks === 'LOCKED' ? 'bad' : ''));
+                const state = String(km.margin_state || '').toUpperCase();
+                let reason = '';
+                if (ks === 'LOCKED' || ks === 'RATE_LIMITED') {
+                    if (state === 'PAIR_UNSUPPORTED') reason = 'Pair unsupported';
+                    else if (state === 'LEVERAGE_UNSUPPORTED') reason = 'Leverage unsupported';
+                    else if (state === 'RECONCILIATION_LOCK') reason = 'Reconciliation';
+                    else if (state === 'RATE_LIMITED' || ks === 'RATE_LIMITED') reason = 'Rate limited';
+                    else if (state === 'PAIR_ERROR') reason = 'Pair check error';
+                    else if (state === 'DISABLED') reason = 'Disabled';
+                    else reason = km.reason || km.message || km.error || state || 'Safety lock';
+                }
+                kmPill.textContent = `Margin: ${ks}${reason ? ' — ' + reason : ''}`;
+                kmPill.className = 'pill ' + (ks === 'SAFE' ? 'good' : ((ks === 'LOCKED' || ks === 'RATE_LIMITED') ? 'bad' : ''));
                 const c = km.costs || {};
-                kmPill.title = km.enabled ? `Kraken reconciliation ${ks} | positions ${(km.positions||[]).length} | margin costs ${Number(c.margin_fees||0).toFixed(4)} | rollover ${Number(c.rollover_fees||0).toFixed(4)}${km.error ? ' | '+km.error : ''}` : 'Kraken live margin shorts disabled';
+                const detail = km.reason || km.message || km.error || '';
+                kmPill.title = km.enabled ? `Kraken reconciliation ${ks}${reason ? ' — '+reason : ''} | positions ${(km.positions||[]).length} | margin costs ${Number(c.margin_fees||0).toFixed(4)} | rollover ${Number(c.rollover_fees||0).toFixed(4)}${detail ? ' | '+detail : ''}` : 'Kraken live margin shorts disabled';
             }
 
             els.pairDisplay.textContent = activeSymbol + (settings.asset_class === 'forex' ? ' forex' : '');
