@@ -3815,8 +3815,10 @@ class PaperBot:
             return False
 
         exchange=str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
-        armed=coinbase_live_is_armed() if exchange=="coinbase" else (kraken_live_is_armed() if exchange=="kraken" else False)
-        return bool(settings.get("live_trading_enabled")) and settings.get("asset_class","crypto")=="crypto" and exchange in {"coinbase","kraken"} and armed
+        # This startup hook calls sync_live_balance_from_coinbase(), so it must ONLY
+        # return True for Coinbase. Kraken live/margin state is handled by Kraken
+        # reconciliation and must never be routed through the Coinbase balance sync.
+        return bool(settings.get("live_trading_enabled")) and settings.get("asset_class","crypto")=="crypto" and exchange=="coinbase" and coinbase_live_is_armed()
 
     def coinbase_live_account_snapshot(self) -> dict[str, Any]:
         """Value the real Coinbase brokerage account in the selected quote currency.
