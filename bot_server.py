@@ -7206,15 +7206,24 @@ class PaperBot:
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
         active_exchange=str(settings.get("active_exchange") or settings.get("exchange") or "coinbase").lower()
+        effective_quote=kraken_margin_quote(settings) if (is_short and active_exchange=="kraken") else str(settings["quote_currency"])
+        pair_diag=None
         if is_short:
             if not settings.get("allow_short_selling",False): raise RuntimeError("Short selling is disabled")
             if active_exchange!="kraken": raise RuntimeError("Live crypto shorting is Kraken-only")
             if not settings.get("kraken_margin_short_enabled",False): raise RuntimeError("Kraken live margin shorts are disabled")
-            if settings.get("kraken_margin_read_only",True):
-                raise RuntimeError("Kraken margin READ ONLY is enabled")
-            margin_safety=self.kraken_margin_safety()
+            if settings.get("kraken_margin_read_only",True): raise RuntimeError("Kraken margin READ ONLY is enabled")
+            margin_safety=self.kraken_margin_safety(symbol)
             if not margin_safety.get("new_shorts_allowed"):
-                raise RuntimeError("Kraken margin safety lock: "+str(margin_safety.get("error") or margin_safety.get("message") or margin_safety.get("mismatches") or "reconciliation failed"))
+                raise RuntimeError("Kraken margin safety lock: "+str(margin_safety.get("reason") or margin_safety.get("message") or "reconciliation failed"))
+            fresh=self.reconcile_kraken_margin(force=True)
+            if not fresh.get("healthy"):
+                raise RuntimeError("Kraken margin fresh pre-trade reconciliation failed: "+str(fresh.get("status")))
+            pair_diag=kraken_margin_pair_diagnostics(symbol,effective_quote)
+            lev=float(settings.get("kraken_margin_leverage",2))
+            allowed=[float(x) for x in (pair_diag.get("leverage_sell") or [])]
+            if lev not in allowed:
+                raise RuntimeError(f"{symbol}/{effective_quote} does not support requested {lev:g}x SHORT leverage; allowed={allowed}")
 
         if candles is None:
             with self.lock:
@@ -7292,7 +7301,7 @@ class PaperBot:
         guard = live_market_guard(
             exchange=str(settings["exchange"]),
             symbol=symbol,
-            quote_currency=str(settings["quote_currency"]),
+            quote_currency=effective_quote,
             granularity=int(settings.get("live_granularity", 3600)),
             candle_count=int(settings.get("live_candle_count", 300)),
             max_spread_pct=float(settings["max_live_spread_pct"]),
@@ -7304,7 +7313,7 @@ class PaperBot:
                 self.journal(symbol, "BLOCK", self.state.last_signal, price, guard)
             return
 
-        gbp_available = self.live_available_balance(settings["quote_currency"])
+        gbp_available = self.live_available_balance(effective_quote)
         if gbp_available < quote_size:
             with self.lock:
                 self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: only {settings['quote_currency']} {gbp_available:.2f} available"
@@ -7361,8 +7370,8 @@ class PaperBot:
                     return
 
                 base_size = quote_size / limit_price if limit_price > 0 else 0.0
-                base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
-                order = (kraken_order(symbol,str(settings["quote_currency"]),side,"limit",base_size,limit_price,order_type=="maker",leverage=margin_leverage)
+                base_size = self.live_round_size(base_size,symbol,effective_quote if active_exchange=="kraken" else str(settings["quote_currency"]))
+                order = (kraken_order(symbol,effective_quote,side,"limit",base_size,limit_price,order_type=="maker",leverage=margin_leverage)
                          if active_exchange=="kraken" else coinbase_limit_order(product_id,side,base_size,limit_price,post_only=(order_type=="maker")))
 
             else:
@@ -7379,7 +7388,7 @@ class PaperBot:
                     else:
                         best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
                         base_size = quote_size / best_price if best_price > 0 else 0.0
-                        base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
+                        base_size = self.live_round_size(base_size,symbol,effective_quote if active_exchange=="kraken" else str(settings["quote_currency"]))
                         order = coinbase_market_order(
                             product_id=product_id,
                             side=side,
@@ -7388,7 +7397,7 @@ class PaperBot:
                 elif active_exchange == "kraken":
                     px=float(guard.get("ask") if side=="BUY" else guard.get("bid") or price)
                     base_size=self.live_round_size(quote_size/px,symbol,str(settings["quote_currency"]))
-                    order=kraken_order(symbol,str(settings["quote_currency"]),side,"market",base_size,leverage=margin_leverage)
+                    order=kraken_order(symbol,effective_quote,side,"market",base_size,leverage=margin_leverage)
                 else:
                     # Preserve the existing connector path for other exchanges.
                     if side == "BUY":
@@ -7396,7 +7405,7 @@ class PaperBot:
                     else:
                         best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
                         base_size = quote_size / best_price if best_price > 0 else 0.0
-                        base_size = self.live_round_size(base_size,symbol,str(settings["quote_currency"]))
+                        base_size = self.live_round_size(base_size,symbol,effective_quote if active_exchange=="kraken" else str(settings["quote_currency"]))
                         raw_order = connector.market_sell(symbol, base_size)
 
                     try:
@@ -7406,6 +7415,17 @@ class PaperBot:
                     order = {"order_id": order_id, "raw": raw_order}
 
             order_id = str(order["order_id"]) if active_exchange=="kraken" else coinbase_order_id(order)
+            if active_exchange=="kraken" and is_short:
+                qty=float(base_size or 0)
+                self.state.kraken_margin_owned[order_id]={
+                    "order_id":order_id,"symbol":symbol,"quote":effective_quote,
+                    "pair":(pair_diag or {}).get("resolved_pair") or f"{symbol}{effective_quote}",
+                    "side":"SHORT","quantity":qty,"quote_amount":quote_size,
+                    "reference_price":limit_price if order_type!="market" else price,
+                    "leverage":margin_leverage,"status":"pending","created_ts":time.time(),"source":"strategy"
+                }
+                self.save_state()
+                product_id=f"{symbol}-{effective_quote}"
             managed = self.track_order(
                 order_id,
                 symbol,
@@ -7455,6 +7475,21 @@ class PaperBot:
         product_id = f"{symbol}-{settings['quote_currency']}"
 
         active_exchange=self.live_exchange()
+        if active_exchange=="kraken" and is_short:
+            result=self.kraken_emergency_close(symbol=symbol,all_positions=False)
+            if not result.get("ok"):
+                with self.lock:
+                    self.state.last_signal=f"LIVE SHORT EXIT failed: {result}"
+                    self.journal(symbol,"ERROR",self.state.last_signal,price,{"reason":reason,"cover":result})
+                return
+            covered=sum(float(x.get("quantity") or 0) for x in result.get("closed",[]))
+            if covered>0:
+                self.paper_sell(symbol,price,f"LIVE SHORT ownership-aware cover | {reason}",
+                                quantity_override=covered,fee_override=0.0)
+            with self.lock:
+                self.state.last_signal=f"LIVE SHORT EXIT ownership-aware cover submitted for {symbol}"
+                self.journal(symbol,"INFO",self.state.last_signal,price,{"reason":reason,"cover":result})
+            return
         base_available = abs(float(self.state.positions.get(symbol,{}).get("quantity",0))) if is_short else self.live_available_balance(symbol)
 
         desired_size = (
@@ -7674,6 +7709,14 @@ class PaperBot:
         is_short = order.details.get("is_short", False)
 
         if order.role == "ENTRY":
+            if is_short and self.live_exchange()=="kraken":
+                rec=(getattr(self.state,"kraken_margin_owned",{}) or {}).get(order.order_id)
+                if rec is not None:
+                    rec["quantity"]=float(fill["filled_size"])
+                    rec["verified_filled_quantity"]=float(fill["filled_size"])
+                    rec["status"]="adopted"; rec["adopted_ts"]=time.time()
+                    rec["fill_price"]=float(filled_price)
+                    self.save_state()
             filled_value = float(fill["filled_value"] or 0.0)
             entry_fee = float(fill["total_fee"] or 0.0)
             filled_quote = (filled_value or order.quote_size or 0.0) + entry_fee
