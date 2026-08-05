@@ -4497,10 +4497,10 @@ class PaperBot:
         return f"{exchange}_{mode}_account_only_net_fees"
 
     def live_trade_performance_stats(self) -> dict[str, Any]:
-        """Return completed LIVE-trade performance from trades.db, net of fees.
+        """Return completed account-scoped trade performance from trades.db, net of fees.
 
-        Coinbase LIVE rows are identified by exchange_order_id plus Coinbase-specific
-        trade metadata. OANDA/forex rows are explicitly excluded. BUY lots are matched FIFO to
+        The population follows this engine's authenticated account, active exchange,
+        and paper/live mode. BUY lots are matched FIFO to
         SELL quantities per symbol. Entry fees are allocated pro-rata when a BUY is
         closed in more than one SELL; each SELL fee is also deducted. This makes
         win/loss, win rate, profit factor and average P/L all use the same net result.
@@ -4523,7 +4523,9 @@ class PaperBot:
         closed: list[dict[str, float]] = []
 
         for row in rows:
-            if not row.get("exchange_order_id"):
+            active_exchange = str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+            is_live = bool(self.state.settings.get("live_trading_enabled", False))
+            if is_live and not row.get("exchange_order_id"):
                 continue
 
             # Rows are already user/account scoped. Keep the card population
@@ -4531,9 +4533,6 @@ class PaperBot:
             reason_text = str(row.get("reason") or "")
             reason_upper = reason_text.upper()
             row_exchange = str(row.get("exchange") or "").lower()
-            active_exchange = str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
-            is_live = bool(self.state.settings.get("live_trading_enabled", False))
-
             if active_exchange == "coinbase":
                 is_coinbase_live = (
                     row_exchange == "coinbase"
@@ -4542,6 +4541,10 @@ class PaperBot:
                     or "EMERGENCY MARKET EXIT" in reason_upper
                 )
                 if "OANDA" in reason_upper or not is_coinbase_live:
+                    continue
+                if is_live and "PAPER" in reason_upper:
+                    continue
+                if not is_live and ("LIVE " in reason_upper or "EMERGENCY MARKET EXIT" in reason_upper):
                     continue
             elif active_exchange == "kraken":
                 if row_exchange and row_exchange != "kraken":
@@ -4603,7 +4606,7 @@ class PaperBot:
 
             if matched_qty <= 0:
                 # Do not invent performance for an unmatched historical SELL.
-                logger.debug(f"Skipping unmatched Coinbase LIVE SELL in performance stats: {symbol} qty={qty}")
+                logger.debug(f"Skipping unmatched account SELL in performance stats: {symbol} qty={qty}")
                 continue
 
             net_pnl = gross_move - entry_fees - exit_fees
