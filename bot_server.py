@@ -2901,6 +2901,8 @@ class PaperBot:
                 repair = self.reconstruct_kraken_live_trades()
                 if repair.get("errors"):
                     logger.warning("Kraken trade reconstruction completed with warnings: %s", repair.get("errors"))
+                # Persisted exchange order IDs are reconciled before strategy resumes.
+                self.manage_open_orders()
                 reconciled = self.sync_kraken_live_balance_on_start()
                 if not reconciled:
                     raise RuntimeError("Kraken live start requires a successful balance reconciliation")
@@ -6616,7 +6618,7 @@ class PaperBot:
 
                 trade = Trade(
                     time=now_iso(),
-                    side="SHORT",
+                    side="SELL",
                     symbol=symbol,
                     price=price,
                     quantity=-coin_bought,
@@ -7761,6 +7763,17 @@ class PaperBot:
             except Exception as exc:
                 errors.append({"owned_order_id":oid,"pair":pair,"error":str(exc)})
 
+        # AddOrder acceptance is not execution. Query Kraken for final CLOSED fills.
+        confirmed_fills=[]
+        for item in closed:
+            for cover_id in item.get("cover_order_ids") or []:
+                try:
+                    q=kraken_reconcile_order(str(cover_id))
+                    if q.get("exchange_confirmed_complete"):
+                        confirmed_fills.append(q)
+                except Exception as exc:
+                    errors.append({"cover_order_id":str(cover_id),"error":f"fill confirmation failed: {exc}"})
+
         # Reconcile after cover submission. Mark ownership closed only when Kraken's remaining
         # exposure is no greater than non-Auxo residual/dust that existed outside owned quantity.
         time.sleep(1.0)
@@ -7783,8 +7796,8 @@ class PaperBot:
         # Reconcile once more so normal dust handling can classify any old residual.
         self._kraken_margin_reconciliation=None
         final=self.reconcile_kraken_margin(force=True)
-        return {"ok":bool(closed) and not errors,"stage":"D8.6.10",
-                "closed":closed,"errors":errors,"skipped":skipped,
+        return {"ok":bool(closed) and not errors,"stage":"kraken_close",
+                "closed":closed,"confirmed_fills":confirmed_fills,"errors":errors,"skipped":skipped,
                 "reconciliation":{"healthy":final.get("healthy"),"status":final.get("status"),
                                   "mismatches":final.get("mismatches",[]),
                                   "ignored_dust":final.get("ignored_dust",[])}}
@@ -8346,12 +8359,19 @@ class PaperBot:
                     self.state.last_signal=f"LIVE SHORT EXIT failed: {result}"
                     self.journal(symbol,"ERROR",self.state.last_signal,price,{"reason":reason,"cover":result})
                 return
-            covered=sum(float(x.get("quantity") or 0) for x in result.get("closed",[]))
-            if covered>0:
-                self.paper_sell(symbol,price,f"LIVE SHORT ownership-aware cover | {reason}",
-                                quantity_override=covered,fee_override=0.0)
+            confirmed=result.get("confirmed_fills") or []
+            if confirmed:
+                for fill in confirmed:
+                    oid=str(fill.get("order_id") or "")
+                    managed=self.track_order(
+                        oid,symbol,f"{symbol}-{settings['quote_currency']}","BUY","EXIT","market",
+                        price=price,base_size=float(fill.get("filled_size") or 0),reason=reason,
+                        details={"is_short":True,"ownership_aware_cover":True},
+                    )
+                    self.apply_reconciled_order(managed,fill)
             with self.lock:
-                self.state.last_signal=f"LIVE SHORT EXIT ownership-aware cover submitted for {symbol}"
+                self.state.last_signal=(f"LIVE SHORT EXIT confirmed for {symbol}" if confirmed
+                                        else f"LIVE SHORT EXIT submitted/pending confirmation for {symbol}")
                 self.journal(symbol,"INFO",self.state.last_signal,price,{"reason":reason,"cover":result})
             return
         base_available = abs(float(self.state.positions.get(symbol,{}).get("quantity",0))) if is_short else self.live_available_balance(symbol)
@@ -8537,6 +8557,8 @@ class PaperBot:
         self.state.open_orders.append(order)
         self.state.open_orders = self.state.open_orders[-120:]
         self.audit("ORDER_TRACKED", order=asdict(order))
+        if self.live_exchange()=="kraken" and bool(self.state.settings.get("live_trading_enabled")):
+            self.save_state()
         return order
 
     def managed_order(self, order_id: str) -> ManagedOrder | None:
@@ -8567,6 +8589,10 @@ class PaperBot:
         order.updated_at = now_iso()
         order.status = fill.get("status", "UNKNOWN")
         if fill["filled_size"] <= 0 or order.local_applied:
+            return False
+        if self.live_exchange()=="kraken" and not bool(fill.get("exchange_confirmed_complete")):
+            self.audit("KRAKEN_ORDER_NOT_FINAL",order_id=order.order_id,status=order.status,
+                       filled_size=fill.get("filled_size"),requested_size=fill.get("requested_size"))
             return False
 
         filled_price = fill["average_price"] or order.price or self.state.last_price or 0.0
@@ -8637,7 +8663,7 @@ class PaperBot:
             self.paper_buy(
                 order.symbol,
                 filled_price,
-                f"LIVE {order.order_type.upper()} BUY filled {order.order_id} | {order.reason}",
+                f"LIVE {order.order_type.upper()} {'SELL/SHORT' if is_short else 'BUY'} filled {order.order_id} | {order.reason}",
                 spend_override=filled_quote,
                 fee_override=entry_fee,
                 quantity_override=fill["filled_size"],
@@ -9763,16 +9789,18 @@ def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,lev
     return {"order_id":str(ids[0]),"raw":data}
 
 def kraken_reconcile_order(oid):
-    row=(kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}).get(oid,{})
-    size=float(row.get("vol_exec") or 0); cost=float(row.get("cost") or 0)
-    reported=float(row.get("price") or 0)
-    # Kraken's executed cost / executed volume is the safest fill-price source.
-    # Prefer it whenever both values exist; use row.price only as a fallback.
+    result=kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}
+    row=result.get(oid)
+    if not isinstance(row,dict) or not row:
+        raise RuntimeError(f"Kraken QueryOrders could not verify order {oid}")
+    status=str(row.get("status") or "UNKNOWN").upper()
+    size=float(row.get("vol_exec") or 0); requested=float(row.get("vol") or 0)
+    cost=float(row.get("cost") or 0); reported=float(row.get("price") or 0)
     avg=(cost/size) if (size>0 and cost>0) else reported
-    return {"order_id":oid,"status":str(row.get("status") or "UNKNOWN").upper(),"filled_size":size,
+    return {"order_id":oid,"status":status,"filled_size":size,"requested_size":requested,
             "filled_value":cost,"total_fee":float(row.get("fee") or 0),"average_price":avg,
-            "reported_price":reported,
-            "fills_count":len(row.get("trades") or []),"order":row}
+            "reported_price":reported,"fills_count":len(row.get("trades") or []),
+            "exchange_confirmed_complete":bool(status=="CLOSED" and size>0),"order":row}
 
 def kraken_cancel_order(oid):
     if not kraken_live_is_armed():
