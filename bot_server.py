@@ -2774,8 +2774,16 @@ class PaperBot:
             if not margin.get("healthy"):
                 detail = margin.get("error") or "; ".join(margin.get("mismatches") or []) or margin.get("status") or "unknown margin reconciliation failure"
                 raise RuntimeError(f"Kraken margin reconciliation failed: {detail}")
+            if margin.get("recovered_closed_positions"):
+                with self.lock:
+                    recovered_names=", ".join(
+                        str(x.get("symbol") or "") for x in margin.get("recovered_closed_positions",[])
+                    )
+                    self.state.last_signal=f"Kraken recovered already-closed position(s): {recovered_names}"
+                    self.save_state()
+
             # A healthy reconciliation with local short ownership means the exposure
-            # is real.  Startup must preserve it rather than flattening accounting.
+            # is real. Startup must preserve it rather than flattening accounting.
             if margin.get("owned_positions"):
                 # D10.4: a verified open margin position IS a successful startup
                 # reconciliation. Populate the same authoritative snapshot consumed
@@ -7283,6 +7291,101 @@ class PaperBot:
             and coinbase_live_is_armed()
         )
 
+    def recover_kraken_stale_closed_short(self, symbol: str, position: dict[str,Any]) -> dict[str,Any]:
+        """Clear stale Auxo SHORT state only when Kraken proves the cover filled.
+
+        Kraken OpenPositions being flat is not enough on its own: we additionally
+        require closed BUY fills for the same base/quote, after Auxo's short entry,
+        whose executed quantity covers the locally remaining short quantity.
+        """
+        symbol=str(symbol or "").upper()
+        quote=str(self.state.settings.get("quote_currency") or "USDT").upper()
+        local_qty=abs(float(position.get("quantity") or 0.0))
+        entry_ts=float(position.get("entry_time") or self.state.entry_time or 0.0)
+        if not symbol or local_qty<=0:
+            return {"ok":False,"reason":"No local short quantity"}
+
+        aliases={"BTC":"XBT","DOGE":"XDG"}
+        kraken_base=aliases.get(symbol,symbol)
+
+        def parse_pair(raw: str) -> tuple[str,str]:
+            p=str(raw or "").upper().replace("/","").replace("-","").replace("_","")
+            p=p.replace("XXBT","XBT").replace("XXDG","XDG")
+            qs=("USDT","USDC","GBP","USD","EUR","XBT","BTC")
+            q=next((x for x in qs if p.endswith(x)),"")
+            b=p[:-len(q)] if q else p
+            b={"XBT":"BTC","XDG":"DOGE","XETH":"ETH"}.get(b,b)
+            q={"XBT":"BTC","ZUSD":"USD","ZGBP":"GBP","ZEUR":"EUR"}.get(q,q)
+            return b,q
+
+        hist=kraken_private("/0/private/TradesHistory",{"type":"all","trades":"true"}).get("result") or {}
+        fills=hist.get("trades") if isinstance(hist,dict) else {}
+        covers=[]
+        if isinstance(fills,dict):
+            for txid,f in fills.items():
+                if not isinstance(f,dict): continue
+                base,q=parse_pair(str(f.get("pair") or ""))
+                if base!=symbol or q!=quote: continue
+                if str(f.get("type") or "").lower()!="buy": continue
+                ts=float(f.get("time") or 0.0)
+                # Entry timestamps may be absent in very old state; when present,
+                # never use a BUY from before the short existed.
+                if entry_ts>0 and ts+1.0<entry_ts: continue
+                qty=abs(float(f.get("vol") or 0.0))
+                if qty<=0: continue
+                covers.append({
+                    "trade_id":str(txid),"order_id":str(f.get("ordertxid") or ""),
+                    "time":ts,"quantity":qty,"price":float(f.get("price") or 0.0),
+                    "fee":max(0.0,float(f.get("fee") or 0.0)),
+                })
+
+        covers.sort(key=lambda x:x["time"])
+        covered=sum(x["quantity"] for x in covers)
+        # Kraken volume rounding can leave tiny residuals. Use the same quote-dust
+        # philosophy as margin reconciliation, but never forgive a meaningful gap.
+        last_px=next((x["price"] for x in reversed(covers) if x["price"]>0),0.0)
+        missing=max(0.0,local_qty-covered)
+        missing_quote=missing*last_px if last_px>0 else float("inf")
+        dust=float(self.state.settings.get("kraken_margin_dust_quote",0.10))
+        if covered<=0 or (covered+1e-12<local_qty and missing_quote>dust):
+            return {"ok":False,"reason":"No sufficient Kraken cover fills found",
+                    "local_quantity":local_qty,"covered_quantity":covered,
+                    "missing_quantity":missing,"missing_quote":missing_quote}
+
+        # The exchange has proven the short is covered. Clear only this symbol.
+        with self.lock:
+            self.state.positions.pop(symbol,None)
+            if self.state.active_symbol==symbol:
+                self.state.active_symbol=None
+                self.state.coin=0.0
+                self.state.is_short=False
+                self.state.entry_price=None
+                self.state.entry_time=None
+                self.state.highest_price=None
+                self.state.stop_price=None
+                self.state.target_price=None
+                self.state.active_stop_order_id=None
+                self.state.partial_take_profit_done=False
+
+            owned=getattr(self.state,"kraken_margin_owned",{}) or {}
+            for oid,rec in owned.items():
+                if str(rec.get("symbol") or "").upper()==symbol and str(rec.get("status") or "").lower() in {"open","pending","adopted"}:
+                    rec["status"]="closed_recovered"
+                    rec["closed_ts"]=time.time()
+                    rec["close_source"]="kraken_trades_history_reconciliation"
+                    rec["cover_order_ids"]=sorted({x["order_id"] for x in covers if x["order_id"]})
+            self.state.last_signal=f"Kraken reconciliation recovered closed {symbol} SHORT"
+            self.state.last_error=None
+            self.save_state()
+
+        details={"ok":True,"symbol":symbol,"local_quantity":local_qty,
+                 "covered_quantity":covered,"cover_fills":covers,
+                 "reason":"Kraken trade history proves local SHORT was already covered"}
+        self.journal(symbol,"RECONCILE",
+                     f"Recovered stale closed Kraken SHORT {symbol}; cleared local position",
+                     last_px or None,details)
+        return details
+
     def reconcile_kraken_margin(self,force:bool=False)->dict[str,Any]:
         """D8.6.5: cached reconciliation with Kraken rate-limit backoff."""
         now=time.time()
@@ -7371,6 +7474,7 @@ class PaperBot:
                             f"Unknown Kraken margin position {kp.get('position_id')} {pair} "
                             f"value {value:.8f} exceeds dust threshold {dust_limit:.8f}"
                         )
+            recovered_symbols=set()
             for lp in local:
                 if not any(
                     max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
@@ -7383,7 +7487,43 @@ class PaperBot:
                         if age<30:
                             result.setdefault("pending_owned_orders",[]).append({"order_id":lp.get("order_id"),"symbol":lp["symbol"],"age_seconds":age})
                             continue
-                    result["mismatches"].append(f"Auxo SHORT {lp['symbol']} missing at Kraken")
+
+                    # D10.5: Kraken may already have filled Auxo's TP/SL cover while
+                    # local state failed to clear. Prove that from TradesHistory before
+                    # treating the discrepancy as a safety lock.
+                    sym=lp["symbol"]
+                    if sym in recovered_symbols:
+                        continue
+                    local_position=(self.state.positions or {}).get(sym)
+                    if local_position and bool(local_position.get("is_short")):
+                        try:
+                            recovery=self.recover_kraken_stale_closed_short(sym,local_position)
+                        except Exception as exc:
+                            recovery={"ok":False,"reason":str(exc)}
+                        if recovery.get("ok"):
+                            recovered_symbols.add(sym)
+                            result.setdefault("recovered_closed_positions",[]).append(recovery)
+                            continue
+                        result.setdefault("stale_position_recovery_failed",[]).append(
+                            {"symbol":sym,"reason":recovery.get("reason")}
+                        )
+                    result["mismatches"].append(f"Auxo SHORT {sym} missing at Kraken")
+            if result.get("recovered_closed_positions"):
+                # Kraken was already flat; refresh the authoritative account figures
+                # after local stale state has been cleared. Do not recursively call
+                # reconcile_kraken_margin here.
+                try:
+                    refreshed=kraken_margin_snapshot()
+                    result.update(refreshed)
+                    result["recovered_closed_positions"]=result.get("recovered_closed_positions",[])
+                    result["mismatches"]=[
+                        m for m in result.get("mismatches",[])
+                        if not any(f"Auxo SHORT {r['symbol']} missing at Kraken" in m
+                                   for r in result["recovered_closed_positions"])
+                    ]
+                except Exception as exc:
+                    result.setdefault("warnings",[]).append(f"Post-recovery Kraken refresh failed: {exc}")
+
             shorts=[p for p in result["positions"] if str(p.get("type") or "").upper()=="SELL"
                     and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
             max_shorts=max(1,int(float(self.state.settings.get("kraken_margin_max_open_shorts",1))))
