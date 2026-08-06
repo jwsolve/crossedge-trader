@@ -6206,9 +6206,15 @@ class PaperBot:
                 }
 
         if analysis["blowoff"]:
+            direction = "bullish" if analysis.get("is_green") else "bearish"
+            blocked_side = "LONG" if analysis.get("is_green") else "SHORT"
             return {
                 "signal": "WAIT",
-                "reason": f"Blow-off candle: {analysis['range_ratio']:.2%} of ATR, waiting for pullback",
+                "reason": (
+                    f"{direction.title()} blow-off candle: {analysis['range_ratio']:.2%} of ATR "
+                    f"(threshold {analysis['blowoff_threshold']:.0%}); avoiding {blocked_side} chase, "
+                    "waiting for pullback/reassessment"
+                ),
                 "analysis": analysis,
             }
 
@@ -6245,9 +6251,12 @@ class PaperBot:
             atr = candle_range
 
         manipulation_threshold = float(self.state.settings.get("opening_range_manipulation_threshold", 0.20))
+        blowoff_threshold = float(self.state.settings.get("opening_range_blowoff_atr_threshold", 1.40))
+        if blowoff_threshold <= manipulation_threshold:
+            blowoff_threshold = max(1.40, manipulation_threshold + 0.10)
         range_ratio = candle_range / atr if atr > 0 else 0
         manipulation = range_ratio < manipulation_threshold
-        blowoff = range_ratio >= manipulation_threshold
+        blowoff = range_ratio >= blowoff_threshold
 
         return {
             "bias": "bullish" if is_green else "bearish",
@@ -6258,6 +6267,8 @@ class PaperBot:
             "range": candle_range,
             "atr": atr,
             "range_ratio": round(range_ratio, 4),
+            "manipulation_threshold": manipulation_threshold,
+            "blowoff_threshold": blowoff_threshold,
             "manipulation": manipulation,
             "blowoff": blowoff,
             "is_green": is_green,
@@ -10860,9 +10871,12 @@ def run_opening_range_backtest(
             atr = candle_range
 
         manipulation_threshold = float(settings.get("opening_range_manipulation_threshold", 0.20))
+        blowoff_threshold = float(settings.get("opening_range_blowoff_atr_threshold", 1.40))
+        if blowoff_threshold <= manipulation_threshold:
+            blowoff_threshold = max(1.40, manipulation_threshold + 0.10)
         range_ratio = candle_range / atr if atr > 0 else 0
         manipulation = range_ratio < manipulation_threshold
-        is_blowoff = range_ratio >= manipulation_threshold
+        is_blowoff = range_ratio >= blowoff_threshold
 
         trigger = first_candle.high if is_green else first_candle.low
         stop_loss_mult = float(settings.get("opening_range_stop_loss_atr_multiplier", 1.5))
