@@ -2869,6 +2869,29 @@ class PaperBot:
                 repair = self.reconstruct_kraken_live_trades()
                 if repair.get("errors"):
                     logger.warning("Kraken trade reconstruction completed with warnings: %s", repair.get("errors"))
+
+                # D9.7: reconciliation can legitimately replace stale/corrupt local
+                # accounting with Kraken's real balance. Risk baselines must be
+                # re-anchored at the same moment; otherwise an old peak (for example
+                # the corrupt ~42k equity incident) makes a real ~43 USDT account
+                # appear to have suffered ~99.9% drawdown and immediately STOPs.
+                with self.lock:
+                    reconciled_equity = float(self.state.cash or 0.0)
+                    if self.state.positions:
+                        # equity() values any genuine reconstructed spot exposure too.
+                        try:
+                            reconciled_equity = float(self.equity(self.state.last_price))
+                        except Exception:
+                            reconciled_equity = float(self.state.cash or 0.0)
+                    self.state.day_start_equity = reconciled_equity
+                    self.state.day_start_date = today_key()
+                    self.state.peak_equity = reconciled_equity
+                    self.state.last_error = None
+                    self.state.last_signal = (
+                        f"Kraken live account reconciled; risk baseline reset to "
+                        f"{self.state.settings.get('quote_currency','USDT')} {reconciled_equity:.8f}"
+                    )
+                    self.save_state()
         except Exception as exc:
             with self.lock:
                 self.state.last_error = f"Start blocked: {exc}"
@@ -5564,6 +5587,25 @@ class PaperBot:
             return "Daily loss limit reached"
 
         max_drawdown_pct = float(settings.get("max_drawdown_pct", 20.0))
+        # D9.7 safety: a successfully reconciled Kraken live account must not be
+        # stopped by a legacy/corrupt local peak. A >10x peak/equity discontinuity
+        # is accounting state, not a plausible current-session drawdown.
+        if (
+            self.live_exchange() == "kraken"
+            and bool(settings.get("live_trading_enabled"))
+            and bool(getattr(self, "_kraken_live_balance", {}).get("reconciled"))
+            and equity > 0
+            and peak_equity > equity * 10.0
+        ):
+            with self.lock:
+                self.state.peak_equity = equity
+                self.state.day_start_equity = equity
+                self.state.day_start_date = today_key()
+                peak_equity = equity
+                day_start_equity = equity
+                self.save_state()
+            logger.warning("Reset impossible Kraken live drawdown baseline to reconciled equity %.8f", equity)
+
         if peak_equity > 0:
             current_drawdown = ((peak_equity - equity) / peak_equity) * 100
             if current_drawdown > max_drawdown_pct:
@@ -5647,6 +5689,25 @@ class PaperBot:
             return "Daily loss limit reached"
 
         max_drawdown_pct = float(settings.get("max_drawdown_pct", 20.0))
+        # D9.7 safety: a successfully reconciled Kraken live account must not be
+        # stopped by a legacy/corrupt local peak. A >10x peak/equity discontinuity
+        # is accounting state, not a plausible current-session drawdown.
+        if (
+            self.live_exchange() == "kraken"
+            and bool(settings.get("live_trading_enabled"))
+            and bool(getattr(self, "_kraken_live_balance", {}).get("reconciled"))
+            and equity > 0
+            and peak_equity > equity * 10.0
+        ):
+            with self.lock:
+                self.state.peak_equity = equity
+                self.state.day_start_equity = equity
+                self.state.day_start_date = today_key()
+                peak_equity = equity
+                day_start_equity = equity
+                self.save_state()
+            logger.warning("Reset impossible Kraken live drawdown baseline to reconciled equity %.8f", equity)
+
         if peak_equity > 0:
             current_drawdown = ((peak_equity - equity) / peak_equity) * 100
             if current_drawdown > max_drawdown_pct:
@@ -5934,6 +5995,25 @@ class PaperBot:
             return "Daily loss limit reached"
 
         max_drawdown_pct = float(settings.get("max_drawdown_pct", 20.0))
+        # D9.7 safety: a successfully reconciled Kraken live account must not be
+        # stopped by a legacy/corrupt local peak. A >10x peak/equity discontinuity
+        # is accounting state, not a plausible current-session drawdown.
+        if (
+            self.live_exchange() == "kraken"
+            and bool(settings.get("live_trading_enabled"))
+            and bool(getattr(self, "_kraken_live_balance", {}).get("reconciled"))
+            and equity > 0
+            and peak_equity > equity * 10.0
+        ):
+            with self.lock:
+                self.state.peak_equity = equity
+                self.state.day_start_equity = equity
+                self.state.day_start_date = today_key()
+                peak_equity = equity
+                day_start_equity = equity
+                self.save_state()
+            logger.warning("Reset impossible Kraken live drawdown baseline to reconciled equity %.8f", equity)
+
         if peak_equity > 0:
             current_drawdown = ((peak_equity - equity) / peak_equity) * 100
             if current_drawdown > max_drawdown_pct:
