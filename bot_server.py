@@ -5238,9 +5238,19 @@ class PaperBot:
                     self.state.last_signal = f"OANDA SELL blocked: {oanda_demo_status_message()}"
                     self.journal(symbol, "BLOCK", self.state.last_signal, fetched_prices.get(symbol, active_price))
                 elif self.should_live_trade():
-                    self.live_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity, is_short=bool(self.state.positions.get(symbol,{}).get("is_short",False)))
+                    exit_price = fetched_prices.get(symbol)
+                    if exit_price is None or float(exit_price) <= 0:
+                        self.state.last_signal = f"LIVE SELL blocked: no current {symbol} price; refusing cross-symbol fallback"
+                        self.journal(symbol, "BLOCK", self.state.last_signal, None)
+                    else:
+                        self.live_sell(symbol, float(exit_price), decision, sell_quantity, is_short=bool(self.state.positions.get(symbol,{}).get("is_short",False)))
                 else:
-                    self.paper_sell(symbol, fetched_prices.get(symbol, active_price), decision, sell_quantity)
+                    exit_price = fetched_prices.get(symbol)
+                    if exit_price is None or float(exit_price) <= 0:
+                        self.state.last_signal = f"SELL blocked: no current {symbol} price; refusing cross-symbol fallback"
+                        self.journal(symbol, "BLOCK", self.state.last_signal, None)
+                    else:
+                        self.paper_sell(symbol, float(exit_price), decision, sell_quantity)
 
             # ─── XGBoost training ──────────────────────────────────────
             if hasattr(self, 'self_learning_trader'):
@@ -5689,7 +5699,13 @@ class PaperBot:
 
         if abs(coin) > 0 and entry_price and active_symbol:
             symbol = active_symbol
-            price = fetched_prices.get(symbol, active_price)
+            # Safety invariant: an open position may only be evaluated using that
+            # exact symbol's market price. Never fall back to another watchlist
+            # asset (e.g. BTC) if LINK failed to fetch this tick.
+            price = fetched_prices.get(symbol)
+            if price is None or float(price) <= 0:
+                return f"HOLD {symbol} position price unavailable — exit evaluation skipped"
+            price = float(price)
             history = price_history.get(symbol, [])
             candles = candles_by_symbol.get(symbol) or closes_to_candles(history)
             signal_candle_set = signal_candles(closes_to_candles(history), settings)
@@ -5697,6 +5713,7 @@ class PaperBot:
             current_highest = max(highest_price or price, price)
 
             position = positions.get(symbol, {})
+            partial_take_profit_done = bool(position.get("partial_take_profit_done", partial_take_profit_done))
             # Track intra-trade excursion continuously for future learning (MFE/MAE).
             if symbol in self.state.positions:
                 with self.lock:
@@ -5763,6 +5780,8 @@ class PaperBot:
             ):
                 with self.lock:
                     self.state.partial_take_profit_done = True
+                    if symbol in self.state.positions:
+                        self.state.positions[symbol]["partial_take_profit_done"] = True
                 return f"SELL {symbol} partial {exit_mode} target"
 
             trail_ref=float(position.get("lowest_price") or price) if position_side=="SHORT" else current_highest
@@ -7711,6 +7730,31 @@ class PaperBot:
         filled_price = fill["average_price"] or order.price or self.state.last_price or 0.0
         is_short = order.details.get("is_short", False)
 
+        # Reject impossible local fill accounting before it can corrupt cash/equity.
+        # This does not undo an exchange fill; it prevents a bad/mismatched price
+        # response from being multiplied by the position quantity locally.
+        reference_price = float(order.price or self.state.positions.get(order.symbol,{}).get("entry_price") or 0.0)
+        if reference_price > 0 and filled_price > 0:
+            ratio = float(filled_price) / reference_price
+            if ratio < 0.20 or ratio > 5.0:
+                order.status = "RECONCILE_ERROR"
+                self.state.last_error = (
+                    f"Kraken fill sanity lock for {order.symbol}: fill {filled_price:.8f} "
+                    f"vs reference {reference_price:.8f}"
+                )
+                self.journal(order.symbol, "ERROR", self.state.last_error, reference_price,
+                             {"order_id":order.order_id,"fill":fill})
+                # Anchor live Kraken quote cash to the exchange even though the
+                # suspect fill is not applied to local position accounting.
+                if self.live_exchange()=="kraken":
+                    try:
+                        q=str(self.state.settings.get("quote_currency") or "USDT")
+                        self.state.cash=kraken_available_balance(q)
+                    except Exception:
+                        pass
+                self.save_state()
+                return False
+
         if order.role == "ENTRY":
             if is_short and self.live_exchange()=="kraken":
                 rec=(getattr(self.state,"kraken_margin_owned",{}) or {}).get(order.order_id)
@@ -7797,6 +7841,19 @@ class PaperBot:
             and self.state.settings.get("exchange") == "coinbase"
         ):
             self.sync_live_balance_always()
+        elif (
+            self.state.settings.get("live_trading_enabled")
+            and self.state.settings.get("asset_class", "crypto") == "crypto"
+            and self.live_exchange() == "kraken"
+        ):
+            # In Kraken live mode the exchange balance is authoritative. Local
+            # paper_* arithmetic is retained for trade history/P&L only.
+            try:
+                quote=str(self.state.settings.get("quote_currency") or "USDT")
+                self.state.cash=kraken_available_balance(quote)
+                self.save_state()
+            except Exception as exc:
+                self.journal(order.symbol,"WARN",f"Kraken post-fill balance sync failed: {exc}",filled_price)
 
         return True
 
@@ -8864,9 +8921,13 @@ def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,lev
 def kraken_reconcile_order(oid):
     row=(kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}).get(oid,{})
     size=float(row.get("vol_exec") or 0); cost=float(row.get("cost") or 0)
-    avg=float(row.get("price") or 0) or (cost/size if size else 0)
+    reported=float(row.get("price") or 0)
+    # Kraken's executed cost / executed volume is the safest fill-price source.
+    # Prefer it whenever both values exist; use row.price only as a fallback.
+    avg=(cost/size) if (size>0 and cost>0) else reported
     return {"order_id":oid,"status":str(row.get("status") or "UNKNOWN").upper(),"filled_size":size,
             "filled_value":cost,"total_fee":float(row.get("fee") or 0),"average_price":avg,
+            "reported_price":reported,
             "fills_count":len(row.get("trades") or []),"order":row}
 
 def kraken_cancel_order(oid):
