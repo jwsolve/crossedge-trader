@@ -4823,6 +4823,86 @@ class PaperBot:
         self.save_state()
         return result
 
+    def kraken_reconstructed_performance_stats(self) -> dict[str, Any] | None:
+        """Compute closed Kraken performance directly from authoritative recovered fills.
+
+        D9.8 fallback for legacy DB rows whose account/exchange metadata prevents the
+        normal account-scoped stats query from seeing an otherwise valid reconstructed
+        Kraken BUY + partial SELL + final SELL sequence.
+        """
+        if self.live_exchange() != "kraken" or not bool(self.state.settings.get("live_trading_enabled")):
+            return None
+
+        rows = []
+        for tr in list(self.state.trades or []):
+            reason = str(getattr(tr, "reason", "") or "")
+            oid = str(getattr(tr, "exchange_order_id", "") or "").strip().upper()
+            if oid and "KRAKEN RECONSTRUCTED" in reason.upper():
+                rows.append({
+                    "time": getattr(tr, "time", ""),
+                    "side": str(getattr(tr, "side", "") or "").upper(),
+                    "symbol": str(getattr(tr, "symbol", "") or "").upper(),
+                    "quantity": abs(float(getattr(tr, "quantity", 0.0) or getattr(tr, "exchange_filled_size", 0.0) or 0.0)),
+                    "price": float(getattr(tr, "exchange_average_filled_price", 0.0) or getattr(tr, "exit_price", 0.0) or getattr(tr, "entry_price", 0.0) or getattr(tr, "price", 0.0) or 0.0),
+                    "fee": max(0.0, float(getattr(tr, "fee_paid", 0.0) or 0.0)),
+                    "oid": oid,
+                })
+        if not rows:
+            return None
+
+        # deterministic order-id dedupe, then chronological FIFO matching
+        dedup = {r["oid"]: r for r in rows}
+        rows = sorted(dedup.values(), key=lambda r: str(r["time"]))
+        lots: dict[str, list[dict[str, float]]] = {}
+        exits = []
+        for r in rows:
+            if r["quantity"] <= 0 or r["price"] <= 0 or r["side"] not in {"BUY","SELL"} or not r["symbol"]:
+                continue
+            if r["side"] == "BUY":
+                lots.setdefault(r["symbol"], []).append({
+                    "qty": r["quantity"], "price": r["price"], "fee": r["fee"]
+                })
+                continue
+            remaining=r["quantity"]; matched=0.0; gross=0.0; entry_fees=0.0; exit_fees=0.0; entry_notional=0.0
+            symbol_lots=lots.get(r["symbol"],[])
+            while remaining > 1e-15 and symbol_lots:
+                lot=symbol_lots[0]; before=lot["qty"]; take=min(remaining,before)
+                frac=take/before if before else 0.0
+                ef=lot["fee"]*frac
+                xf=r["fee"]*(take/r["quantity"]) if r["quantity"] else 0.0
+                gross += (r["price"]-lot["price"])*take
+                entry_notional += lot["price"]*take
+                entry_fees += ef; exit_fees += xf; matched += take
+                lot["qty"] -= take; lot["fee"] -= ef; remaining -= take
+                if lot["qty"] <= 1e-15: symbol_lots.pop(0)
+            if matched > 0:
+                pnl=gross-entry_fees-exit_fees
+                exits.append({"pnl":pnl,"fees":entry_fees+exit_fees,"qty":matched,
+                              "pnl_pct": (pnl/(entry_notional+entry_fees)*100.0) if entry_notional+entry_fees>0 else 0.0})
+
+        if not exits:
+            return None
+        eps=1e-12
+        wins=[x for x in exits if x["pnl"]>eps]; losses=[x for x in exits if x["pnl"]<-eps]
+        breakeven=[x for x in exits if abs(x["pnl"])<=eps]
+        gp=sum(x["pnl"] for x in wins); gl=abs(sum(x["pnl"] for x in losses))
+        return {
+            "source":"kraken_reconstructed_fills",
+            "scope":self.performance_scope_label(),
+            # Each partial/final SELL is an exit fill. Also expose logical round trips.
+            "closed_trades":len(exits),
+            "closed_exit_fills":len(exits),
+            "completed_positions":1 if not any(lots.values()) else 0,
+            "winning_trades":len(wins),"losing_trades":len(losses),"breakeven_trades":len(breakeven),
+            "win_rate":round(len(wins)/(len(wins)+len(losses))*100,2) if (wins or losses) else None,
+            "profit_factor":round(gp/gl,4) if gl>0 else (None if gp<=0 else "inf"),
+            "average_win":round(gp/len(wins),8) if wins else None,
+            "average_loss":round(-gl/len(losses),8) if losses else None,
+            "gross_profit":round(gp,8),"gross_loss":round(gl,8),
+            "net_realised_pnl":round(sum(x["pnl"] for x in exits),8),
+            "total_fees":round(sum(x["fees"] for x in exits),8),
+        }
+
     def live_trade_performance_stats(self) -> dict[str, Any]:
         """Return completed account-scoped trade performance from trades.db, net of fees.
 
@@ -4972,6 +5052,11 @@ class PaperBot:
         gross_loss = abs(sum(x["pnl"] for x in losses))
         total_fees = sum(x["fees"] for x in closed)
         net_realised = sum(x["pnl"] for x in closed)
+
+        if self.live_exchange() == "kraken" and len(closed) == 0:
+            recovered_stats = self.kraken_reconstructed_performance_stats()
+            if recovered_stats and recovered_stats.get("closed_trades", 0) > 0:
+                return recovered_stats
 
         return {
             "source": "trades.db",
