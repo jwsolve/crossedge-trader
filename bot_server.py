@@ -5008,175 +5008,124 @@ class PaperBot:
         }
 
     def live_trade_performance_stats(self) -> dict[str, Any]:
-        """Return completed account-scoped trade performance from trades.db, net of fees.
+        """Account-scoped realised performance, correctly matching LONG and SHORT round trips.
 
-        The population follows this engine's authenticated account, active exchange,
-        and paper/live mode. BUY lots are matched FIFO to
-        SELL quantities per symbol. Entry fees are allocated pro-rata when a BUY is
-        closed in more than one SELL; each SELL fee is also deducted. This makes
-        win/loss, win rate, profit factor and average P/L all use the same net result.
+        D10.7 fixes the old BUY-entry/SELL-exit assumption. Kraken margin shorts are
+        SELL-to-open and BUY-to-cover, so both directions are now FIFO matched.
+        Each closing fill produces one realised exit record; partial closes allocate
+        entry and exit fees pro-rata.
         """
         try:
-            rows = self.db.get_trades(limit=999999, user_id=self.user_id, account_id=self.account_id)
+            rows=self.db.get_trades(limit=999999,user_id=self.user_id,account_id=self.account_id)
         except Exception as exc:
-            logger.warning(f"Could not read live performance from trades.db: {exc}")
-            return {
-                "source": "trades.db", "scope": self.performance_scope_label(), "closed_trades": 0,
-                "winning_trades": 0, "losing_trades": 0, "breakeven_trades": 0,
-                "win_rate": None, "profit_factor": None, "average_win": None,
-                "average_loss": None, "gross_profit": 0.0, "gross_loss": 0.0,
-                "net_realised_pnl": 0.0, "total_fees": 0.0,
-            }
+            logger.warning("Could not read live performance from trades.db: %s",exc)
+            rows=[]
 
-        # Kraken recovery can coexist with an older corrupted audit row. Collapse
-        # duplicate exchange order IDs and prefer the authoritative reconstructed row.
-        if self.live_exchange() == "kraken":
-            by_order: dict[str, dict[str, Any]] = {}
-            without_order: list[dict[str, Any]] = []
+        active_exchange=str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
+        is_live=bool(self.state.settings.get("live_trading_enabled",False))
+
+        # Prefer authoritative reconstructed Kraken rows for duplicate exchange orders.
+        if active_exchange=="kraken":
+            by_order={}; without=[]
             for row in rows:
-                oid = str(row.get("exchange_order_id") or "").strip().upper()
-                if not oid:
-                    without_order.append(row); continue
-                current = by_order.get(oid)
-                recovered = "KRAKEN RECONSTRUCTED" in str(row.get("reason") or "").upper()
-                current_recovered = bool(current and "KRAKEN RECONSTRUCTED" in str(current.get("reason") or "").upper())
-                if current is None or (recovered and not current_recovered):
-                    by_order[oid] = row
-            rows = without_order + list(by_order.values())
+                oid=str(row.get("exchange_order_id") or "").strip().upper()
+                if not oid: without.append(row); continue
+                cur=by_order.get(oid)
+                rec="KRAKEN RECONSTRUCTED" in str(row.get("reason") or "").upper()
+                cur_rec=bool(cur and "KRAKEN RECONSTRUCTED" in str(cur.get("reason") or "").upper())
+                if cur is None or (rec and not cur_rec): by_order[oid]=row
+            rows=without+list(by_order.values())
 
-        # get_trades may return newest-first. FIFO matching requires chronological order.
-        rows = sorted(rows, key=lambda r: str(r.get("created_at") or r.get("time") or ""))
-        open_lots: dict[str, list[dict[str, float]]] = {}
-        closed: list[dict[str, float]] = []
+        rows=sorted(rows,key=lambda r:str(r.get("created_at") or r.get("time") or ""))
+
+        # symbol -> FIFO lots. signed qty: +LONG, -SHORT.
+        lots:dict[str,list[dict[str,float]]]={}
+        closed=[]
+
+        def eligible(row:dict[str,Any])->bool:
+            reason=str(row.get("reason") or ""); ru=reason.upper()
+            rx=str(row.get("exchange") or "").lower()
+            if is_live and not row.get("exchange_order_id"): return False
+            if active_exchange=="kraken":
+                if rx and rx!="kraken": return False
+                if is_live and "PAPER" in ru: return False
+            elif active_exchange=="coinbase":
+                liveish=(rx=="coinbase" or "LIVE " in ru or "COINBASE" in ru or "EMERGENCY MARKET EXIT" in ru)
+                if "OANDA" in ru or not liveish: return False
+                if is_live and "PAPER" in ru: return False
+                if not is_live and ("LIVE " in ru or "EMERGENCY MARKET EXIT" in ru): return False
+            return True
 
         for row in rows:
-            active_exchange = str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
-            is_live = bool(self.state.settings.get("live_trading_enabled", False))
-            if is_live and not row.get("exchange_order_id"):
-                continue
+            if not eligible(row): continue
+            side=str(row.get("side") or "").upper()
+            symbol=str(row.get("symbol") or "").upper()
+            if side not in {"BUY","SELL"} or not symbol: continue
+            qty=abs(float(row.get("quantity") or row.get("exchange_filled_size") or 0.0))
+            price=float(row.get("exchange_average_filled_price") or row.get("exit_price") or row.get("entry_price") or row.get("price") or 0.0)
+            fee=max(0.0,float(row.get("fee_paid") or 0.0))
+            if qty<=0 or price<=0: continue
 
-            # Rows are already user/account scoped. Keep the card population
-            # aligned with this account's configured exchange and execution mode.
-            reason_text = str(row.get("reason") or "")
-            reason_upper = reason_text.upper()
-            row_exchange = str(row.get("exchange") or "").lower()
-            if active_exchange == "coinbase":
-                is_coinbase_live = (
-                    row_exchange == "coinbase"
-                    or "LIVE " in reason_upper
-                    or "COINBASE" in reason_upper
-                    or "EMERGENCY MARKET EXIT" in reason_upper
-                )
-                if "OANDA" in reason_upper or not is_coinbase_live:
-                    continue
-                if is_live and "PAPER" in reason_upper:
-                    continue
-                if not is_live and ("LIVE " in reason_upper or "EMERGENCY MARKET EXIT" in reason_upper):
-                    continue
-            elif active_exchange == "kraken":
-                if row_exchange and row_exchange != "kraken":
-                    continue
-                if is_live and "PAPER" in reason_upper:
-                    continue
-                if not is_live and ("LIVE " in reason_upper or "EMERGENCY MARKET EXIT" in reason_upper):
-                    continue
+            incoming_sign=1.0 if side=="BUY" else -1.0
+            remaining=qty
+            symbol_lots=lots.setdefault(symbol,[])
 
-            side = str(row.get("side") or "").upper()
-            symbol = str(row.get("symbol") or "").upper()
-            if not symbol or side not in {"BUY", "SELL"}:
-                continue
+            # Opposite-signed existing lots mean this fill is closing exposure.
+            while remaining>1e-15 and symbol_lots and symbol_lots[0]["sign"] != incoming_sign:
+                lot=symbol_lots[0]
+                before=lot["qty"]
+                take=min(remaining,before)
+                entry_fee=lot["fee"]*(take/before) if before else 0.0
+                exit_fee=fee*(take/qty) if qty else 0.0
 
-            qty = abs(float(row.get("quantity") or row.get("exchange_filled_size") or 0.0))
-            price = float(row.get("exit_price") or row.get("entry_price") or row.get("price") or 0.0)
-            fee = max(0.0, float(row.get("fee_paid") or 0.0))
-            if qty <= 0 or price <= 0:
-                continue
+                # LONG: (sell-entry)*qty. SHORT: (entry-cover)*qty.
+                if lot["sign"]>0:
+                    gross=(price-lot["price"])*take
+                else:
+                    gross=(lot["price"]-price)*take
 
-            if side == "BUY":
-                open_lots.setdefault(symbol, []).append({
-                    "remaining_qty": qty,
-                    "entry_price": price,
-                    "remaining_fee": fee,
+                pnl=gross-entry_fee-exit_fee
+                entry_notional=lot["price"]*take
+                closed.append({
+                    "pnl":pnl,
+                    "pnl_pct":pnl/(entry_notional+entry_fee)*100.0 if entry_notional+entry_fee>0 else 0.0,
+                    "fees":entry_fee+exit_fee,
+                    "symbol":symbol,
+                    "direction":"LONG" if lot["sign"]>0 else "SHORT",
+                    "quantity":take,
                 })
-                continue
+                lot["qty"]-=take; lot["fee"]-=entry_fee; remaining-=take
+                if lot["qty"]<=1e-15: symbol_lots.pop(0)
 
-            lots = open_lots.get(symbol, [])
-            remaining_sell = qty
-            sell_fee_remaining = fee
-            matched_qty = 0.0
-            gross_move = 0.0
-            entry_fees = 0.0
-            exit_fees = 0.0
-            entry_notional = 0.0
+            # Any remainder opens/increases exposure in the incoming direction.
+            if remaining>1e-15:
+                remaining_fee=fee*(remaining/qty) if qty else 0.0
+                symbol_lots.append({"sign":incoming_sign,"qty":remaining,"price":price,"fee":remaining_fee})
 
-            while remaining_sell > 1e-15 and lots:
-                lot = lots[0]
-                lot_qty_before = lot["remaining_qty"]
-                take = min(remaining_sell, lot_qty_before)
-                fraction = take / lot_qty_before if lot_qty_before > 0 else 0.0
-                allocated_entry_fee = lot["remaining_fee"] * fraction
-                allocated_exit_fee = fee * (take / qty) if qty > 0 else 0.0
-
-                gross_move += (price - lot["entry_price"]) * take
-                entry_notional += lot["entry_price"] * take
-                entry_fees += allocated_entry_fee
-                exit_fees += allocated_exit_fee
-                matched_qty += take
-
-                lot["remaining_qty"] -= take
-                lot["remaining_fee"] -= allocated_entry_fee
-                remaining_sell -= take
-                sell_fee_remaining -= allocated_exit_fee
-
-                if lot["remaining_qty"] <= 1e-15:
-                    lots.pop(0)
-
-            if matched_qty <= 0:
-                # Do not invent performance for an unmatched historical SELL.
-                logger.debug(f"Skipping unmatched account SELL in performance stats: {symbol} qty={qty}")
-                continue
-
-            net_pnl = gross_move - entry_fees - exit_fees
-            net_cost = entry_notional + entry_fees
-            net_pnl_pct = (net_pnl / net_cost * 100.0) if net_cost > 0 else 0.0
-            closed.append({
-                "pnl": net_pnl,
-                "pnl_pct": net_pnl_pct,
-                "entry_fees": entry_fees,
-                "exit_fees": exit_fees,
-                "fees": entry_fees + exit_fees,
-            })
-
-        eps = 1e-12
-        wins = [x for x in closed if x["pnl"] > eps]
-        losses = [x for x in closed if x["pnl"] < -eps]
-        breakeven = [x for x in closed if abs(x["pnl"]) <= eps]
-        decided = len(wins) + len(losses)
-        gross_profit = sum(x["pnl"] for x in wins)
-        gross_loss = abs(sum(x["pnl"] for x in losses))
-        total_fees = sum(x["fees"] for x in closed)
-        net_realised = sum(x["pnl"] for x in closed)
-
-        if self.live_exchange() == "kraken" and len(closed) == 0:
-            recovered_stats = self.kraken_reconstructed_performance_stats()
-            if recovered_stats and recovered_stats.get("closed_trades", 0) > 0:
-                return recovered_stats
-
+        eps=1e-12
+        wins=[x for x in closed if x["pnl"]>eps]
+        losses=[x for x in closed if x["pnl"]<-eps]
+        breakeven=[x for x in closed if abs(x["pnl"])<=eps]
+        decided=len(wins)+len(losses)
+        gp=sum(x["pnl"] for x in wins)
+        gl=abs(sum(x["pnl"] for x in losses))
         return {
-            "source": "trades.db",
-            "scope": self.performance_scope_label(),
-            "closed_trades": len(closed),
-            "winning_trades": len(wins),
-            "losing_trades": len(losses),
-            "breakeven_trades": len(breakeven),
-            "win_rate": round((len(wins) / decided) * 100, 2) if decided else None,
-            "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else (None if gross_profit <= 0 else "inf"),
-            "average_win": round(gross_profit / len(wins), 8) if wins else None,
-            "average_loss": round(-gross_loss / len(losses), 8) if losses else None,
-            "gross_profit": round(gross_profit, 8),
-            "gross_loss": round(gross_loss, 8),
-            "net_realised_pnl": round(net_realised, 8),
-            "total_fees": round(total_fees, 8),
+            "source":"trades.db_direction_aware",
+            "scope":self.performance_scope_label(),
+            "closed_trades":len(closed),
+            "winning_trades":len(wins),
+            "losing_trades":len(losses),
+            "breakeven_trades":len(breakeven),
+            "win_rate":round(len(wins)/decided*100.0,2) if decided else None,
+            "profit_factor":round(gp/gl,4) if gl>0 else (None if gp<=0 else "inf"),
+            "average_win":round(gp/len(wins),8) if wins else None,
+            "average_loss":round(-gl/len(losses),8) if losses else None,
+            "gross_profit":round(gp,8),
+            "gross_loss":round(gl,8),
+            "net_realised_pnl":round(sum(x["pnl"] for x in closed),8),
+            "total_fees":round(sum(x["fees"] for x in closed),8),
+            "long_closes":sum(1 for x in closed if x["direction"]=="LONG"),
+            "short_closes":sum(1 for x in closed if x["direction"]=="SHORT"),
         }
 
     def snapshot(self) -> dict[str, Any]:
