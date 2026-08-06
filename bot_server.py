@@ -904,27 +904,19 @@ class SelfLearningTrader:
                 'strength': 0.8,
             })
 
-        # 3. MACD
-        macd_data = calculate_macd(prices)
-        if macd_data and len(macd_data) > 3:
-            if macd_data[-1] > 0 and macd_data[-2] <= 0:
-                strength = abs(macd_data[-1] - macd_data[-2]) / (abs(prices[-1]) + 0.0001)
-                signals.append({
-                    'type': 'macd_buy',
-                    'weight': self.get_signal_weight('macd_buy'),
-                    'direction': 'BUY',
-                    'price': prices[-1],
-                    'strength': min(1.0, strength * 10),
-                })
-            elif macd_data[-1] < 0 and macd_data[-2] >= 0:
-                strength = abs(macd_data[-1] - macd_data[-2]) / (abs(prices[-1]) + 0.0001)
-                signals.append({
-                    'type': 'macd_sell',
-                    'weight': self.get_signal_weight('macd_sell'),
-                    'direction': 'SELL',
-                    'price': prices[-1],
-                    'strength': min(1.0, strength * 10),
-                })
+        # 3. MACD — standard 12/26/9 signal-line crossover
+        macd_full = calculate_macd_full(prices, 12, 26, 9)
+        macd_line, macd_signal, macd_hist = macd_full["macd"], macd_full["signal"], macd_full["histogram"]
+        if len(prices) >= 35 and None not in (macd_line[-1],macd_signal[-1],macd_line[-2],macd_signal[-2]):
+            curr_diff=macd_line[-1]-macd_signal[-1]
+            prev_diff=macd_line[-2]-macd_signal[-2]
+            strength=abs(curr_diff)/(abs(prices[-1])+0.0001)
+            if curr_diff > 0 and prev_diff <= 0:
+                signals.append({'type':'macd_buy','weight':self.get_signal_weight('macd_buy'),
+                    'direction':'BUY','price':prices[-1],'strength':min(1.0,strength*20)})
+            elif curr_diff < 0 and prev_diff >= 0:
+                signals.append({'type':'macd_sell','weight':self.get_signal_weight('macd_sell'),
+                    'direction':'SELL','price':prices[-1],'strength':min(1.0,strength*20)})
 
         # 4. RSI
         rsi_value = calculate_rsi(prices)
@@ -959,24 +951,24 @@ class SelfLearningTrader:
                     'strength': min(1.0, (last_volume / avg_volume) / 4),
                 })
 
-        # 6. Support/Resistance breakouts
-        support, resistance = find_support_resistance(candles)
-        if support and prices[-1] < support * 0.995:
-            signals.append({
-                'type': 'breakdown_support',
-                'weight': self.get_signal_weight('breakdown_support'),
-                'direction': 'SELL',
-                'price': prices[-1],
-                'strength': (support - prices[-1]) / support,
-            })
-        if resistance and prices[-1] > resistance * 1.005:
-            signals.append({
-                'type': 'breakout_resistance',
-                'weight': self.get_signal_weight('breakout_resistance'),
-                'direction': 'BUY',
-                'price': prices[-1],
-                'strength': (prices[-1] - resistance) / resistance,
-            })
+        # 6. Confirmed breakouts. Calculate levels from PRIOR candles so the
+        # breakout candle cannot move the level it is attempting to break.
+        prior=candles[:-1]
+        support, resistance = find_support_resistance(prior)
+        if len(candles)>=21 and support and resistance:
+            last=candles[-1]
+            avg_vol=sum(c.volume for c in prior[-20:])/min(20,len(prior))
+            atr=calculate_atr_from_candles(candles,14)
+            clearance=max(atr*0.15, prices[-1]*0.001)
+            volume_confirmed=(avg_vol<=0 or last.volume>=avg_vol*1.20)
+            breakout_up=(last.close > resistance+clearance and last.open <= last.close)
+            breakout_down=(last.close < support-clearance and last.open >= last.close)
+            if breakout_down and volume_confirmed:
+                signals.append({'type':'breakdown_support','weight':self.get_signal_weight('breakdown_support'),
+                    'direction':'SELL','price':last.close,'strength':min(1.0,(support-last.close)/support*10)})
+            if breakout_up and volume_confirmed:
+                signals.append({'type':'breakout_resistance','weight':self.get_signal_weight('breakout_resistance'),
+                    'direction':'BUY','price':last.close,'strength':min(1.0,(last.close-resistance)/resistance*10)})
 
         # 7. Support/Resistance bounces
         if support and abs(prices[-1] - support) / support < 0.01:
@@ -1122,27 +1114,30 @@ def calculate_macd(prices: list[float], fast: int = 12, slow: int = 26) -> list[
 
     return [v for v in macd_values if v is not None]
 
+def calculate_macd_full(prices: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> dict[str, list[float | None]]:
+    """Standard MACD 12/26/9: MACD line, EMA signal line and histogram."""
+    n=len(prices)
+    empty={"macd":[None]*n,"signal":[None]*n,"histogram":[None]*n}
+    if n < slow:
+        return empty
+    fast_e=ema_series(prices,fast)
+    slow_e=ema_series(prices,slow)
+    macd=[(float(fast_e[i])-float(slow_e[i])) if fast_e[i] is not None and slow_e[i] is not None else None for i in range(n)]
+    valid=[v for v in macd if v is not None]
+    sig_valid=ema_series(valid,signal) if valid else []
+    sig=[None]*n
+    j=0
+    for i,v in enumerate(macd):
+        if v is not None:
+            if j < len(sig_valid): sig[i]=sig_valid[j]
+            j+=1
+    hist=[(macd[i]-sig[i]) if macd[i] is not None and sig[i] is not None else None for i in range(n)]
+    return {"macd":macd,"signal":sig,"histogram":hist}
+
 def calculate_rsi(prices: list[float], period: int = 14) -> float | None:
-    """Calculate RSI value."""
-    if len(prices) < period + 1:
-        return None
-
-    gains = 0
-    losses = 0
-    for i in range(len(prices) - period, len(prices)):
-        change = prices[i] - prices[i-1]
-        if change >= 0:
-            gains += change
-        else:
-            losses -= change
-
-    avg_gain = gains / period
-    avg_loss = losses / period
-
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    """Wilder-smoothed RSI, matching conventional exchange/chart implementations."""
+    values=rsi_series(prices,period)
+    return values[-1] if values else None
 
 def find_support_resistance(candles: list[Candle] | list[dict], lookback: int = 20) -> tuple[float | None, float | None]:
     """Find support and resistance levels."""
@@ -12988,6 +12983,30 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
 
             current_price = self.bot.state.last_price
 
+            closes=[c.close for c in candles]
+            rsi_vals=rsi_series(closes,14) if closes else []
+            macd_full=calculate_macd_full(closes,12,26,9) if closes else {"macd":[],"signal":[],"histogram":[]}
+            short_w=int(settings.get("short_window",5)); long_w=int(settings.get("long_window",20))
+            trend_short=sma(closes,short_w) if closes else None
+            trend_long=sma(closes,long_w) if closes else None
+            prior=candles[:-1]
+            bo_support,bo_resistance=find_support_resistance(prior) if len(prior)>=20 else (None,None)
+            avg_vol=(sum(c.volume for c in prior[-20:])/min(20,len(prior))) if prior else 0.0
+            atr=calculate_atr_from_candles(candles,14) if candles else 0.0
+            clearance=max(atr*.15,closes[-1]*.001) if closes else 0.0
+            breakout="NONE"
+            if candles and bo_resistance and candles[-1].close>bo_resistance+clearance and (avg_vol<=0 or candles[-1].volume>=avg_vol*1.20): breakout="UP"
+            elif candles and bo_support and candles[-1].close<bo_support-clearance and (avg_vol<=0 or candles[-1].volume>=avg_vol*1.20): breakout="DOWN"
+
+            signal_accuracy={}
+            trader=getattr(self.bot,"self_learning_trader",None)
+            if trader is not None:
+                for key in ("trend_up","trend_down","macd_buy","macd_sell","rsi_oversold","rsi_overbought","breakout_resistance","breakdown_support"):
+                    h=trader.signal_history.get(key)
+                    if h:
+                        signal_accuracy[key]={"samples":int(h.total_signals),"wins":int(h.successful_trades),
+                                              "win_rate":round(float(h.win_rate),2),"avg_pnl":round(float(h.avg_pnl),8)}
+
             chart_row = next(
                 (row for row in self.bot.state.scan_rows if row.get('symbol') == symbol),
                 {}
@@ -13002,6 +13021,25 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
                 'current_price': current_price,
                 'support': chart_row.get('support'),
                 'resistance': chart_row.get('resistance'),
+                'indicator_source': {
+                    'exchange': exchange, 'pair': f"{symbol}/{quote_currency}",
+                    'granularity_seconds': granularity, 'candle_count': len(candle_data),
+                    'note': 'Indicators calculated server-side from the same exchange OHLCV candles returned above.'
+                },
+                'indicators': {
+                    'rsi14_wilder': rsi_vals[-1] if rsi_vals else None,
+                    'macd_12_26_9': {
+                        'macd': macd_full['macd'][-1] if macd_full['macd'] else None,
+                        'signal': macd_full['signal'][-1] if macd_full['signal'] else None,
+                        'histogram': macd_full['histogram'][-1] if macd_full['histogram'] else None,
+                    },
+                    'trend': {'short_period':short_w,'long_period':long_w,'short_sma':trend_short,'long_sma':trend_long,
+                              'direction':'UP' if trend_short is not None and trend_long is not None and trend_short>trend_long else
+                                          ('DOWN' if trend_short is not None and trend_long is not None and trend_short<trend_long else 'NEUTRAL')},
+                    'breakout': {'status':breakout,'support':bo_support,'resistance':bo_resistance,
+                                 'atr14':atr,'clearance':clearance,'volume_ratio':(candles[-1].volume/avg_vol if candles and avg_vol>0 else None)}
+                },
+                'signal_accuracy': signal_accuracy,
             })
 
         except BrokenPipeError:
