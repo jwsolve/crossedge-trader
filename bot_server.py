@@ -4737,89 +4737,133 @@ class PaperBot:
         return f"{exchange}_{mode}_account_only_net_fees"
 
     def reconstruct_kraken_live_trades(self) -> dict[str, Any]:
-        """Repair Auxo's persisted Kraken LIVE fills from Kraken QueryOrders.
+        """Persist authoritative Kraken spot fills into Auxo's normal trade store.
 
-        Only order IDs already known to Auxo are queried, so unrelated manual Kraken
-        account activity is never imported. Recovered rows use a deterministic
-        trade_id and can safely be rebuilt on every startup. The original corrupted
-        row may remain for audit purposes; performance stats deduplicate by Kraken
-        exchange_order_id and prefer the reconstructed row.
+        Recovery sources:
+        1. Auxo-known Kraken order IDs -> QueryOrders.
+        2. Kraken TradesHistory -> fills for configured Auxo watchlist/quote.
+
+        TradesHistory closes the restart hole where the local state/database no longer
+        contains the order IDs. Recovery is deliberately limited to the current quote,
+        configured watchlist, and recent history. record_trade() supplies normal
+        user/account/exchange metadata so the existing frontend stats can see the rows.
         """
         if self.live_exchange() != "kraken" or not bool(self.state.settings.get("live_trading_enabled")):
             return {"ok": True, "exchange": "kraken", "skipped": "not live Kraken", "reconstructed": 0}
 
-        known: dict[str, dict[str, Any]] = {}
-        # State trades include the live order IDs even when the old DB row was bad.
-        for tr in list(self.state.trades or []):
-            oid = str(getattr(tr, "exchange_order_id", None) or "").strip().upper()
-            if oid:
-                known.setdefault(oid, {"reason": getattr(tr, "reason", ""), "symbol": getattr(tr, "symbol", "")})
-        try:
-            for row in self.db.get_trades(limit=999999, user_id=self.user_id, account_id=self.account_id):
-                oid = str(row.get("exchange_order_id") or "").strip().upper()
-                if oid:
-                    known.setdefault(oid, {"reason": row.get("reason") or "", "symbol": row.get("symbol") or ""})
-        except Exception as exc:
-            logger.warning("Kraken reconstruction DB scan failed; continuing from state trades: %s", exc)
-
-        if not known:
-            return {"ok": True, "exchange": "kraken", "known_orders": 0, "reconstructed": 0}
-
         quote = str(self.state.settings.get("quote_currency") or "USDT").upper()
-        reconstructed = 0
-        errors = []
-        # Query individually and pause very briefly: startup repair is correctness-first
-        # and must remain gentle with Kraken's private API rate limits.
-        for oid, old in list(known.items())[-100:]:
-            try:
-                raw = (kraken_private("/0/private/QueryOrders", {"txid": oid, "trades": "true"}).get("result") or {}).get(oid)
-                if not isinstance(raw, dict):
-                    errors.append(f"{oid}: not found")
-                    continue
-                status = str(raw.get("status") or "").lower()
-                qty = float(raw.get("vol_exec") or 0.0)
-                cost = float(raw.get("cost") or 0.0)
-                fee = max(0.0, float(raw.get("fee") or 0.0))
-                if qty <= 0 or cost <= 0 or status not in {"closed", "canceled", "cancelled"}:
-                    continue
-                avg = cost / qty
-                descr = raw.get("descr") if isinstance(raw.get("descr"), dict) else {}
-                side = str(descr.get("type") or "").upper()
-                if side not in {"BUY", "SELL"}:
-                    continue
-                pair = str(descr.get("pair") or "").upper().replace("/", "")
-                symbol = str(old.get("symbol") or "").upper()
-                if not symbol:
-                    # Prefer configured quote removal; handle Kraken XBT naming.
-                    symbol = pair[:-len(quote)] if quote and pair.endswith(quote) else pair
-                    if symbol == "XBT": symbol = "BTC"
-                    if symbol == "XDG": symbol = "DOGE"
-                reason = str(old.get("reason") or "Kraken live fill")
-                recovered_reason = f"KRAKEN RECONSTRUCTED | {reason}"
-                trade = Trade(
-                    time=datetime.fromtimestamp(float(raw.get("closetm") or raw.get("opentm") or time.time()), tz=timezone.utc).isoformat(),
-                    side=side, symbol=symbol, price=avg, quantity=qty,
-                    cash_after=float(self.state.cash or 0.0), coin_after=0.0,
-                    reason=recovered_reason, fee_paid=fee,
-                    exchange_order_id=oid, exchange_order_status=str(raw.get("status") or "").upper(),
-                    exchange_average_filled_price=avg, exchange_filled_size=qty,
-                    entry_price=avg if side == "BUY" else None,
-                    exit_price=avg if side == "SELL" else None,
-                    trade_id=f"kraken-reconstructed-{oid}",
-                )
-                # Stamp/persist through the normal account-scoped path.
-                self.record_trade(trade)
-                reconstructed += 1
-                time.sleep(0.12)
-            except Exception as exc:
-                errors.append(f"{oid}: {exc}")
-                if "rate limit" in str(exc).lower():
-                    time.sleep(1.5)
+        watch = {str(x).strip().upper() for x in str(self.state.settings.get("watchlist") or "").split(",") if str(x).strip()}
+        watch.add(str(self.state.settings.get("symbol") or "").upper())
+        known: dict[str, dict[str, Any]] = {}
+        existing_ids=set()
 
-        result = {"ok": not errors, "exchange": "kraken", "known_orders": len(known),
-                  "reconstructed": reconstructed, "errors": errors[:20], "_ts": time.time()}
-        self._kraken_trade_reconstruction = result
-        self.journal("", "RECONCILE", f"Kraken live trade reconstruction: {reconstructed}/{len(known)} orders rebuilt", None, result)
+        for tr in list(self.state.trades or []):
+            oid=str(getattr(tr,"exchange_order_id",None) or "").strip().upper()
+            if oid:
+                known.setdefault(oid,{"reason":getattr(tr,"reason",""),"symbol":getattr(tr,"symbol","")})
+                existing_ids.add(oid)
+        try:
+            for row in self.db.get_trades(limit=999999,user_id=self.user_id,account_id=self.account_id):
+                oid=str(row.get("exchange_order_id") or "").strip().upper()
+                if oid:
+                    known.setdefault(oid,{"reason":row.get("reason") or "","symbol":row.get("symbol") or ""})
+                    if "KRAKEN RECONSTRUCTED" in str(row.get("reason") or "").upper():
+                        existing_ids.add(oid)
+        except Exception as exc:
+            logger.warning("Kraken reconstruction DB scan warning: %s",exc)
+
+        candidates: dict[str,dict[str,Any]]={}
+        errors=[]
+
+        # Known order recovery.
+        for oid,old in list(known.items())[-100:]:
+            try:
+                raw=(kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}).get(oid)
+                if isinstance(raw,dict):
+                    candidates[oid]={"raw":raw,"old":old}
+                time.sleep(.12)
+            except Exception as exc:
+                errors.append(f"QueryOrders {oid}: {exc}")
+                if "rate limit" in str(exc).lower(): time.sleep(1.5)
+
+        # D9.9: discover fills even when restart erased the local order-id breadcrumb.
+        try:
+            hist=kraken_private("/0/private/TradesHistory",{"type":"all","trades":"true"}).get("result") or {}
+            fills=hist.get("trades") if isinstance(hist,dict) else {}
+            if isinstance(fills,dict):
+                grouped={}
+                for txid,f in fills.items():
+                    if not isinstance(f,dict): continue
+                    pair=str(f.get("pair") or "").upper().replace("/","")
+                    # Normalize Kraken pair names sufficiently for configured USDT pairs.
+                    p=pair.replace("XXBT","XBT").replace("XETH","ETH")
+                    base=p[:-len(quote)] if quote and p.endswith(quote) else ""
+                    base={"XBT":"BTC","XDG":"DOGE"}.get(base,base)
+                    if not base or (watch and base not in watch): continue
+                    oid=str(f.get("ordertxid") or "").strip().upper()
+                    if not oid: continue
+                    g=grouped.setdefault(oid,{"pair":pair,"symbol":base,"side":str(f.get("type") or "").upper(),
+                                             "qty":0.0,"cost":0.0,"fee":0.0,"time":0.0})
+                    q=float(f.get("vol") or 0); px=float(f.get("price") or 0)
+                    g["qty"]+=q; g["cost"]+=q*px; g["fee"]+=max(0.0,float(f.get("fee") or 0))
+                    g["time"]=max(g["time"],float(f.get("time") or 0))
+                for oid,g in grouped.items():
+                    if oid in candidates: continue
+                    # synthesize QueryOrders-compatible authoritative aggregate
+                    candidates[oid]={"old":{"reason":"Recovered from Kraken TradesHistory","symbol":g["symbol"]},
+                        "raw":{"status":"closed","vol_exec":g["qty"],"cost":g["cost"],"fee":g["fee"],
+                               "closetm":g["time"],"descr":{"type":g["side"].lower(),"pair":g["pair"]}}}
+        except Exception as exc:
+            errors.append(f"TradesHistory: {exc}")
+
+        reconstructed=0; discovered=0
+        for oid,item in candidates.items():
+            try:
+                raw=item["raw"]; old=item["old"]
+                status=str(raw.get("status") or "").lower()
+                qty=float(raw.get("vol_exec") or 0); cost=float(raw.get("cost") or 0)
+                fee=max(0.0,float(raw.get("fee") or 0))
+                if qty<=0 or cost<=0 or status not in {"closed","canceled","cancelled"}: continue
+                descr=raw.get("descr") if isinstance(raw.get("descr"),dict) else {}
+                side=str(descr.get("type") or "").upper()
+                if side not in {"BUY","SELL"}: continue
+                pair=str(descr.get("pair") or "").upper().replace("/","")
+                symbol=str(old.get("symbol") or "").upper()
+                if not symbol:
+                    p=pair.replace("XXBT","XBT").replace("XETH","ETH")
+                    symbol=p[:-len(quote)] if quote and p.endswith(quote) else p
+                    symbol={"XBT":"BTC","XDG":"DOGE"}.get(symbol,symbol)
+                if watch and symbol not in watch: continue
+                avg=cost/qty
+                reason=f"KRAKEN RECONSTRUCTED | {str(old.get('reason') or 'Kraken live fill')}"
+                trade=Trade(
+                    time=datetime.fromtimestamp(float(raw.get("closetm") or raw.get("opentm") or time.time()),tz=timezone.utc).isoformat(),
+                    side=side,symbol=symbol,price=avg,quantity=qty,
+                    cash_after=float(self.state.cash or 0.0),coin_after=0.0,reason=reason,fee_paid=fee,
+                    exchange_order_id=oid,exchange_order_status=str(raw.get("status") or "").upper(),
+                    exchange_average_filled_price=avg,exchange_filled_size=qty,
+                    entry_price=avg if side=="BUY" else None,exit_price=avg if side=="SELL" else None,
+                    trade_id=f"kraken-reconstructed-{oid}")
+                # Do not endlessly duplicate an already reconstructed authoritative row.
+                if oid not in existing_ids:
+                    self.record_trade(trade)
+                    existing_ids.add(oid); reconstructed+=1
+                # Keep recovered fills in memory too, so stats work immediately this run.
+                if not any(str(getattr(x,"exchange_order_id","") or "").upper()==oid and
+                           "KRAKEN RECONSTRUCTED" in str(getattr(x,"reason","") or "").upper()
+                           for x in self.state.trades):
+                    self.state.trades.append(trade)
+                if oid not in known: discovered+=1
+            except Exception as exc:
+                errors.append(f"persist {oid}: {exc}")
+
+        result={"ok":not errors,"exchange":"kraken","known_orders":len(known),
+                "candidate_orders":len(candidates),"discovered_from_history":discovered,
+                "reconstructed":reconstructed,"errors":errors[:20],"_ts":time.time()}
+        self._kraken_trade_reconstruction=result
+        self.journal("","RECONCILE",
+                     f"Kraken persistent trade recovery: {reconstructed} persisted, {discovered} discovered",
+                     None,result)
         self.save_state()
         return result
 
@@ -5264,7 +5308,7 @@ class PaperBot:
                 "kraken_balance": round(float(kraken_data.get("available_cash", 0.0)), 8) if kraken_data.get("ok") else None,
                 "balance_reconciled": bool(kraken_data.get("reconciled", False)) if self.live_exchange() == "kraken" else None,
                 "balance_reconciliation_error": kraken_data.get("error") if self.live_exchange() == "kraken" else None,
-                "kraken_trade_reconstruction": getattr(self, "_kraken_trade_reconstruction", None) if self.live_exchange() == "kraken" else None,
+                "kraken_trade_reconstruction": getattr(self, "_kraken_trade_reconstruction", {"status":"not_run_this_process"}) if self.live_exchange() == "kraken" else None,
                 "open_position_value": round(open_position_value, 2),
                 "realized_pnl": round(realized_pnl, 2),
                 "unrealized_pnl": round(unrealized_pnl, 2),
