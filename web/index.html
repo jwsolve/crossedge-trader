@@ -1235,6 +1235,26 @@
         .diag-home { margin:0 auto 14px; max-width:1440px; }
         @media(max-width:900px){ .control-grid{grid-template-columns:1fr 1fr}.d9-grid{grid-template-columns:1fr} }
         @media(max-width:560px){ .control-grid{grid-template-columns:1fr}.cap-row,.decision-row{grid-template-columns:1fr 1fr} }
+
+        /* ─── UX refinement: operational clarity ─── */
+        .now-status { margin:0 0 12px; padding:12px 14px; border:1px solid var(--line); border-radius:8px; background:var(--panel-hover); display:flex; gap:10px; align-items:flex-start; }
+        .now-status .now-dot { width:9px; height:9px; border-radius:50%; margin-top:5px; background:var(--muted); flex:0 0 auto; }
+        .now-status.running .now-dot { background:var(--good); }
+        .now-status.warning .now-dot { background:var(--warn); }
+        .now-status.error .now-dot { background:var(--bad); }
+        .now-status .now-main { font-weight:750; }
+        .now-status .now-sub { color:var(--muted); font-size:12px; margin-top:2px; }
+        body.live-trading-active .header { box-shadow: inset 0 -2px 0 var(--bad); }
+        .live-context { font-size:10px; font-weight:800; letter-spacing:.06em; border:1px solid var(--bad); color:var(--bad); border-radius:999px; padding:2px 6px; margin-left:6px; }
+        .position-badges { display:flex; gap:5px; align-items:center; flex-wrap:wrap; }
+        .position-badge { font-size:10px; font-weight:800; letter-spacing:.04em; border:1px solid var(--line); border-radius:999px; padding:2px 6px; }
+        .position-badge.long { color:var(--good); border-color:var(--good); }
+        .position-badge.short { color:var(--bad); border-color:var(--bad); }
+        .position-badge.live { color:var(--bad); border-color:var(--bad); }
+        .position-value { color:var(--muted); font-size:11px; font-weight:500; }
+        .decision-head { display:grid; grid-template-columns:1.2fr .7fr .7fr 1.6fr; gap:8px; padding:0 4px 6px; color:var(--muted); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--line); }
+        .activity-item { gap:14px; }
+        @media(max-width:560px){ .decision-head{display:none} .now-status{padding:10px} }
     </style>
 </head>
 <body>
@@ -1290,6 +1310,7 @@
             <!-- Trading Control Centre -->
             <section class="control-centre" id="tradingControlCentre">
                 <div class="control-head"><h2>Trading Control Centre</h2><span class="mode-badge paper" id="d9ModeBadge">PAPER</span></div>
+                <div class="now-status" id="auxoNowStatus"><span class="now-dot"></span><div><div class="now-main" id="auxoNowMain">Checking bot status…</div><div class="now-sub" id="auxoNowSub">Waiting for the latest trading state.</div></div></div>
                 <div class="control-grid">
                     <div class="control-tile"><div class="k">Equity</div><div class="v" id="d9Equity">—</div></div>
                     <div class="control-tile"><div class="k">Available</div><div class="v" id="d9Available">—</div></div>
@@ -1307,7 +1328,7 @@
                 <section class="d9-panel"><h2>Market Readiness</h2><div id="d9CapabilityMatrix"><span class="muted-text">Waiting for pair capability data…</span></div></section>
                 <section class="d9-panel"><h2>Safety Centre</h2><div class="safety-list" id="d9SafetyCentre"></div></section>
             </div>
-            <section class="d9-panel" style="margin-bottom:14px"><h2>Why isn't Auxo trading?</h2><div id="d9DecisionFeed"><span class="muted-text">Waiting for scanner decisions…</span></div></section>
+            <section class="d9-panel" style="margin-bottom:14px"><h2>Why isn't Auxo trading?</h2><div class="decision-head"><span>Pair</span><span>Direction</span><span>Score</span><span>Decision</span></div><div id="d9DecisionFeed"><span class="muted-text">Waiting for scanner decisions…</span></div></section>
 
             <!-- Metrics -->
             <div class="metrics">
@@ -1421,7 +1442,7 @@
 
             <!-- Recent Activity -->
             <section class="recent-section">
-                <h2>🕒 Recent Activity</h2>
+                <h2>Event Feed</h2>
                 <div id="recentActivity">
                     <div class="activity-item"><span class="muted">No recent activity.</span></div>
                 </div>
@@ -1449,7 +1470,7 @@
 
             <div class="settings-section">
                 <div class="search-box">
-                    <input id="settingsSearch" placeholder="Search settings…" />
+                    <input id="settingsSearch" placeholder="Search advanced settings…" />
                 </div>
 
                 <!-- ─── STRATEGY PRESETS ─── -->
@@ -2503,6 +2524,16 @@ Live test actions can place or close real Kraken margin orders when live trading
             const s=data.settings||{}, quote=s.quote_currency||s.kraken_margin_quote_currency||'GBP';
             const live=!!s.live_trading_enabled, exchange=String(s.active_exchange||s.exchange||'').toUpperCase();
             const mode=document.getElementById('d9ModeBadge'); if(mode){mode.textContent=live?'● LIVE TRADING':'PAPER TRADING';mode.className='mode-badge '+(live?'live':'paper');}
+            document.body.classList.toggle('live-trading-active', live);
+            const now=document.getElementById('auxoNowStatus'), nowMain=document.getElementById('auxoNowMain'), nowSub=document.getElementById('auxoNowSub');
+            const positions=(data.positions||[]), scans=(data.scan_rows||[]);
+            let nowText='Ready', nowDetail='', nowClass='';
+            if(data.last_error){ nowText='Attention required'; nowDetail=String(data.last_error); nowClass='error'; }
+            else if(!data.running){ nowText=live?'Live trading is stopped':'Paper trading is stopped'; nowDetail='Start Auxo when you are ready to scan for new opportunities.'; }
+            else if(positions.length){ nowText=`Managing ${positions.length} open position${positions.length===1?'':'s'}`; nowDetail=data.last_signal||'Stops, targets and exit conditions are being monitored.'; nowClass='running'; }
+            else if(scans.length){ nowText=`Scanning ${scans.length} market${scans.length===1?'':'s'}`; nowDetail=data.last_signal||'Waiting for a qualifying entry setup.'; nowClass='running'; }
+            else { nowText='Running — waiting for market data'; nowDetail=data.last_signal||'Auxo is active and waiting for the next scan.'; nowClass='warning'; }
+            if(now){now.className='now-status '+nowClass;} if(nowMain)nowMain.textContent=nowText; if(nowSub)nowSub.textContent=nowDetail;
             const set=(id,val)=>{const e=document.getElementById(id);if(e)e.textContent=val;};
             set('d9Equity',d9Money(data.equity,quote)); set('d9Available',d9Money(data.cash,quote)); set('d9DayPnl',d9Money(data.day_pnl,quote));
             set('d9OpenTrades',String((data.positions||[]).length));
@@ -3938,6 +3969,8 @@ Live test actions can place or close real Kraken margin orders when live trading
                 const isShort = row.is_short || false;
                 const sideText = isShort ? 'SHORT' : 'LONG';
                 const sideClass = isShort ? 'bad' : 'good';
+                const isLive = !!(lastStatusData && lastStatusData.settings && lastStatusData.settings.live_trading_enabled);
+                const positionValue = current ? Math.abs(Number(qty||0) * Number(current||0)) : null;
 
                 let stopDisplay = '—';
                 let stopClass = '';
@@ -3991,10 +4024,9 @@ Live test actions can place or close real Kraken margin orders when live trading
 
                 return `<div class="trade-card">
                     <div class="header">
-                        <span><strong>${sym}</strong> <span class="muted" style="font-weight:400;font-size:12px;">${Number(qty).toFixed(4)}</span></span>
-                        <span class="pl ${cls}">${pnl !== null && pnl !== undefined ? money(pnl) : '-'}${pnlPct !== undefined && pnlPct !== null ? ` (${Number(pnlPct).toFixed(2)}%)` : ''}</span>
+                        <span><strong>${sym}</strong><div class="position-badges"><span class="position-badge ${isShort?'short':'long'}">${sideText}</span>${isLive?'<span class="position-badge live">LIVE</span>':''}<span class="position-value">${Number(qty).toFixed(4)}${positionValue!==null?' · '+money(positionValue):''}</span></div></span>
+                        <span class="pl ${cls}"><span style="display:block;font-size:9px;color:var(--muted);text-transform:uppercase">Unrealised P/L</span>${pnl !== null && pnl !== undefined ? money(pnl) : '-'}${pnlPct !== undefined && pnlPct !== null ? ` (${Number(pnlPct).toFixed(2)}%)` : ''}</span>
                     </div>
-                    <div class="detail"><span class="label">Side</span><span class="${sideClass}">${sideText}</span></div>
                     <div class="detail"><span class="label">Entry</span><span>${entry ? tradePriceText(entry, sym) : '-'}</span></div>
                     <div class="detail"><span class="label">Current</span><span><strong>${current ? tradePriceText(current, sym) : '-'}</strong></span></div>
                     <div class="detail"><span class="label">Stop Loss</span><span class="${stopClass}">${stopDisplay}</span></div>
@@ -4020,8 +4052,8 @@ Live test actions can place or close real Kraken margin orders when live trading
                     </div>
                     ` : ''}
                     <div class="actions">
-                        <button data-symbol="${sym}" data-mode="profit_only">Take Profit</button>
-                        <button class="danger" data-symbol="${sym}" data-mode="force">Force Close</button>
+                        <button data-symbol="${sym}" data-mode="profit_only">Close If In Profit</button>
+                        <button class="danger" data-symbol="${sym}" data-mode="force">Close Position</button>
                     </div>
                 </div>`;
             }).join('');
@@ -4033,7 +4065,7 @@ Live test actions can place or close real Kraken margin orders when live trading
                 .map(t => ({ time: t.time, text: `${t.side} ${num(t.quantity)} at ${priceText(t.price, t.symbol)}` }))
             ];
             all.sort((a, b) => new Date(b.time) - new Date(a.time));
-            const recent = all.slice(0, 5);
+            const recent = all.slice(0, 10);
             if (!recent.length) {
                 els.recentActivity.innerHTML = '<div class="activity-item"><span class="muted">No recent activity.</span></div>';
                 return;
