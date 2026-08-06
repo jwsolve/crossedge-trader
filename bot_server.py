@@ -2866,6 +2866,9 @@ class PaperBot:
                 reconciled = self.sync_kraken_live_balance_on_start()
                 if not reconciled:
                     raise RuntimeError("Kraken live start requires a successful balance reconciliation")
+                repair = self.reconstruct_kraken_live_trades()
+                if repair.get("errors"):
+                    logger.warning("Kraken trade reconstruction completed with warnings: %s", repair.get("errors"))
         except Exception as exc:
             with self.lock:
                 self.state.last_error = f"Start blocked: {exc}"
@@ -4706,9 +4709,96 @@ class PaperBot:
     # ─── Snapshot ────────────────────────────────────────────────────
 
     def performance_scope_label(self) -> str:
-        exchange = str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+        exchange = str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
         mode = "live" if bool(self.state.settings.get("live_trading_enabled", False)) else "paper"
         return f"{exchange}_{mode}_account_only_net_fees"
+
+    def reconstruct_kraken_live_trades(self) -> dict[str, Any]:
+        """Repair Auxo's persisted Kraken LIVE fills from Kraken QueryOrders.
+
+        Only order IDs already known to Auxo are queried, so unrelated manual Kraken
+        account activity is never imported. Recovered rows use a deterministic
+        trade_id and can safely be rebuilt on every startup. The original corrupted
+        row may remain for audit purposes; performance stats deduplicate by Kraken
+        exchange_order_id and prefer the reconstructed row.
+        """
+        if self.live_exchange() != "kraken" or not bool(self.state.settings.get("live_trading_enabled")):
+            return {"ok": True, "exchange": "kraken", "skipped": "not live Kraken", "reconstructed": 0}
+
+        known: dict[str, dict[str, Any]] = {}
+        # State trades include the live order IDs even when the old DB row was bad.
+        for tr in list(self.state.trades or []):
+            oid = str(getattr(tr, "exchange_order_id", None) or "").strip().upper()
+            if oid:
+                known.setdefault(oid, {"reason": getattr(tr, "reason", ""), "symbol": getattr(tr, "symbol", "")})
+        try:
+            for row in self.db.get_trades(limit=999999, user_id=self.user_id, account_id=self.account_id):
+                oid = str(row.get("exchange_order_id") or "").strip().upper()
+                if oid:
+                    known.setdefault(oid, {"reason": row.get("reason") or "", "symbol": row.get("symbol") or ""})
+        except Exception as exc:
+            logger.warning("Kraken reconstruction DB scan failed; continuing from state trades: %s", exc)
+
+        if not known:
+            return {"ok": True, "exchange": "kraken", "known_orders": 0, "reconstructed": 0}
+
+        quote = str(self.state.settings.get("quote_currency") or "USDT").upper()
+        reconstructed = 0
+        errors = []
+        # Query individually and pause very briefly: startup repair is correctness-first
+        # and must remain gentle with Kraken's private API rate limits.
+        for oid, old in list(known.items())[-100:]:
+            try:
+                raw = (kraken_private("/0/private/QueryOrders", {"txid": oid, "trades": "true"}).get("result") or {}).get(oid)
+                if not isinstance(raw, dict):
+                    errors.append(f"{oid}: not found")
+                    continue
+                status = str(raw.get("status") or "").lower()
+                qty = float(raw.get("vol_exec") or 0.0)
+                cost = float(raw.get("cost") or 0.0)
+                fee = max(0.0, float(raw.get("fee") or 0.0))
+                if qty <= 0 or cost <= 0 or status not in {"closed", "canceled", "cancelled"}:
+                    continue
+                avg = cost / qty
+                descr = raw.get("descr") if isinstance(raw.get("descr"), dict) else {}
+                side = str(descr.get("type") or "").upper()
+                if side not in {"BUY", "SELL"}:
+                    continue
+                pair = str(descr.get("pair") or "").upper().replace("/", "")
+                symbol = str(old.get("symbol") or "").upper()
+                if not symbol:
+                    # Prefer configured quote removal; handle Kraken XBT naming.
+                    symbol = pair[:-len(quote)] if quote and pair.endswith(quote) else pair
+                    if symbol == "XBT": symbol = "BTC"
+                    if symbol == "XDG": symbol = "DOGE"
+                reason = str(old.get("reason") or "Kraken live fill")
+                recovered_reason = f"KRAKEN RECONSTRUCTED | {reason}"
+                trade = Trade(
+                    time=datetime.fromtimestamp(float(raw.get("closetm") or raw.get("opentm") or time.time()), tz=timezone.utc).isoformat(),
+                    side=side, symbol=symbol, price=avg, quantity=qty,
+                    cash_after=float(self.state.cash or 0.0), coin_after=0.0,
+                    reason=recovered_reason, fee_paid=fee,
+                    exchange_order_id=oid, exchange_order_status=str(raw.get("status") or "").upper(),
+                    exchange_average_filled_price=avg, exchange_filled_size=qty,
+                    entry_price=avg if side == "BUY" else None,
+                    exit_price=avg if side == "SELL" else None,
+                    trade_id=f"kraken-reconstructed-{oid}",
+                )
+                # Stamp/persist through the normal account-scoped path.
+                self.record_trade(trade)
+                reconstructed += 1
+                time.sleep(0.12)
+            except Exception as exc:
+                errors.append(f"{oid}: {exc}")
+                if "rate limit" in str(exc).lower():
+                    time.sleep(1.5)
+
+        result = {"ok": not errors, "exchange": "kraken", "known_orders": len(known),
+                  "reconstructed": reconstructed, "errors": errors[:20], "_ts": time.time()}
+        self._kraken_trade_reconstruction = result
+        self.journal("", "RECONCILE", f"Kraken live trade reconstruction: {reconstructed}/{len(known)} orders rebuilt", None, result)
+        self.save_state()
+        return result
 
     def live_trade_performance_stats(self) -> dict[str, Any]:
         """Return completed account-scoped trade performance from trades.db, net of fees.
@@ -4731,13 +4821,29 @@ class PaperBot:
                 "net_realised_pnl": 0.0, "total_fees": 0.0,
             }
 
+        # Kraken recovery can coexist with an older corrupted audit row. Collapse
+        # duplicate exchange order IDs and prefer the authoritative reconstructed row.
+        if self.live_exchange() == "kraken":
+            by_order: dict[str, dict[str, Any]] = {}
+            without_order: list[dict[str, Any]] = []
+            for row in rows:
+                oid = str(row.get("exchange_order_id") or "").strip().upper()
+                if not oid:
+                    without_order.append(row); continue
+                current = by_order.get(oid)
+                recovered = "KRAKEN RECONSTRUCTED" in str(row.get("reason") or "").upper()
+                current_recovered = bool(current and "KRAKEN RECONSTRUCTED" in str(current.get("reason") or "").upper())
+                if current is None or (recovered and not current_recovered):
+                    by_order[oid] = row
+            rows = without_order + list(by_order.values())
+
         # get_trades may return newest-first. FIFO matching requires chronological order.
         rows = sorted(rows, key=lambda r: str(r.get("created_at") or r.get("time") or ""))
         open_lots: dict[str, list[dict[str, float]]] = {}
         closed: list[dict[str, float]] = []
 
         for row in rows:
-            active_exchange = str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+            active_exchange = str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
             is_live = bool(self.state.settings.get("live_trading_enabled", False))
             if is_live and not row.get("exchange_order_id"):
                 continue
@@ -5050,6 +5156,7 @@ class PaperBot:
                 "kraken_balance": round(float(kraken_data.get("available_cash", 0.0)), 8) if kraken_data.get("ok") else None,
                 "balance_reconciled": bool(kraken_data.get("reconciled", False)) if self.live_exchange() == "kraken" else None,
                 "balance_reconciliation_error": kraken_data.get("error") if self.live_exchange() == "kraken" else None,
+                "kraken_trade_reconstruction": getattr(self, "_kraken_trade_reconstruction", None) if self.live_exchange() == "kraken" else None,
                 "open_position_value": round(open_position_value, 2),
                 "realized_pnl": round(realized_pnl, 2),
                 "unrealized_pnl": round(unrealized_pnl, 2),
