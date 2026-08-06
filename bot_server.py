@@ -2751,13 +2751,71 @@ class PaperBot:
         ):
             return False
 
-        # Never flatten/overwrite local accounting while Auxo believes it owns exposure.
-        if local_positions or abs(current_coin) > 1e-12 or active_symbol or owned_margin:
+        # D9.5: persisted strategy state can outlive the real Kraken position.  Do not
+        # let a stale local LINK/ADA position permanently block startup after Kraken
+        # has already filled the closing order.  Verify Kraken first, then discard
+        # local exposure only when the exchange proves it is gone.
+        open_owned = {
+            oid: rec for oid, rec in owned_margin.items()
+            if str(rec.get("status") or "open").lower() in {"open", "pending", "adopted"}
+        }
+        local_shorts = {
+            sym: p for sym, p in local_positions.items() if bool(p.get("is_short"))
+        }
+        local_longs = {
+            sym: p for sym, p in local_positions.items() if not bool(p.get("is_short"))
+        }
+
+        if local_shorts or open_owned:
+            margin = self.reconcile_kraken_margin(force=True)
+            if not margin.get("healthy"):
+                detail = margin.get("error") or "; ".join(margin.get("mismatches") or []) or margin.get("status") or "unknown margin reconciliation failure"
+                raise RuntimeError(f"Kraken margin reconciliation failed: {detail}")
+            # A healthy reconciliation with local short ownership means the exposure
+            # is real.  Startup must preserve it rather than flattening accounting.
+            if margin.get("owned_positions"):
+                with self.lock:
+                    self._kraken_spot_balance_snapshot = {
+                        "ok": False, "reconciled": False,
+                        "error": "Kraken margin exposure is still open; flat cash reconciliation is not applicable",
+                        "_ts": time.time(),
+                    }
+                    self.state.last_signal = "Kraken startup preserving verified open margin exposure"
+                    self.save_state()
+                return True
+
+        # Verify every persisted spot long against Kraken.  Zero exchange balance
+        # means the local position is stale (for example after a fully-filled TP).
+        # A genuine remaining holding is preserved and prevents a flat-account reset.
+        genuine_spot = []
+        for sym, pos in local_longs.items():
+            exchange_qty = float(kraken_available_balance(str(sym).upper()))
+            if exchange_qty > 1e-10:
+                genuine_spot.append((str(sym).upper(), exchange_qty))
+
+        if genuine_spot:
+            detail = ", ".join(f"{sym}={qty:.12g}" for sym, qty in genuine_spot)
+            raise RuntimeError(f"Kraken spot exposure still exists ({detail}); refusing flat cash reconciliation")
+
+        if local_positions or abs(current_coin) > 1e-12 or active_symbol or open_owned:
             with self.lock:
-                self.state.last_signal = "Kraken startup balance sync skipped: local/open exposure exists"
-                self.journal(active_symbol or "", "INFO", self.state.last_signal, self.state.last_price)
+                stale_symbols = sorted(str(x).upper() for x in local_positions)
+                self.state.positions = {}
+                self.state.coin = 0.0
+                self.state.active_symbol = None
+                self.state.entry_price = None
+                self.state.highest_price = None
+                self.state.stop_price = None
+                self.state.target_price = None
+                self.state.is_short = False
+                # Closed/adopted history remains in kraken_margin_owned; only records
+                # that still claim to be open were relevant to the startup gate.
+                self.state.last_signal = (
+                    "Kraken startup cleared stale local exposure after exchange verification"
+                    + (f": {', '.join(stale_symbols)}" if stale_symbols else "")
+                )
+                self.journal(active_symbol or "", "RECONCILE", self.state.last_signal, self.state.last_price)
                 self.save_state()
-            return False
 
         quote = str(settings.get("quote_currency") or "USDT").upper()
         actual_cash = float(kraken_available_balance(quote))
