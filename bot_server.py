@@ -2731,7 +2731,7 @@ class PaperBot:
             active_symbol = self.state.active_symbol
             owned_margin = dict(getattr(self.state, "kraken_margin_owned", {}) or {})
 
-        exchange = str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
+        exchange = str(settings.get("exchange") or settings.get("active_exchange") or "").lower()
         if not (
             bool(settings.get("live_trading_enabled"))
             and settings.get("asset_class", "crypto") == "crypto"
@@ -2755,10 +2755,9 @@ class PaperBot:
         with self.lock:
             previous_cash = float(self.state.cash or 0.0)
             self.state.cash = actual_cash
-            # Flat account: equity is cash. realised_pnl is derived from the
-            # configured session baseline, not from the previously corrupted cash.
-            self.state.realized_pnl = actual_cash - float(self.state.starting_cash or 0.0)
-            self.state.unrealized_pnl = 0.0
+            # Do not persist a synthetic realised P/L adjustment here. Snapshot P/L
+            # is derived from authoritative exchange equity versus the configured
+            # starting_cash baseline. The old corrupted local cash is discarded.
             self.state.coin = 0.0
             self.state.active_symbol = None
             self.state.last_error = None
@@ -2770,8 +2769,18 @@ class PaperBot:
                 "exchange": "kraken", "quote": quote,
                 "previous_local_cash": previous_cash,
                 "exchange_cash": actual_cash,
-                "starting_cash": float(self.state.starting_cash or 0.0),
+                "starting_cash": float(settings.get("starting_cash", 0.0) or 0.0),
             })
+            self._kraken_spot_balance_snapshot = {
+                "ok": True,
+                "quote_currency": quote,
+                "available_cash": actual_cash,
+                "equity": actual_cash,
+                "reconciled": True,
+                "error": None,
+                "time": now_iso(),
+                "_ts": time.time(),
+            }
             self.save_state()
         logger.warning(
             "Kraken startup reconciliation re-anchored local %s cash from %.8f to %.8f",
@@ -4825,6 +4834,7 @@ class PaperBot:
             unrealized_pnl = 0.0
             oanda_positions = []
             coinbase_data = {}
+            kraken_data = {}
 
             if self.should_oanda_demo_trade():
                 try:
@@ -4877,6 +4887,11 @@ class PaperBot:
                     and self.state.settings.get("exchange") == "coinbase"
                     and coinbase_live_is_armed()
                 )
+                is_live_kraken = (
+                    bool(self.state.settings.get("live_trading_enabled"))
+                    and self.state.settings.get("asset_class", "crypto") == "crypto"
+                    and self.live_exchange() == "kraken"
+                )
                 if is_live_coinbase:
                     # Use the most recently reconciled exchange snapshot.  Refresh
                     # if one is not available yet.  This prevents stale/missing local
@@ -4894,6 +4909,19 @@ class PaperBot:
                         self.state.cash = cash
                         equity = float(coinbase_data.get("equity", cash))
                     else:
+                        equity = self._calculate_equity_local(price)
+                elif is_live_kraken:
+                    # Kraken startup reconciliation is authoritative for a flat live
+                    # account. Never let stale persisted local cash drive status/P&L.
+                    kraken_data = getattr(self, "_kraken_spot_balance_snapshot", {}) or {}
+                    if kraken_data.get("ok"):
+                        cash = float(kraken_data.get("available_cash", self.state.cash))
+                        self.state.cash = cash
+                        equity = float(kraken_data.get("equity", cash))
+                    else:
+                        # If startup reconciliation was not available, expose the
+                        # failure rather than silently presenting corrupt local cash.
+                        cash = float(self.state.cash)
                         equity = self._calculate_equity_local(price)
                 else:
                     equity = self._calculate_equity_local(price)
@@ -4947,6 +4975,9 @@ class PaperBot:
                 "settings": self.state.settings,
                 "starting_cash": round(starting_cash, 2),
                 "cash": round(cash, 2),
+                "kraken_balance": round(float(kraken_data.get("available_cash", 0.0)), 8) if kraken_data.get("ok") else None,
+                "balance_reconciled": bool(kraken_data.get("reconciled", False)) if self.live_exchange() == "kraken" else None,
+                "balance_reconciliation_error": kraken_data.get("error") if self.live_exchange() == "kraken" else None,
                 "open_position_value": round(open_position_value, 2),
                 "realized_pnl": round(realized_pnl, 2),
                 "unrealized_pnl": round(unrealized_pnl, 2),
@@ -7238,7 +7269,9 @@ class PaperBot:
         }
 
     def live_exchange(self) -> str:
-        return str(self.state.settings.get("active_exchange") or self.state.settings.get("exchange") or "coinbase").lower()
+        # `exchange` is the user's selected trading venue. `active_exchange` is a
+        # legacy/UI field whose default is Coinbase and can otherwise mask Kraken.
+        return str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
 
     def live_available_balance(self,currency:str)->float:
         return kraken_available_balance(currency) if self.live_exchange()=="kraken" else coinbase_available_balance(currency)
