@@ -5244,18 +5244,63 @@ class PaperBot:
                     else:
                         equity = self._calculate_equity_local(price)
                 elif is_live_kraken:
-                    # Kraken startup reconciliation is authoritative for a flat live
-                    # account. Never let stale persisted local cash drive status/P&L.
+                    # D10.2: Kraken margin accounting is NOT spot accounting.
+                    # A short's notional is exposure/collateral, not an asset liability
+                    # to subtract from the quote balance. Use Kraken TradeBalance.e
+                    # (exchange equity) whenever verified margin exposure is open.
                     kraken_data = getattr(self, "_kraken_spot_balance_snapshot", {}) or {}
-                    if kraken_data.get("ok"):
-                        cash = float(kraken_data.get("available_cash", self.state.cash))
-                        self.state.cash = cash
+                    cash = float(
+                        kraken_data.get("available_cash", self.state.cash)
+                        if kraken_data.get("ok") else self.state.cash
+                    )
+                    self.state.cash = cash
+
+                    margin_snapshot = {}
+                    has_margin_short = any(
+                        bool(p.get("is_short")) for p in (self.state.positions or {}).values()
+                    ) or any(
+                        str(rec.get("status") or "").lower() in {"open","pending","adopted"}
+                        for rec in (getattr(self.state, "kraken_margin_owned", {}) or {}).values()
+                    )
+                    if has_margin_short:
+                        try:
+                            margin_snapshot = self.reconcile_kraken_margin(force=False) or {}
+                        except Exception as exc:
+                            logger.warning("Kraken margin equity snapshot failed: %s", exc)
+                            margin_snapshot = {}
+                        tb = margin_snapshot.get("trade_balance") or {}
+                        exchange_equity = tb.get("e")
+                        if margin_snapshot.get("healthy") and exchange_equity is not None:
+                            equity = float(exchange_equity)
+                            kraken_data = {
+                                **kraken_data,
+                                "ok": True,
+                                "reconciled": True,
+                                "available_cash": cash,
+                                "equity": equity,
+                                "margin_equity": equity,
+                                "margin_free": float(tb.get("mf") or 0.0),
+                                "margin_used": float(tb.get("m") or 0.0),
+                                "margin_unrealized_pnl": float(tb.get("n") or 0.0),
+                                "open_exposure_quote": float(margin_snapshot.get("open_exposure_quote") or 0.0),
+                                "valuation_mode": "kraken_trade_balance",
+                                "error": None,
+                            }
+                        else:
+                            # Fail visibly but never subtract short notional from cash.
+                            equity = cash
+                            kraken_data = {
+                                **kraken_data,
+                                "available_cash": cash,
+                                "equity": equity,
+                                "valuation_mode": "cash_fallback_margin_reconciliation_unavailable",
+                                "error": margin_snapshot.get("error") or "Kraken margin equity unavailable",
+                            }
+                    elif kraken_data.get("ok"):
                         equity = float(kraken_data.get("equity", cash))
                     else:
-                        # If startup reconciliation was not available, expose the
-                        # failure rather than silently presenting corrupt local cash.
-                        cash = float(self.state.cash)
-                        equity = self._calculate_equity_local(price)
+                        # Flat live Kraken account: cash is the conservative fallback.
+                        equity = cash
                 else:
                     equity = self._calculate_equity_local(price)
                 total_pnl = equity - float(self.state.settings.get("starting_cash", 0))
@@ -5263,10 +5308,24 @@ class PaperBot:
             # Account accounting: starting_cash is the fixed baseline; cash is the
             # current available balance; equity includes open positions.
             starting_cash = float(self.state.settings.get("starting_cash", 0.0))
-            open_position_value = equity - cash
+            if (
+                self.live_exchange() == "kraken"
+                and bool(self.state.settings.get("live_trading_enabled"))
+                and kraken_data.get("valuation_mode") == "kraken_trade_balance"
+            ):
+                open_position_value = float(kraken_data.get("open_exposure_quote") or 0.0)
+            else:
+                open_position_value = equity - cash
             if self.should_oanda_demo_trade() and oanda_data.get("ok"):
                 # OANDA supplies its own unrealised P/L.
                 unrealized_pnl = float(oanda_data.get("unrealized_pnl", unrealized_pnl) or 0.0)
+            elif (
+                self.live_exchange() == "kraken"
+                and bool(self.state.settings.get("live_trading_enabled"))
+                and kraken_data.get("valuation_mode") == "kraken_trade_balance"
+            ):
+                # Kraken TradeBalance.n already has the correct sign for LONG/SHORT.
+                unrealized_pnl = float(kraken_data.get("margin_unrealized_pnl") or 0.0)
             else:
                 unrealized_pnl = 0.0
                 live_holding_qty = {
@@ -5309,6 +5368,10 @@ class PaperBot:
                 "starting_cash": round(starting_cash, 2),
                 "cash": round(cash, 2),
                 "kraken_balance": round(float(kraken_data.get("available_cash", 0.0)), 8) if kraken_data.get("ok") else None,
+                "kraken_equity": round(float(kraken_data.get("equity", 0.0)), 8) if kraken_data.get("ok") else None,
+                "kraken_margin_used": round(float(kraken_data.get("margin_used", 0.0)), 8) if kraken_data.get("valuation_mode") == "kraken_trade_balance" else None,
+                "kraken_margin_free": round(float(kraken_data.get("margin_free", 0.0)), 8) if kraken_data.get("valuation_mode") == "kraken_trade_balance" else None,
+                "kraken_valuation_mode": kraken_data.get("valuation_mode", "spot_cash") if self.live_exchange() == "kraken" else None,
                 "balance_reconciled": bool(kraken_data.get("reconciled", False)) if self.live_exchange() == "kraken" else None,
                 "balance_reconciliation_error": kraken_data.get("error") if self.live_exchange() == "kraken" else None,
                 "kraken_trade_reconstruction": getattr(self, "_kraken_trade_reconstruction", {"status":"not_run_this_process"}) if self.live_exchange() == "kraken" else None,

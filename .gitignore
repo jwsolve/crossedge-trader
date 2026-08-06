@@ -14,3 +14,11 @@ auxo.log
 trades.db
 
 cdp_api_key.json
+
+trades .db
+
+auth/password.py
+
+auth/
+
+auth_setup.py
