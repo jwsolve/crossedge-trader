@@ -2777,12 +2777,34 @@ class PaperBot:
             # A healthy reconciliation with local short ownership means the exposure
             # is real.  Startup must preserve it rather than flattening accounting.
             if margin.get("owned_positions"):
+                # D10.4: a verified open margin position IS a successful startup
+                # reconciliation. Populate the same authoritative snapshot consumed
+                # by /api/status instead of marking it unreconciled.
+                tb = margin.get("trade_balance") or {}
+                exchange_equity = tb.get("e")
+                if exchange_equity is None:
+                    raise RuntimeError("Kraken margin reconciliation returned no TradeBalance equity")
+                quote = str(settings.get("quote_currency") or "USDT").upper()
+                actual_cash = float(kraken_available_balance(quote))
                 with self.lock:
+                    self.state.cash = actual_cash
                     self._kraken_spot_balance_snapshot = {
-                        "ok": False, "reconciled": False,
-                        "error": "Kraken margin exposure is still open; flat cash reconciliation is not applicable",
+                        "ok": True,
+                        "reconciled": True,
+                        "quote_currency": quote,
+                        "available_cash": actual_cash,
+                        "equity": float(exchange_equity),
+                        "margin_equity": float(exchange_equity),
+                        "margin_free": float(tb.get("mf") or 0.0),
+                        "margin_used": float(tb.get("m") or 0.0),
+                        "margin_unrealized_pnl": float(tb.get("n") or 0.0),
+                        "open_exposure_quote": float(margin.get("open_exposure_quote") or 0.0),
+                        "valuation_mode": "kraken_trade_balance",
+                        "error": None,
+                        "time": now_iso(),
                         "_ts": time.time(),
                     }
+                    self.state.last_error = None
                     self.state.last_signal = "Kraken startup preserving verified open margin exposure"
                     self.save_state()
                 return True
@@ -2866,12 +2888,14 @@ class PaperBot:
             if self.should_sync_live_balance_on_start():
                 self.sync_live_balance_from_coinbase()
             elif self.live_exchange() == "kraken" and bool(self.state.settings.get("live_trading_enabled")):
-                reconciled = self.sync_kraken_live_balance_on_start()
-                if not reconciled:
-                    raise RuntimeError("Kraken live start requires a successful balance reconciliation")
+                # D10.4: recover authoritative Kraken fills/order context first.
+                # Reconciliation then validates the reconstructed/adopted exposure.
                 repair = self.reconstruct_kraken_live_trades()
                 if repair.get("errors"):
                     logger.warning("Kraken trade reconstruction completed with warnings: %s", repair.get("errors"))
+                reconciled = self.sync_kraken_live_balance_on_start()
+                if not reconciled:
+                    raise RuntimeError("Kraken live start requires a successful balance reconciliation")
 
                 # D9.7: reconciliation can legitimately replace stale/corrupt local
                 # accounting with Kraken's real balance. Risk baselines must be
@@ -2879,9 +2903,12 @@ class PaperBot:
                 # the corrupt ~42k equity incident) makes a real ~43 USDT account
                 # appear to have suffered ~99.9% drawdown and immediately STOPs.
                 with self.lock:
-                    reconciled_equity = float(self.state.cash or 0.0)
-                    if self.state.positions:
-                        # equity() values any genuine reconstructed spot exposure too.
+                    snapshot = getattr(self, "_kraken_spot_balance_snapshot", {}) or {}
+                    reconciled_equity = float(
+                        snapshot.get("equity", self.state.cash or 0.0)
+                        if snapshot.get("reconciled") else (self.state.cash or 0.0)
+                    )
+                    if self.state.positions and not snapshot.get("reconciled"):
                         try:
                             reconciled_equity = float(self.equity(self.state.last_price))
                         except Exception:
@@ -4734,6 +4761,28 @@ class PaperBot:
 
     # ─── Snapshot ────────────────────────────────────────────────────
 
+    def _public_safe(self, value: Any) -> Any:
+        """Recursively redact secrets before returning state through public APIs."""
+        secret_fragments = (
+            "token", "secret", "password", "passwd", "api_key", "apikey",
+            "private_key", "access_key", "client_secret", "telegram_chat_id",
+        )
+        if isinstance(value, dict):
+            clean = {}
+            for key, item in value.items():
+                k = str(key)
+                lk = k.lower()
+                if any(fragment in lk for fragment in secret_fragments):
+                    clean[k] = "[REDACTED]" if item not in (None, "", False) else item
+                else:
+                    clean[k] = self._public_safe(item)
+            return clean
+        if isinstance(value, list):
+            return [self._public_safe(x) for x in value]
+        if isinstance(value, tuple):
+            return [self._public_safe(x) for x in value]
+        return value
+
     def performance_scope_label(self) -> str:
         exchange = str(self.state.settings.get("exchange") or self.state.settings.get("active_exchange") or "coinbase").lower()
         mode = "live" if bool(self.state.settings.get("live_trading_enabled", False)) else "paper"
@@ -5364,7 +5413,7 @@ class PaperBot:
             return {
                 "running": self.state.running,
                 "live_trade_stats": live_trade_stats,
-                "settings": self.state.settings,
+                "settings": self._public_safe(dict(self.state.settings)),
                 "starting_cash": round(starting_cash, 2),
                 "cash": round(cash, 2),
                 "kraken_balance": round(float(kraken_data.get("available_cash", 0.0)), 8) if kraken_data.get("ok") else None,
