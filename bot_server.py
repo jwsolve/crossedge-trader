@@ -7276,11 +7276,31 @@ class PaperBot:
                                   "source":"kraken_margin_owned","order_id":oid})
             result["ignored_dust"]=[]
             dust_limit=max(0.0,float(self.state.settings.get("kraken_margin_dust_quote",0.10)))
+
+            # Kraken uses exchange-native asset codes in margin positions (most
+            # notably XBT for BTC and XDG for DOGE). Strategy state deliberately
+            # uses user-facing symbols (BTC/DOGE). Never compare them by substring.
+            def _kraken_canonical_pair(raw_pair: str) -> tuple[str, str]:
+                p=str(raw_pair or "").upper().replace("/","").replace("-","").replace("_","")
+                # Strip Kraken's legacy asset prefixes where applicable.
+                p=p.replace("XXBT","XBT").replace("XXDG","XDG")
+                quote_candidates=("USDT","USDC","GBP","USD","EUR","BTC","XBT")
+                q=next((x for x in quote_candidates if p.endswith(x)), "")
+                b=p[:-len(q)] if q else p
+                aliases={"XBT":"BTC","XXBT":"BTC","XDG":"DOGE","XXDG":"DOGE",
+                         "XETH":"ETH","ZUSD":"USD","ZGBP":"GBP","ZEUR":"EUR",
+                         "ZUSDT":"USDT"}
+                return aliases.get(b,b), aliases.get(q,q)
+
+            def _kraken_position_matches_symbol(kp: dict[str,Any], symbol: str) -> bool:
+                base,_quote=_kraken_canonical_pair(str(kp.get("pair") or ""))
+                return base == str(symbol or "").upper()
+
             for kp in result["positions"]:
                 pair=str(kp.get("pair") or "").upper()
                 qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
                 if qty<=0: continue
-                owners=[x for x in local if x["symbol"] and x["symbol"] in pair]
+                owners=[x for x in local if x["symbol"] and _kraken_position_matches_symbol(kp,x["symbol"])]
                 if owners:
                     result.setdefault("owned_positions",[]).append({
                         "position_id":kp.get("position_id"),"pair":pair,
@@ -7303,7 +7323,11 @@ class PaperBot:
                             f"value {value:.8f} exceeds dust threshold {dust_limit:.8f}"
                         )
             for lp in local:
-                if not any(lp["symbol"] in str(k.get("pair") or "").upper() for k in result["positions"]):
+                if not any(
+                    max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
+                    and _kraken_position_matches_symbol(k,lp["symbol"])
+                    for k in result["positions"]
+                ):
                     if lp.get("source")=="kraken_margin_owned":
                         rec=owned.get(lp.get("order_id"),{})
                         age=now-float(rec.get("created_ts") or now)
