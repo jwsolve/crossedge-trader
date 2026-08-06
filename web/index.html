@@ -1212,7 +1212,7 @@
         #streamingPill .dot.off { background: var(--muted); }
         #streamingPill .dot.error { background: var(--bad); }
 
-        /* ─── D9 Trading Control Centre ─── */
+        /* ─── Trading Control Centre ─── */
         .control-centre { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); margin-bottom:14px; }
         .control-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
         .control-head h2 { font-size:18px; margin:0; }
@@ -1237,20 +1237,7 @@
         @media(max-width:560px){ .control-grid{grid-template-columns:1fr}.cap-row,.decision-row{grid-template-columns:1fr 1fr} }
     </style>
 </head>
-<body><details class="panel" id="krakenMarginDiagnostics" class="diag-home" data-admin-diagnostic="true" style="margin:10px auto 14px">
-<summary style="cursor:pointer;font-weight:700;">Kraken Margin Diagnostics · D8.7</summary>
-<div style="padding-top:10px;">
-<div class="message-box" style="display:block;margin:0 0 10px;">
-<strong>Diagnostic controls.</strong> Normal D8.7 automated trading does not require these buttons.
-Live test actions can place or close real Kraken margin orders when live trading is armed.
-</div>
-<div class="group"><button id="kmValidate">Validate Margin Pair</button><button id="kmRead">Read-only Safety Check</button><button id="kmRecon">Reconcile Kraken Margin</button>
-<button id="kmClose" class="danger">Close Auxo-Owned Margin Position</button></div>
-<div class="group" style="margin-top:8px;"><label>Symbol <input id="kmSymbol" value="ADA" style="max-width:90px"></label>
-<label>Test amount <input id="kmAmount" type="number" value="5" min="1" style="max-width:90px"></label>
-<button id="kmTiny">Tiny Live SHORT Test</button></div>
-<pre id="kmOut" style="white-space:pre-wrap;max-height:220px;overflow:auto"></pre>
-</div></details>
+<body>
     <div class="app" id="app">
 
         <!-- ─── HEADER ─── -->
@@ -1300,7 +1287,7 @@ Live test actions can place or close real Kraken margin orders when live trading
         <!-- ─── DASHBOARD TAB ─── -->
         <div class="tab-pane active" id="tab-dashboard">
 
-            <!-- D9 Trading Control Centre -->
+            <!-- Trading Control Centre -->
             <section class="control-centre" id="tradingControlCentre">
                 <div class="control-head"><h2>Trading Control Centre</h2><span class="mode-badge paper" id="d9ModeBadge">PAPER</span></div>
                 <div class="control-grid">
@@ -1522,11 +1509,11 @@ Live test actions can place or close real Kraken margin orders when live trading
 <label>Kraken Live Margin Shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled (paper only)</option><option value="true">Enabled</option></select></label>
 <label>Kraken Margin Leverage <input type="number" name="kraken_margin_leverage" min="2" max="5" step="1" value="2"></label>
 <label>Kraken Margin Quote Currency <select name="kraken_margin_quote_currency"><option value="USDT">USDT</option><option value="USD">USD</option><option value="GBP">GBP</option><option value="EUR">EUR</option></select></label>
-<label>Kraken Margin Read Only <select name="kraken_margin_read_only"><option value="true">Enabled — safest</option><option value="false">Disabled — D8.6 only</option></select></label>
+<label>Kraken Margin Read Only <select name="kraken_margin_read_only"><option value="true">Enabled — safest</option><option value="false">Disabled — live orders permitted</option></select></label>
 <label>Max Margin Exposure <input type="number" name="kraken_margin_max_exposure_quote" min="1" step="1" value="25"></label>
 <label>Max Open Shorts <input type="number" name="kraken_margin_max_open_shorts" min="1" max="10" value="1"></label>
 <label>Minimum Margin Level % <input type="number" name="kraken_margin_min_level_pct" min="100" step="10" value="250"></label>
-<label>D8.6 Test Max Value <input type="number" name="kraken_margin_test_max_quote" min="1" value="10"></label>
+<label>Live Test Max Value <input type="number" name="kraken_margin_test_max_quote" min="1" value="10"></label>
                             <label>Short SMA <input name="short_window" type="number" value="5" step="1" /></label>
                             <label>Long SMA <input name="long_window" type="number" value="20" step="1" /></label>
                             <label>EWO buy EMA <input name="base_nb_candles_buy" type="number" value="14" step="1" /></label>
@@ -2066,7 +2053,25 @@ Live test actions can place or close real Kraken margin orders when live trading
                         <tbody id="auditBody"></tbody>
                     </table>
                 </div>
-            </section>
+            
+                <div class="admin-diagnostics">
+                    <h3 style="margin:18px 0 8px">Diagnostics</h3>
+                    <details class="panel diag-home" id="krakenMarginDiagnostics" data-admin-diagnostic="true" style="margin:18px 0 0">
+<summary style="cursor:pointer;font-weight:700;">Kraken Margin Diagnostics</summary>
+<div style="padding-top:10px;">
+<div class="message-box" style="display:block;margin:0 0 10px;">
+<strong>Diagnostic controls.</strong> Normal automated trading does not require these buttons.
+Live test actions can place or close real Kraken margin orders when live trading is armed.
+</div>
+<div class="group"><button id="kmValidate">Validate Margin Pair</button><button id="kmRead">Read-only Safety Check</button><button id="kmRecon">Reconcile Kraken Margin</button>
+<button id="kmClose" class="danger">Close Auxo-Owned Margin Position</button></div>
+<div class="group" style="margin-top:8px;"><label>Symbol <input id="kmSymbol" value="ADA" style="max-width:90px"></label>
+<label>Test amount <input id="kmAmount" type="number" value="5" min="1" style="max-width:90px"></label>
+<button id="kmTiny">Tiny Live SHORT Test</button></div>
+<pre id="kmOut" style="white-space:pre-wrap;max-height:220px;overflow:auto"></pre>
+</div></details>
+                </div>
+</section>
         </div>
 
     </div>
@@ -4334,7 +4339,7 @@ Live test actions can place or close real Kraken margin orders when live trading
                     });
                     if (!r.ok) throw new Error(r.error || 'Update failed');
 
-                    // D8 fix: persist the tier selected in the row too.
+                    // Persist the tier selected in the row too.
                     const selectedTier=row.querySelector('.adm-tier')?.value || 'starter';
                     const cachedUser=(adminUsersCache || []).find(u => Number(u.id)===userId);
                     const existingOverrides=cachedUser?.entitlement_overrides || {};
@@ -4829,6 +4834,6 @@ document.getElementById('kmValidate')?.addEventListener('click',()=>kmCall('/api
 document.getElementById('kmRead')?.addEventListener('click',()=>kmCall('/api/kraken-margin/read-only-check'));
 document.getElementById('kmRecon')?.addEventListener('click',()=>kmCall('/api/kraken-margin/reconcile','POST',{}));
 document.getElementById('kmClose')?.addEventListener('click',()=>confirm('BUY TO COVER ALL KRAKEN SHORTS?')&&kmCall('/api/kraken-margin/emergency-close','POST',{all_positions:true}));
-document.getElementById('kmTiny')?.addEventListener('click',()=>{const symbol=document.getElementById('kmSymbol').value,quote_amount=Number(document.getElementById('kmAmount').value);if(confirm('REAL MONEY D8.6 SHORT TEST?'))kmCall('/api/kraken-margin/tiny-live-short','POST',{symbol,quote_amount})});
+document.getElementById('kmTiny')?.addEventListener('click',()=>{const symbol=document.getElementById('kmSymbol').value,quote_amount=Number(document.getElementById('kmAmount').value);if(confirm('REAL MONEY SHORT TEST?'))kmCall('/api/kraken-margin/tiny-live-short','POST',{symbol,quote_amount})});
 </script></body>
 </html>
