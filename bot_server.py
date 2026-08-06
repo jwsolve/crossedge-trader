@@ -7291,7 +7291,7 @@ class PaperBot:
             and coinbase_live_is_armed()
         )
 
-    def recover_kraken_stale_closed_short(self, symbol: str, position: dict[str,Any]) -> dict[str,Any]:
+    def recover_kraken_stale_closed_short(self, symbol: str, position: dict[str,Any], exchange_flat_verified: bool=False) -> dict[str,Any]:
         """Clear stale Auxo SHORT state only when Kraken proves the cover filled.
 
         Kraken OpenPositions being flat is not enough on its own: we additionally
@@ -7347,12 +7347,28 @@ class PaperBot:
         missing=max(0.0,local_qty-covered)
         missing_quote=missing*last_px if last_px>0 else float("inf")
         dust=float(self.state.settings.get("kraken_margin_dust_quote",0.10))
-        if covered<=0 or (covered+1e-12<local_qty and missing_quote>dust):
-            return {"ok":False,"reason":"No sufficient Kraken cover fills found",
-                    "local_quantity":local_qty,"covered_quantity":covered,
-                    "missing_quantity":missing,"missing_quote":missing_quote}
+        history_proved = not (covered<=0 or (covered+1e-12<local_qty and missing_quote>dust))
+        if not history_proved:
+            # D10.6: TradesHistory is not a reliable sole source of truth for old/restarted
+            # positions (pagination, missing entry timestamps and Kraken consolidation can
+            # hide the exact cover fill). If OpenPositions AND OpenOrders are authoritatively
+            # flat for this symbol, only permit recovery when Auxo has persisted ownership
+            # for the same symbol. This cannot silently discard an unrelated/manual trade.
+            owned=getattr(self.state,"kraken_margin_owned",{}) or {}
+            owned_records=[
+                (oid,rec) for oid,rec in owned.items()
+                if str(rec.get("symbol") or "").upper()==symbol
+                and str(rec.get("status") or "").lower() in {"open","pending","adopted"}
+            ]
+            if not exchange_flat_verified or not owned_records:
+                return {"ok":False,"reason":"No sufficient Kraken cover fills found and authoritative owned-flat recovery was not available",
+                        "local_quantity":local_qty,"covered_quantity":covered,
+                        "missing_quantity":missing,"missing_quote":missing_quote,
+                        "exchange_flat_verified":bool(exchange_flat_verified),
+                        "owned_records":len(owned_records)}
 
-        # The exchange has proven the short is covered. Clear only this symbol.
+        # Kraken has proven the short is gone either through cover fills or through an
+        # authoritative flat OpenPositions/OpenOrders snapshot tied to Auxo ownership.
         with self.lock:
             self.state.positions.pop(symbol,None)
             if self.state.active_symbol==symbol:
@@ -7372,7 +7388,7 @@ class PaperBot:
                 if str(rec.get("symbol") or "").upper()==symbol and str(rec.get("status") or "").lower() in {"open","pending","adopted"}:
                     rec["status"]="closed_recovered"
                     rec["closed_ts"]=time.time()
-                    rec["close_source"]="kraken_trades_history_reconciliation"
+                    rec["close_source"]=("kraken_trades_history_reconciliation" if history_proved else "kraken_authoritative_flat_reconciliation")
                     rec["cover_order_ids"]=sorted({x["order_id"] for x in covers if x["order_id"]})
             self.state.last_signal=f"Kraken reconciliation recovered closed {symbol} SHORT"
             self.state.last_error=None
@@ -7380,7 +7396,8 @@ class PaperBot:
 
         details={"ok":True,"symbol":symbol,"local_quantity":local_qty,
                  "covered_quantity":covered,"cover_fills":covers,
-                 "reason":"Kraken trade history proves local SHORT was already covered"}
+                 "recovery_mode":("trade_history" if history_proved else "authoritative_flat"),
+                 "reason":("Kraken trade history proves local SHORT was already covered" if history_proved else "Kraken OpenPositions/OpenOrders are flat and Auxo ownership proves the stale local SHORT belongs to Auxo")}
         self.journal(symbol,"RECONCILE",
                      f"Recovered stale closed Kraken SHORT {symbol}; cleared local position",
                      last_px or None,details)
@@ -7413,7 +7430,8 @@ class PaperBot:
         result={"healthy":False,"status":"LOCKED","positions":[],"open_orders":[],"trade_balance":{},
                 "costs":{},"mismatches":[],"error":None,"_ts":now,"rate_limited":False}
         try:
-            snap=kraken_margin_snapshot(); result.update(snap)
+            _margin_quote=str(self.state.settings.get("kraken_margin_quote_currency") or self.state.settings.get("quote_currency") or "USDT").upper()
+            snap=kraken_margin_snapshot(quote_asset=_margin_quote); result.update(snap)
             local=[]
             for sym,p in self.state.positions.items():
                 if p.get("is_short"):
@@ -7497,7 +7515,14 @@ class PaperBot:
                     local_position=(self.state.positions or {}).get(sym)
                     if local_position and bool(local_position.get("is_short")):
                         try:
-                            recovery=self.recover_kraken_stale_closed_short(sym,local_position)
+                            has_open_order = any(
+                                _kraken_position_matches_symbol({"pair":o.get("pair")}, sym)
+                                and max(0.0,float(o.get("volume") or 0)-float(o.get("executed") or 0)) > 1e-12
+                                for o in result.get("open_orders",[])
+                            )
+                            recovery=self.recover_kraken_stale_closed_short(
+                                sym, local_position, exchange_flat_verified=not has_open_order
+                            )
                         except Exception as exc:
                             recovery={"ok":False,"reason":str(exc)}
                         if recovery.get("ok"):
@@ -7513,7 +7538,7 @@ class PaperBot:
                 # after local stale state has been cleared. Do not recursively call
                 # reconcile_kraken_margin here.
                 try:
-                    refreshed=kraken_margin_snapshot()
+                    refreshed=kraken_margin_snapshot(quote_asset=_margin_quote)
                     result.update(refreshed)
                     result["recovered_closed_positions"]=result.get("recovered_closed_positions",[])
                     result["mismatches"]=[
@@ -7679,7 +7704,7 @@ class PaperBot:
             raise RuntimeError(f"Refusing adoption: Kraken order {oid} status is {status or 'unknown'}")
 
         # Match the verified order to a currently open Kraken SELL position.
-        snap=kraken_margin_snapshot()
+        snap=kraken_margin_snapshot(quote_asset=str(self.state.settings.get("kraken_margin_quote_currency") or self.state.settings.get("quote_currency") or "USDT").upper())
         candidates=[]
         for pos in snap.get("positions",[]):
             p=str(pos.get("pair") or "").upper()
@@ -7733,7 +7758,7 @@ class PaperBot:
         if not kraken_live_is_armed():
             raise RuntimeError("Kraken live-order interlock is not armed")
         wanted=str(symbol or "").upper()
-        snap=kraken_margin_snapshot()
+        snap=kraken_margin_snapshot(quote_asset=str(self.state.settings.get("kraken_margin_quote_currency") or self.state.settings.get("quote_currency") or "USDT").upper())
         owned=getattr(self.state,"kraken_margin_owned",{}) or {}
         closed=[]; errors=[]; skipped=[]
 
@@ -9709,7 +9734,7 @@ def kraken_available_balance(currency:str)->float:
         if clean.upper()==currency.upper(): total+=float(v or 0)
     return total
 
-def kraken_margin_snapshot(ledger_limit:int=100)->dict[str,Any]:
+def kraken_margin_snapshot(ledger_limit:int=100, quote_asset:str="USD")->dict[str,Any]:
     """Fetch Kraken margin state defensively across dict/list response shapes."""
     def rows(raw):
         if isinstance(raw,dict): return list(raw.items())
@@ -9727,7 +9752,9 @@ def kraken_margin_snapshot(ledger_limit:int=100)->dict[str,Any]:
     else:
         orders_raw={}
 
-    tb=kraken_private("/0/private/TradeBalance",{"asset":"ZUSD"}).get("result") or {}
+    _qa=str(quote_asset or "USD").upper()
+    _tb_asset={"USD":"ZUSD","GBP":"ZGBP","EUR":"ZEUR","BTC":"XXBT","XBT":"XXBT","DOGE":"XXDG","XDG":"XXDG"}.get(_qa,_qa)
+    tb=kraken_private("/0/private/TradeBalance",{"asset":_tb_asset}).get("result") or {}
     if not isinstance(tb,dict): tb={}
 
     ledger_result=kraken_private("/0/private/Ledgers",{"type":"all"}).get("result") or {}
