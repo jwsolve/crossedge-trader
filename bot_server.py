@@ -4959,6 +4959,7 @@ class PaperBot:
                 "chart_regime": chart_row.get("regime"),
                 "live_status": self.live_status(),
                 "kraken_margin": self.kraken_margin_safety(),
+                "pair_capabilities": kraken_margin_capability_matrix(self.state.settings),
                 "news_guard": self.news_guard_status(),
                 "opening_range_analysis": self.state.opening_range_analysis,
                 "peak_equity": self.state.peak_equity,
@@ -8721,6 +8722,52 @@ def kraken_margin_pair_diagnostics(symbol:str,quote:str)->dict[str,Any]:
         "public_api_errors":errors,
         "short_margin_advertised":bool(meta.get("leverage_sell") or []),
     }
+
+# ─── D9 Trading Control Centre: public per-pair margin capability cache ───
+_KRAKEN_MARGIN_CAP_CACHE = {"ts": 0.0, "quote": None, "rows": {}}
+
+def kraken_margin_capability_matrix(settings:dict[str,Any], symbols:list[str]|None=None)->list[dict[str,Any]]:
+    """Return LONG/SHORT readiness per watchlist symbol using Kraken public AssetPairs only.
+
+    This deliberately does not call private reconciliation per pair. LONG means the spot pair
+    exists; SHORT means Kraken advertises sell leverage including the configured leverage.
+    Results are cached for five minutes to avoid hammering Kraken from /api/status polling.
+    """
+    if str(settings.get("active_exchange") or settings.get("exchange") or "").lower() != "kraken":
+        return []
+    quote=kraken_margin_quote(settings)
+    requested=float(settings.get("kraken_margin_leverage",2) or 2)
+    if symbols is None:
+        raw=str(settings.get("watchlist") or settings.get("symbol") or "")
+        symbols=[x.strip().upper() for x in raw.split(",") if x.strip()]
+    symbols=list(dict.fromkeys(str(x).upper() for x in symbols if x))[:40]
+    now=time.time(); cache=_KRAKEN_MARGIN_CAP_CACHE
+    cache_key=(quote,requested,tuple(symbols))
+    if cache.get("key")==cache_key and now-float(cache.get("ts",0)) < 300:
+        return list(cache.get("rows") or [])
+    rows=[]
+    try:
+        data=fetch_json("https://api.kraken.com/0/public/AssetPairs")
+        pairs=data.get("result") or {}
+        for symbol in symbols:
+            base={"BTC":"XBT","DOGE":"XDG"}.get(symbol,symbol)
+            wanted={f"{base}{quote}",f"{base}/{quote}",f"{symbol}{quote}",f"{symbol}/{quote}"}
+            match_key=None; meta={}
+            for k,v in pairs.items():
+                if k.upper() in wanted or str(v.get("altname","")).upper() in wanted or str(v.get("wsname","")).upper() in wanted:
+                    match_key=k; meta=v; break
+            if not match_key:
+                rows.append({"symbol":symbol,"pair":f"{symbol}/{quote}","long_ready":False,"short_ready":False,"reason":"Pair unavailable"})
+                continue
+            allowed=[float(x) for x in (meta.get("leverage_sell") or [])]
+            short_ready=requested in allowed
+            rows.append({"symbol":symbol,"pair":str(meta.get("wsname") or meta.get("altname") or match_key),
+                         "long_ready":True,"short_ready":short_ready,"allowed_short_leverage":allowed,
+                         "reason":None if short_ready else ("Short margin unavailable" if not allowed else f"{requested:g}x leverage unavailable")})
+    except Exception as exc:
+        rows=[{"symbol":s,"pair":f"{s}/{quote}","long_ready":False,"short_ready":False,"reason":f"Pair check failed: {exc}"} for s in symbols]
+    cache.update({"ts":now,"key":cache_key,"rows":rows})
+    return rows
 
 def kraken_round_price(v,s,q): return round(float(v),kraken_pair_info(s,q)["price_decimals"])
 def kraken_round_size(v,s,q):

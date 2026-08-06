@@ -1211,9 +1211,33 @@
         #streamingPill .dot.connecting { background: var(--warn); }
         #streamingPill .dot.off { background: var(--muted); }
         #streamingPill .dot.error { background: var(--bad); }
+
+        /* ─── D9 Trading Control Centre ─── */
+        .control-centre { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); margin-bottom:14px; }
+        .control-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+        .control-head h2 { font-size:18px; margin:0; }
+        .mode-badge { padding:5px 11px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid var(--line); }
+        .mode-badge.live { color:var(--bad); border-color:var(--bad); } .mode-badge.paper { color:var(--accent); border-color:var(--accent); }
+        .control-grid { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:10px; }
+        .control-tile { border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--panel-hover); }
+        .control-tile .k { color:var(--muted); font-size:11px; text-transform:uppercase; font-weight:700; }
+        .control-tile .v { font-size:17px; font-weight:700; margin-top:2px; }
+        .readiness { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+        .ready-chip { border:1px solid var(--line); border-radius:999px; padding:5px 10px; font-size:12px; font-weight:650; }
+        .ready-chip.good { color:var(--good); border-color:var(--good); } .ready-chip.bad { color:var(--bad); border-color:var(--bad); } .ready-chip.warn { color:var(--warn); border-color:var(--warn); }
+        .d9-grid { display:grid; grid-template-columns:1.1fr .9fr; gap:14px; margin-bottom:14px; }
+        .d9-panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:14px; box-shadow:var(--shadow); }
+        .d9-panel h2 { font-size:16px; margin:0 0 10px; }
+        .cap-row,.decision-row { display:grid; grid-template-columns:1.2fr .7fr .7fr 1.6fr; gap:8px; padding:7px 4px; border-bottom:1px solid var(--line); align-items:center; font-size:12px; }
+        .cap-row:last-child,.decision-row:last-child { border-bottom:0; }
+        .ok-text { color:var(--good); font-weight:700; } .no-text { color:var(--bad); font-weight:700; } .muted-text { color:var(--muted); }
+        .safety-list { display:grid; gap:7px; } .safety-item { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+        .diag-home { margin:0 auto 14px; max-width:1440px; }
+        @media(max-width:900px){ .control-grid{grid-template-columns:1fr 1fr}.d9-grid{grid-template-columns:1fr} }
+        @media(max-width:560px){ .control-grid{grid-template-columns:1fr}.cap-row,.decision-row{grid-template-columns:1fr 1fr} }
     </style>
 </head>
-<body><details class="panel" id="krakenMarginDiagnostics" data-admin-diagnostic="true" style="margin:10px 0">
+<body><details class="panel" id="krakenMarginDiagnostics" class="diag-home" data-admin-diagnostic="true" style="margin:10px auto 14px">
 <summary style="cursor:pointer;font-weight:700;">Kraken Margin Diagnostics · D8.7</summary>
 <div style="padding-top:10px;">
 <div class="message-box" style="display:block;margin:0 0 10px;">
@@ -1275,6 +1299,28 @@ Live test actions can place or close real Kraken margin orders when live trading
 
         <!-- ─── DASHBOARD TAB ─── -->
         <div class="tab-pane active" id="tab-dashboard">
+
+            <!-- D9 Trading Control Centre -->
+            <section class="control-centre" id="tradingControlCentre">
+                <div class="control-head"><h2>Trading Control Centre</h2><span class="mode-badge paper" id="d9ModeBadge">PAPER</span></div>
+                <div class="control-grid">
+                    <div class="control-tile"><div class="k">Equity</div><div class="v" id="d9Equity">—</div></div>
+                    <div class="control-tile"><div class="k">Available</div><div class="v" id="d9Available">—</div></div>
+                    <div class="control-tile"><div class="k">Today P/L</div><div class="v" id="d9DayPnl">—</div></div>
+                    <div class="control-tile"><div class="k">Open Trades</div><div class="v" id="d9OpenTrades">0</div></div>
+                </div>
+                <div class="readiness">
+                    <span class="ready-chip" id="d9LongReady">LONGS —</span>
+                    <span class="ready-chip" id="d9ShortReady">SHORTS —</span>
+                    <span class="ready-chip" id="d9ExchangeReady">EXCHANGE —</span>
+                    <span class="ready-chip" id="d9RiskProfile">RISK —</span>
+                </div>
+            </section>
+            <div class="d9-grid">
+                <section class="d9-panel"><h2>Market Readiness</h2><div id="d9CapabilityMatrix"><span class="muted-text">Waiting for pair capability data…</span></div></section>
+                <section class="d9-panel"><h2>Safety Centre</h2><div class="safety-list" id="d9SafetyCentre"></div></section>
+            </div>
+            <section class="d9-panel" style="margin-bottom:14px"><h2>Why isn't Auxo trading?</h2><div id="d9DecisionFeed"><span class="muted-text">Waiting for scanner decisions…</span></div></section>
 
             <!-- Metrics -->
             <div class="metrics">
@@ -2443,7 +2489,42 @@ Live test actions can place or close real Kraken margin orders when live trading
         });
 
         // ---- Update streaming status ----
-        function updateStreamingUI(data) {
+        function d9Money(v, quote) {
+            const n=Number(v||0); const q=String(quote||'GBP').toUpperCase();
+            const sym=q==='GBP'?'£':(q==='USD'?'$':(q==='EUR'?'€':q+' '));
+            return sym + n.toFixed(2);
+        }
+        function renderD9(data) {
+            const s=data.settings||{}, quote=s.quote_currency||s.kraken_margin_quote_currency||'GBP';
+            const live=!!s.live_trading_enabled, exchange=String(s.active_exchange||s.exchange||'').toUpperCase();
+            const mode=document.getElementById('d9ModeBadge'); if(mode){mode.textContent=live?'● LIVE TRADING':'PAPER TRADING';mode.className='mode-badge '+(live?'live':'paper');}
+            const set=(id,val)=>{const e=document.getElementById(id);if(e)e.textContent=val;};
+            set('d9Equity',d9Money(data.equity,quote)); set('d9Available',d9Money(data.cash,quote)); set('d9DayPnl',d9Money(data.day_pnl,quote));
+            set('d9OpenTrades',String((data.positions||[]).length));
+            const chip=(id,text,cls)=>{const e=document.getElementById(id);if(e){e.textContent=text;e.className='ready-chip '+cls;}};
+            chip('d9LongReady','LONGS: '+(live?'READY':'PAPER'),'good');
+            const km=data.kraken_margin||{}; const shortEnabled=!!s.allow_short_selling;
+            let shortText='SHORTS: DISABLED', shortCls='bad';
+            if(shortEnabled && !live){shortText='SHORTS: PAPER READY';shortCls='good';}
+            else if(shortEnabled && exchange==='KRAKEN' && km.new_shorts_allowed){shortText='SHORTS: READY';shortCls='good';}
+            else if(shortEnabled && exchange==='KRAKEN'){shortText='SHORTS: '+(km.reason||km.message||'LOCKED');shortCls='warn';}
+            else if(shortEnabled){shortText='SHORTS: ENABLED';shortCls='good';}
+            chip('d9ShortReady',shortText,shortCls); chip('d9ExchangeReady',exchange+': '+(data.last_error?'CHECK':'READY'),data.last_error?'warn':'good');
+            const modeName=String(s.risk_sizing_mode||'fixed').toUpperCase(); chip('d9RiskProfile','RISK: '+modeName,'');
+
+            const caps=data.pair_capabilities||[]; const cap=document.getElementById('d9CapabilityMatrix');
+            if(cap){ cap.innerHTML=caps.length ? caps.map(r=>`<div class="cap-row"><strong>${r.pair||r.symbol}</strong><span class="${r.long_ready?'ok-text':'no-text'}">LONG ${r.long_ready?'✓':'—'}</span><span class="${r.short_ready?'ok-text':'no-text'}">SHORT ${r.short_ready?'✓':'🔒'}</span><span class="muted-text">${r.reason||((r.allowed_short_leverage||[]).length?'Margin '+r.allowed_short_leverage.join('x, ')+'x':'Ready')}</span></div>`).join('') : '<span class="muted-text">Capability matrix is shown for Kraken watchlist pairs.</span>'; }
+
+            const safe=document.getElementById('d9SafetyCentre'); if(safe){
+                const items=[['Bot',data.running?'Running':'Stopped',!data.last_error],['Live mode',live?'Armed':'Paper',true],['Kraken margin',km.status||'Off',km.status==='SAFE'||!s.kraken_margin_short_enabled],['Reconciliation',km.healthy?'Healthy':(km.reason||'Not ready'),km.healthy||!s.kraken_margin_short_enabled],['API / last error',data.last_error||'No error',!data.last_error]];
+                safe.innerHTML=items.map(x=>`<div class="safety-item"><span>${x[0]}</span><strong class="${x[2]?'ok-text':'no-text'}">${x[1]}</strong></div>`).join('');
+            }
+            const feed=document.getElementById('d9DecisionFeed'), rows=(data.scan_rows||[]).slice(0,12);
+            if(feed){feed.innerHTML=rows.length?rows.map(r=>{const reason=r.block_reason||r.reason||r.signal_reason||r.message||r.signal||r.action||'Scanning'; const score=r.score??r.setup_score??r.confidence; return `<div class="decision-row"><strong>${r.symbol||'—'}</strong><span>${r.signal||r.action||'WATCH'}</span><span>${score==null?'—':(Number(score).toFixed(1))}</span><span class="muted-text">${reason}</span></div>`;}).join(''):'<span class="muted-text">No scanner decisions yet.</span>';}
+        }
+
+        function updateStreamingUI(data) {            renderD9(data);
+
             if (!els.streamingDot || !els.streamingText) return;
 
             const wsStatus = data?.live_status?.websocket_status || 'disabled';
