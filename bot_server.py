@@ -1866,6 +1866,15 @@ class PaperBot:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.state = self.load_state()
+        # `running` is process-local runtime state, not a durable truth. A saved
+        # True from the previous Python process must never make the new process
+        # appear live before start() has run its exchange safety checks.
+        if self.state.running:
+            logger.warning("Clearing stale persisted running=True on process startup")
+            self.state.running = False
+        self._kraken_spot_balance_snapshot = {
+            "ok": False, "reconciled": False, "error": "Not reconciled in this process"
+        }
         self.quote_currency = self.state.settings.get("quote_currency", "GBP")
         self.connectors = create_connectors(self.quote_currency)
         self.price_aggregator = PriceAggregator(self.connectors)
@@ -1932,6 +1941,9 @@ class PaperBot:
         self.oanda_cache = None
         self.oanda_cache_time = 10
         self.oanda_cache_ttl = 10
+        # Persist the process-local stopped state so /api/status and the frontend
+        # cannot inherit a stale running=True after a service restart.
+        self.save_state()
         logger.info("Auxo bot initialised with XGBoost ML integration")
 
     # ─── COINBASE PRECISION HELPERS ─────────────────────────────────
@@ -2792,8 +2804,10 @@ class PaperBot:
         try:
             if self.should_sync_live_balance_on_start():
                 self.sync_live_balance_from_coinbase()
-            elif self.live_exchange() == "kraken":
-                self.sync_kraken_live_balance_on_start()
+            elif self.live_exchange() == "kraken" and bool(self.state.settings.get("live_trading_enabled")):
+                reconciled = self.sync_kraken_live_balance_on_start()
+                if not reconciled:
+                    raise RuntimeError("Kraken live start requires a successful balance reconciliation")
         except Exception as exc:
             with self.lock:
                 self.state.last_error = f"Start blocked: {exc}"
@@ -3888,7 +3902,7 @@ class PaperBot:
                 self.save_state()
             return False
 
-        exchange=str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
+        exchange=str(settings.get("exchange") or settings.get("active_exchange") or "").lower()
         # This startup hook calls sync_live_balance_from_coinbase(), so it must ONLY
         # return True for Coinbase. Kraken live/margin state is handled by Kraken
         # reconciliation and must never be routed through the Coinbase balance sync.
