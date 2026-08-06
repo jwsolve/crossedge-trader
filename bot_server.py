@@ -1386,8 +1386,14 @@ def open_trade_risk(
         "target_cash": round(max(target_per_unit, 0.0) * abs(state.coin), 8),
         "current_cash": round(current_per_unit * abs(state.coin), 8),
         "current_r": round(current_per_unit / risk_per_unit, 4) if risk_per_unit > 0 else None,
-        "distance_to_stop_pct": pct(float(price) - float(stop), float(price)) if stop else None,
-        "distance_to_target_pct": pct(float(target) - float(price), float(price)) if target else None,
+        "distance_to_stop_pct": (
+            max(0.0, ((float(stop)-float(price))/float(price))*100.0) if state.is_short
+            else max(0.0, ((float(price)-float(stop))/float(price))*100.0)
+        ) if stop else None,
+        "distance_to_target_pct": (
+            max(0.0, ((float(price)-float(target))/float(price))*100.0) if state.is_short
+            else max(0.0, ((float(target)-float(price))/float(price))*100.0)
+        ) if target else None,
         "is_short": state.is_short,
     }
 
@@ -1487,14 +1493,16 @@ def position_rows(state: BotState) -> list[dict[str, Any]]:
         target_distance_pct = None
         if stop and current:
             if is_short:
-                stop_distance_pct = ((stop - current) / current) * 100
+                stop_distance_pct = max(0.0, ((stop - current) / current) * 100)
             else:
-                stop_distance_pct = ((current - stop) / current) * 100
+                stop_distance_pct = max(0.0, ((current - stop) / current) * 100)
         if target and current:
             if is_short:
-                target_distance_pct = ((current - target) / current) * 100
+                # Short target is reached when current <= target.
+                target_distance_pct = max(0.0, ((current - target) / current) * 100)
             else:
-                target_distance_pct = ((target - current) / current) * 100
+                # Long target is reached when current >= target.
+                target_distance_pct = max(0.0, ((target - current) / current) * 100)
 
         rows.append({
             "symbol": symbol,
@@ -5594,8 +5602,10 @@ class PaperBot:
             if self.should_live_trade():
                 self.manage_open_orders()
 
-            decision = None
-            if settings.get("strategy_creator_enabled", False) and self.strategy_manager:
+            # Position protection is strategy-independent. A regime/strategy switch
+            # must never orphan an existing position's stored TP/SL.
+            decision = self.protective_exit_decision(fetched_prices, fetched_candles)
+            if not decision and settings.get("strategy_creator_enabled", False) and self.strategy_manager:
                 for symbol in watchlist:
                     candles = fetched_candles.get(symbol, [])
                     if not candles:
@@ -5680,6 +5690,107 @@ class PaperBot:
                     self.self_learning_trader.train_xgboost()
 
             self.save_state()
+
+    def protective_exit_decision(
+        self,
+        fetched_prices: dict[str, float],
+        candles_by_symbol: dict[str, list[Candle]],
+    ) -> str | None:
+        """Enforce stored TP/SL/trailing/partial exits before strategy logic.
+
+        Protective exits belong to the position, not to whichever strategy happens
+        to be active on the current tick. This is especially important when regime
+        switching changes opening_range/self_learning/legacy while a trade is open.
+        """
+        with self.lock:
+            symbol = self.state.active_symbol
+            positions = dict(self.state.positions or {})
+            settings = dict(self.state.settings)
+
+        if not symbol or symbol not in positions:
+            return None
+
+        position = positions[symbol]
+        quantity = abs(float(position.get("quantity", 0.0) or 0.0))
+        if quantity <= 0:
+            return None
+
+        raw_price = fetched_prices.get(symbol)
+        if raw_price is None or float(raw_price) <= 0:
+            return None
+        price = float(raw_price)
+
+        entry = float(position.get("entry_price") or self.state.entry_price or 0.0)
+        if entry <= 0:
+            return None
+
+        is_short = bool(position.get("is_short", False))
+        side = "SHORT" if is_short else "LONG"
+        candles = candles_by_symbol.get(symbol) or closes_to_candles(self.state.price_history.get(symbol, []))
+
+        stop = (position.get("stop_price") or position.get("stop") or
+                position.get("stop_loss") or position.get("stop_loss_price"))
+        target = (position.get("target_price") or position.get("target") or
+                  position.get("take_profit") or position.get("take_profit_price"))
+        mode = str(position.get("exit_mode") or self.state.exit_mode or "stored")
+
+        if stop is None or target is None:
+            calc_stop, calc_target, calc_mode = self.exit_prices(
+                entry, candles, settings, position_side=side
+            )
+            if stop is None: stop = calc_stop
+            if target is None: target = calc_target
+            if not position.get("exit_mode"): mode = calc_mode
+
+        stop = float(stop) if stop is not None else None
+        target = float(target) if target is not None else None
+
+        # Persist missing legacy levels so frontend and execution use identical values.
+        with self.lock:
+            live = self.state.positions.get(symbol)
+            if live is not None:
+                if stop is not None:
+                    live["stop_price"] = stop
+                    live["stop"] = stop
+                if target is not None:
+                    live["target_price"] = target
+                    live["target"] = target
+                live["exit_mode"] = mode
+                if is_short:
+                    live["lowest_price"] = min(float(live.get("lowest_price") or price), price)
+                else:
+                    live["highest_price"] = max(float(live.get("highest_price") or price), price)
+
+        # Hard TP/SL comes FIRST and is deliberately not blocked by strategy cooldown.
+        if is_short:
+            if stop is not None and price >= stop:
+                return f"SELL {symbol} {mode} stop"
+            if target is not None and price <= target:
+                return f"SELL {symbol} {mode} target"
+        else:
+            if stop is not None and price <= stop:
+                return f"SELL {symbol} {mode} stop"
+            if target is not None and price >= target:
+                return f"SELL {symbol} {mode} target"
+
+        partial_done = bool(position.get("partial_take_profit_done", False))
+        if target is not None and partial_take_profit_ready(
+            price=price, entry_price=entry, target_price=target, settings=settings,
+            already_done=partial_done, is_short=is_short
+        ):
+            with self.lock:
+                if symbol in self.state.positions:
+                    self.state.positions[symbol]["partial_take_profit_done"] = True
+                self.state.partial_take_profit_done = True
+            return f"SELL {symbol} partial {mode} target"
+
+        trail_ref = (float(position.get("lowest_price") or price) if is_short
+                     else float(position.get("highest_price") or price))
+        trail = trailing_stop_price(entry, trail_ref, settings, is_short=is_short)
+        if trail and ((is_short and price >= trail) or ((not is_short) and price <= trail)):
+            return f"SELL {symbol} trailing stop"
+
+        return None
 
     # ─── Self-Learning Decision ─────────────────────────────────────
 
