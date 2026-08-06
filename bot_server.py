@@ -2716,10 +2716,75 @@ class PaperBot:
 
     # ─── Start/Stop ────────────────────────────────────────────────────
 
+    def sync_kraken_live_balance_on_start(self) -> bool:
+        """Anchor flat Kraken live state to the exchange before trading starts.
+
+        Only runs when there is no locally open spot position and no adopted
+        Kraken margin ownership. This deliberately repairs stale/corrupt local
+        cash such as an impossible cross-symbol exit valuation, while refusing
+        to hide a position/reconciliation problem.
+        """
+        with self.lock:
+            settings = dict(self.state.settings)
+            local_positions = dict(self.state.positions or {})
+            current_coin = float(self.state.coin or 0.0)
+            active_symbol = self.state.active_symbol
+            owned_margin = dict(getattr(self.state, "kraken_margin_owned", {}) or {})
+
+        exchange = str(settings.get("active_exchange") or settings.get("exchange") or "").lower()
+        if not (
+            bool(settings.get("live_trading_enabled"))
+            and settings.get("asset_class", "crypto") == "crypto"
+            and exchange == "kraken"
+        ):
+            return False
+
+        # Never flatten/overwrite local accounting while Auxo believes it owns exposure.
+        if local_positions or abs(current_coin) > 1e-12 or active_symbol or owned_margin:
+            with self.lock:
+                self.state.last_signal = "Kraken startup balance sync skipped: local/open exposure exists"
+                self.journal(active_symbol or "", "INFO", self.state.last_signal, self.state.last_price)
+                self.save_state()
+            return False
+
+        quote = str(settings.get("quote_currency") or "USDT").upper()
+        actual_cash = float(kraken_available_balance(quote))
+        if actual_cash < 0 or not math.isfinite(actual_cash):
+            raise RuntimeError(f"Invalid Kraken {quote} balance returned: {actual_cash}")
+
+        with self.lock:
+            previous_cash = float(self.state.cash or 0.0)
+            self.state.cash = actual_cash
+            # Flat account: equity is cash. realised_pnl is derived from the
+            # configured session baseline, not from the previously corrupted cash.
+            self.state.realized_pnl = actual_cash - float(self.state.starting_cash or 0.0)
+            self.state.unrealized_pnl = 0.0
+            self.state.coin = 0.0
+            self.state.active_symbol = None
+            self.state.last_error = None
+            self.state.last_signal = (
+                f"Kraken startup reconciliation: {quote} cash {previous_cash:.8f} "
+                f"→ {actual_cash:.8f}; flat account re-anchored to exchange"
+            )
+            self.journal("", "RECONCILE", self.state.last_signal, None, {
+                "exchange": "kraken", "quote": quote,
+                "previous_local_cash": previous_cash,
+                "exchange_cash": actual_cash,
+                "starting_cash": float(self.state.starting_cash or 0.0),
+            })
+            self.save_state()
+        logger.warning(
+            "Kraken startup reconciliation re-anchored local %s cash from %.8f to %.8f",
+            quote, previous_cash, actual_cash,
+        )
+        return True
+
     def start(self) -> None:
         try:
             if self.should_sync_live_balance_on_start():
                 self.sync_live_balance_from_coinbase()
+            elif self.live_exchange() == "kraken":
+                self.sync_kraken_live_balance_on_start()
         except Exception as exc:
             with self.lock:
                 self.state.last_error = f"Start blocked: {exc}"
