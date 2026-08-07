@@ -120,7 +120,8 @@
             border-radius: 999px;
             font-weight: 600;
         }
-        .header-status {
+        /* Legacy status pills moved to Dashboard Safety / Control Centre */
+.header-status {
             display: flex;
             align-items: center;
             gap: 6px;
@@ -1037,7 +1038,9 @@
                 padding: 10px 12px;
             }
             .header-brand { margin-right: 0; justify-content: center; }
-            .header-status { order: 3; justify-content: center; flex-wrap: wrap; gap: 4px; }
+
+
+        .header-status { order: 3; justify-content: center; flex-wrap: wrap; gap: 4px; }
             .header-tabs { justify-content: center; margin-left: 0; order: 2; overflow-x: auto; }
             .header-tabs button { flex-shrink: 0; padding: 8px 16px; white-space: nowrap; }
             .header-actions { justify-content: center; order: 4; }
@@ -1309,32 +1312,7 @@
                 <h1>Auxo</h1>
                 <span class="badge">v2.0</span>
             </div>
-
-            <!-- Status Pills -->
-            <div class="header-status" id="headerStatus">
-                <span class="pill" id="runPill"><span class="dot gray" id="runDot"></span><span id="runText">Stopped</span></span>
-                <span class="pill" id="tradingPill">Trading Disabled</span>
-                <span class="pill" id="armedPill">🔒 Locked</span>
-                <span class="pill" id="krakenMarginPill" title="Kraken margin reconciliation">Margin: Off</span>
-                <span class="pill" id="streamingPill">
-                    <span class="dot off" id="streamingDot"></span>
-                    <span id="streamingText">Streaming: Off</span>
-                </span>
-                <details class="health-details" id="healthDetails">
-                    <summary>🟢 Healthy</summary>
-                    <div class="popover" id="healthPopover">
-                        <div class="item"><span>News Guard</span><span class="check">✓</span></div>
-                        <div class="item"><span>Spread OK</span><span class="check">✓</span></div>
-                        <div class="item"><span>Volume OK</span><span class="check">✓</span></div>
-                        <div class="item"><span>Daily Loss OK</span><span class="check">✓</span></div>
-                        <div class="item"><span>API Connected</span><span class="check">✓</span></div>
-                        <div class="item"><span>Websocket</span><span class="check">✓</span></div>
-                    </div>
-                </details>
-                <span class="pair-display" id="pairDisplay">BTC-GBP</span>
-            </div>
-
-            <div class="header-tabs" id="mainTabs">
+<div class="header-tabs" id="mainTabs">
                 <button class="active" data-tab="dashboard">Dashboard</button>
                 <button data-tab="trading">Trading</button>
                 <button data-tab="analysis">Analysis</button>
@@ -1501,17 +1479,7 @@
         <div class="tab-pane" id="tab-trading">
 
             <div class="trading-controls">
-                <details class="more-menu">
-                    <summary>⋮</summary>
-                    <div class="dropdown">
-                        <button id="syncOandaBalanceBtn">Sync OANDA Balance</button>
-                        <button id="oandaAuthCheckBtn">Check OANDA</button>
-                        <button id="resetBtn">Reset Paper</button>
-                        <button id="exportTradesBtn">Export Trades</button>
-                        <button id="importSettingsBtn">Import Settings</button>
-                    </div>
-                </details>
-            </div>
+</div>
 
             <div class="settings-section">
                 <div class="search-box">
@@ -2166,13 +2134,6 @@ Live test actions can place or close real Kraken margin orders when live trading
             dashboardClosedTrades: $('dashboardClosedTrades'),
             dashboardRegime: $('dashboardRegime'),
             dashboardStrategy: $('dashboardStrategy'),
-            runPill: $('runPill'),
-            runDot: $('runDot'),
-            runText: $('runText'),
-            tradingPill: $('tradingPill'),
-            armedPill: $('armedPill'),
-            healthDetails: $('healthDetails'),
-            healthPopover: $('healthPopover'),
             pairDisplay: $('pairDisplay'),
             chartSymbolSelect: $('chartSymbolSelect'),
             chartTimeframeSelect: $('chartTimeframeSelect'),
@@ -3878,74 +3839,6 @@ Live test actions can place or close real Kraken margin orders when live trading
             const posCount = (data.positions || []).length;
             els.position.textContent = posCount;
             renderDashboardTradingStats(data);
-
-            const running = !!data.running;
-            els.runDot.className = 'dot ' + (running ? 'green' : 'red');
-            els.runText.textContent = running ? 'Running' : 'Stopped';
-            els.runPill.className = 'pill ' + (running ? 'good' : '');
-
-            const liveEnabled = !!data.live_status?.enabled;
-            const armed = !!data.live_status?.armed;
-            els.tradingPill.textContent = liveEnabled ? 'Trading Enabled' : 'Trading Disabled';
-            els.tradingPill.className = 'pill ' + (liveEnabled ? 'good' : 'bad');
-            els.armedPill.textContent = armed ? '🔓 Armed' : '🔒 Locked';
-            els.armedPill.className = 'pill ' + (armed ? 'warn' : '');
-
-            const km = data.kraken_margin || {};
-            const kmPill = document.getElementById('krakenMarginPill');
-            if (kmPill) {
-                const ks = km.status || 'OFF';
-                const state = String(km.margin_state || '').toUpperCase();
-                let reason = '';
-                if (ks === 'LOCKED' || ks === 'RATE_LIMITED') {
-                    if (state === 'PAIR_UNSUPPORTED') reason = 'Pair unsupported';
-                    else if (state === 'LEVERAGE_UNSUPPORTED') reason = 'Leverage unsupported';
-                    else if (state === 'RECONCILIATION_LOCK') reason = 'Reconciliation';
-                    else if (state === 'RATE_LIMITED' || ks === 'RATE_LIMITED') reason = 'Rate limited';
-                    else if (state === 'PAIR_ERROR') reason = 'Pair check error';
-                    else if (state === 'DISABLED') reason = 'Disabled';
-                    else reason = km.reason || km.message || km.error || state || 'Safety lock';
-                }
-                kmPill.textContent = `Margin: ${ks}${reason ? ' — ' + reason : ''}`;
-                kmPill.className = 'pill ' + (ks === 'SAFE' ? 'good' : ((ks === 'LOCKED' || ks === 'RATE_LIMITED') ? 'bad' : ''));
-                const c = km.costs || {};
-                const detail = km.reason || km.message || km.error || '';
-                kmPill.title = km.enabled ? `Kraken reconciliation ${ks}${reason ? ' — '+reason : ''} | positions ${(km.positions||[]).length} | margin costs ${Number(c.margin_fees||0).toFixed(4)} | rollover ${Number(c.rollover_fees||0).toFixed(4)}${detail ? ' | '+detail : ''}` : 'Kraken live margin shorts disabled';
-            }
-
-            els.pairDisplay.textContent = activeSymbol + (settings.asset_class === 'forex' ? ' forex' : '');
-            els.lastPrice.textContent = data.last_price ? priceText(data.last_price, activeSymbol) : '—';
-            els.signalText.textContent = data.last_signal || 'Waiting';
-
-            els.errorBox.style.display = data.last_error ? 'block' : 'none';
-            els.errorBox.textContent = data.last_error || '';
-
-            const symbols = data.chart_symbols || [];
-            if (!selectedChartSymbol || !symbols.includes(selectedChartSymbol)) selectedChartSymbol = activeSymbol;
-            els.chartSymbolSelect.innerHTML = symbols.map(s =>
-                `<option value="${s}" ${s === selectedChartSymbol ? 'selected' : ''}>${s}</option>`
-            ).join('');
-            els.chartSymbolSelect.disabled = symbols.length <= 1;
-
-            const ls = data.live_status || {};
-            const newsGuard = data.news_guard || {};
-            const healthItems = {
-                'News Guard': newsGuard.enabled ? '✓' : '✗',
-                'Spread OK': ls.spread_ok !== false ? '✓' : '✗',
-                'Volume OK': ls.volume_ok !== false ? '✓' : '✗',
-                'Daily Loss OK': ls.daily_loss_ok !== false ? '✓' : '✗',
-                'API Connected': ls.api_connected !== false ? '✓' : '✗',
-                'Websocket': ls.websocket_connected !== false ? '✓' : '✗',
-                'Kraken Margin': !data.kraken_margin?.enabled || data.kraken_margin?.healthy ? '✓' : '✗',
-            };
-            const allHealthy = Object.values(healthItems).every(v => v === '✓');
-            const healthSummary = allHealthy ? '🟢 Healthy' : '🟡 Issues';
-            const healthSummaryEl = els.healthDetails.querySelector('summary');
-            if (healthSummaryEl) healthSummaryEl.textContent = healthSummary;
-
-            els.healthPopover.innerHTML = Object.entries(healthItems).map(([k, v]) =>
-                `<div class="item"><span>${k}</span><span class="${v==='✓'?'check':'cross'}">${v}</span></div>`
-            ).join('');
 
             renderPositions(data.positions || []);
             renderRecentActivity(data.journal || [], data.trades || []);
