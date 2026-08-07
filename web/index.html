@@ -615,6 +615,49 @@
             margin-left: auto;
         }
 
+        /* Dashboard Trading Control Centre actions */
+        .control-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 1px solid var(--line);
+            flex-wrap: wrap;
+        }
+        .control-actions .big-btn {
+            padding: 9px 24px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 15px;
+            border: none;
+            cursor: pointer;
+            transition: opacity 0.15s, transform 0.05s;
+            color: #fff;
+        }
+        .control-actions .big-btn:hover { opacity: 0.9; }
+        .control-actions .big-btn:active { transform: translateY(1px); }
+        .control-actions .big-btn.start { background: var(--good); }
+        .control-actions .big-btn.stop { background: var(--bad); }
+        .control-actions .trading-status {
+            font-size: 13px;
+            color: var(--muted);
+            margin-left: auto;
+        }
+        @media (max-width: 768px) {
+            .control-actions { gap: 6px; }
+            .control-actions .big-btn {
+                flex: 1;
+                min-width: 100px;
+                min-height: 44px;
+                font-size: 14px;
+            }
+            .control-actions .trading-status {
+                flex: 1 0 100%;
+                margin-left: 0;
+            }
+        }
+
         .settings-section {
             background: var(--panel);
             border: 1px solid var(--line);
@@ -1323,6 +1366,11 @@
                     <span class="ready-chip" id="d9ExchangeReady">EXCHANGE —</span>
                     <span class="ready-chip" id="d9RiskProfile">RISK —</span>
                 </div>
+                <div class="control-actions" aria-label="Trading controls">
+                    <button class="big-btn start" id="startBtn">▶ Start Trading</button>
+                    <button class="big-btn stop" id="stopBtn">■ Stop Trading</button>
+                    <span class="trading-status" id="tradingStatus">Ready</span>
+                </div>
             </section>
             <div class="d9-grid">
                 <section class="d9-panel"><h2>Market Readiness</h2><div id="d9CapabilityMatrix"><span class="muted-text">Waiting for pair capability data…</span></div></section>
@@ -1453,8 +1501,6 @@
         <div class="tab-pane" id="tab-trading">
 
             <div class="trading-controls">
-                <button class="big-btn start" id="startBtn">▶ Start</button>
-                <button class="big-btn stop" id="stopBtn">■ Stop</button>
                 <details class="more-menu">
                     <summary>⋮</summary>
                     <div class="dropdown">
@@ -1465,7 +1511,6 @@
                         <button id="importSettingsBtn">Import Settings</button>
                     </div>
                 </details>
-                <span class="trading-status" id="tradingStatus">Ready</span>
             </div>
 
             <div class="settings-section">
