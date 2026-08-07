@@ -1247,7 +1247,7 @@ def calculate_atr_from_candles(candles: list[dict] | list[Candle], period: int) 
 
 def normalize_granularity(value: Any) -> int:
     granularity = int(value)
-    allowed = [60, 300, 900, 3600, 21600, 86400]
+    allowed = [60, 300, 900, 1800, 3600, 14400, 21600, 86400, 604800]
     if granularity in allowed:
         return granularity
     return min(allowed, key=lambda item: abs(item - granularity))
@@ -1277,9 +1277,12 @@ def granularity_label(seconds: int | float) -> str:
         60: "1m",
         300: "5m",
         900: "15m",
+        1800: "30m",
         3600: "1h",
+        14400: "4h",
         21600: "6h",
         86400: "1d",
+        604800: "1w",
     }
     if seconds in labels:
         return labels[seconds]
@@ -8251,6 +8254,28 @@ class PaperBot:
         profit = ("target", "take profit", "take-profit", "profit")
         return any(token in reason_l for token in profit)
 
+    def ensure_live_connector(self, exchange: str):
+        """Return a live connector, rebuilding it if settings changed after startup."""
+        exchange = str(exchange or "").lower()
+        connector = self.connectors.get(exchange)
+        if connector is not None:
+            return connector
+        quote = str(self.state.settings.get("quote_currency", "USDT")).upper()
+        refreshed = create_connectors(quote)
+        connector = refreshed.get(exchange)
+        if connector is None:
+            if exchange == "kraken":
+                raise RuntimeError(
+                    "Kraken connector unavailable: check KRAKEN_API_KEY/KRAKEN_API_SECRET "
+                    "and that krakenex is installed"
+                )
+            raise RuntimeError(f"No connector available for {exchange}")
+        self.connectors[exchange] = connector
+        self.price_aggregator = PriceAggregator(self.connectors)
+        self.quote_currency = quote
+        logger.info("Rebuilt %s connector on demand for quote %s", exchange, quote)
+        return connector
+
     def live_buy(
         self,
         symbol: str,
@@ -8396,9 +8421,7 @@ class PaperBot:
         if maker_first:
             order_type = "maker"
 
-        connector = self.connectors.get(active_exchange)
-        if not connector:
-            raise RuntimeError(f"No connector available for {active_exchange}")
+        connector = self.ensure_live_connector(active_exchange)
 
         side = "SELL" if is_short else "BUY"
 
@@ -10691,34 +10714,41 @@ def fetch_kraken_candles(
     granularity: int,
     candle_count: int,
 ) -> list[Candle]:
-    interval_minutes = max(1, int(granularity / 60))
-    candle_count = max(20, min(720, int(candle_count)))
-    since = int(time.time() - (interval_minutes * 60 * candle_count))
-    kraken_symbol_map = {"BTC": "XBT", "DOGE": "XDG"}
-    pair = f"{kraken_symbol_map.get(symbol, symbol)}{quote_currency}"
-    query = urllib.parse.urlencode({
-        "pair": pair,
-        "interval": interval_minutes,
-        "since": since,
-    })
-    data = fetch_json(f"https://api.kraken.com/0/public/OHLC?{query}")
-
+    """Fetch Kraken OHLC using Kraken-native intervals."""
+    interval_map = {
+        60: 1, 300: 5, 900: 15, 1800: 30,
+        3600: 60, 14400: 240, 21600: 360,
+        86400: 1440, 604800: 10080,
+    }
+    seconds = int(granularity)
+    if seconds not in interval_map:
+        raise RuntimeError(
+            f"Kraken does not support {granularity_label(seconds)} candles. "
+            "Supported: 1m, 5m, 15m, 30m, 1h, 4h, 6h, 1d, 1w."
+        )
+    interval_minutes = interval_map[seconds]
+    candle_count=max(20,min(720,int(candle_count)))
+    since=int(time.time()-interval_minutes*60*candle_count)
+    base=str(symbol).upper().replace("/","").replace("-","").replace("_","")
+    quote=str(quote_currency).upper()
+    if base.endswith(quote):
+        base=base[:-len(quote)]
+    base={"BTC":"XBT","DOGE":"XDG"}.get(base,base)
+    pair=f"{base}{quote}"
+    query=urllib.parse.urlencode({"pair":pair,"interval":interval_minutes,"since":since})
+    data=fetch_json(f"https://api.kraken.com/0/public/OHLC?{query}")
     if data.get("error"):
         raise RuntimeError("; ".join(data["error"]))
-
-    result_key = next(key for key in data["result"].keys() if key != "last")
-    candles = [
-        Candle(
-            time=int(item[0]),
-            open=float(item[1]),
-            high=float(item[2]),
-            low=float(item[3]),
-            close=float(item[4]),
-            volume=float(item[6]),
-        )
-        for item in data["result"][result_key]
+    result=data.get("result") or {}
+    keys=[key for key in result if key!="last"]
+    if not keys:
+        raise RuntimeError(f"Kraken returned no OHLC series for {pair}")
+    candles=[
+        Candle(time=int(item[0]),open=float(item[1]),high=float(item[2]),
+               low=float(item[3]),close=float(item[4]),volume=float(item[6]))
+        for item in result[keys[0]]
     ]
-    return sorted(candles, key=lambda item: item.time)[-candle_count:]
+    return sorted(candles,key=lambda item:item.time)[-candle_count:]
 
 def fetch_binance_candles(symbol: str, quote_currency: str, granularity: int, candle_count: int) -> list[Candle]:
     if not BINANCE_AVAILABLE:
