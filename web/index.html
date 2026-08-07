@@ -616,6 +616,13 @@
             margin-left: auto;
         }
 
+        .scanner-heartbeat { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:10px; margin-top:12px; padding:10px 12px; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+        .scanner-heartbeat > div { min-width:0; }
+        .scanner-heartbeat .hb-label { display:block; font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:3px; }
+        .scanner-heartbeat strong { display:block; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        @media (max-width:900px){ .scanner-heartbeat{grid-template-columns:repeat(3,minmax(0,1fr));} }
+        @media (max-width:560px){ .scanner-heartbeat{grid-template-columns:repeat(2,minmax(0,1fr));} }
+
         /* Dashboard Trading Control Centre actions */
         .control-actions {
             display: flex;
@@ -1348,6 +1355,14 @@
                     <button class="big-btn start" id="startBtn">▶ Start Trading</button>
                     <button class="big-btn stop" id="stopBtn">■ Stop Trading</button>
                     <span class="trading-status" id="tradingStatus">Ready</span>
+                </div>
+                <div class="scanner-heartbeat" id="scannerHeartbeat" aria-live="polite">
+                    <div><span class="hb-label">Scanner</span><strong id="scannerState">Waiting…</strong></div>
+                    <div><span class="hb-label">Markets</span><strong id="scannerMarkets">—</strong></div>
+                    <div><span class="hb-label">Last scan</span><strong id="scannerLastScan">—</strong></div>
+                    <div><span class="hb-label">Last decision</span><strong id="scannerLastDecision">—</strong></div>
+                    <div><span class="hb-label">Scan time</span><strong id="scannerDuration">—</strong></div>
+                    <div><span class="hb-label">Ticks</span><strong id="scannerTicks">—</strong></div>
                 </div>
             </section>
             <div class="d9-grid">
@@ -2541,6 +2556,17 @@ Live test actions can place or close real Kraken margin orders when live trading
             else { nowText='Running — waiting for market data'; nowDetail=data.last_signal||'Auxo is active and waiting for the next scan.'; nowClass='warning'; }
             if(now){now.className='now-status '+nowClass;} if(nowMain)nowMain.textContent=nowText; if(nowSub)nowSub.textContent=nowDetail;
             const set=(id,val)=>{const e=document.getElementById(id);if(e)e.textContent=val;};
+            const sc=data.scanner||{};
+            const fmtScannerTime=(v)=>{ if(!v) return '—'; const d=new Date(v); return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}); };
+            const ageText=(v)=>{ if(!v) return '—'; const d=new Date(v); if(Number.isNaN(d.getTime())) return String(v); const sec=Math.max(0,Math.round((Date.now()-d.getTime())/1000)); return sec<2?'just now':`${sec}s ago`; };
+            const scannerHealthy=!!data.running && !!sc.last_tick_ok && !!sc.last_tick_completed_at;
+            set('scannerState', data.running ? (sc.last_tick_ok ? 'Running' : 'Error') : 'Stopped');
+            set('scannerMarkets', `${Number(sc.markets_scanned||0)}/${Number(sc.markets_requested||0)}`);
+            set('scannerLastScan', sc.last_scan_at ? `${fmtScannerTime(sc.last_scan_at)} (${ageText(sc.last_scan_at)})` : '—');
+            set('scannerLastDecision', sc.last_decision_at ? `${fmtScannerTime(sc.last_decision_at)} (${ageText(sc.last_decision_at)})` : '—');
+            set('scannerDuration', sc.scan_duration_ms != null ? `${Number(sc.scan_duration_ms)} ms` : '—');
+            set('scannerTicks', String(Number(sc.tick_count||0)));
+            const hb=document.getElementById('scannerHeartbeat'); if(hb) hb.classList.toggle('error', !scannerHealthy && !!data.running);
             set('d9Equity',d9Money(data.equity,quote)); set('d9Available',d9Money(data.cash,quote)); set('d9DayPnl',d9Money(data.day_pnl,quote));
             set('d9OpenTrades',String((data.positions||[]).length));
             const chip=(id,text,cls)=>{const e=document.getElementById(id);if(e){e.textContent=text;e.className='ready-chip '+cls;}};
