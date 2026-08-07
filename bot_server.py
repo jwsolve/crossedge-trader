@@ -481,6 +481,16 @@ class BotState:
     positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     kraken_margin_owned: dict[str, dict[str, Any]] = field(default_factory=dict)
     scan_rows: list[dict[str, Any]] = field(default_factory=list)
+    # Live scanner heartbeat/diagnostics. Independent of strategy selection.
+    scanner_tick_count: int = 0
+    scanner_last_started_at: str | None = None
+    scanner_last_scan_at: str | None = None
+    scanner_last_decision_at: str | None = None
+    scanner_last_tick_completed_at: str | None = None
+    scanner_last_tick_ok: bool = False
+    scanner_markets_requested: int = 0
+    scanner_markets_scanned: int = 0
+    scanner_scan_duration_ms: int | None = None
     trades: list[Trade] = field(default_factory=list)
     journal: list[JournalEntry] = field(default_factory=list)
     setup_records: list[SetupRecord] = field(default_factory=list)
@@ -2497,6 +2507,15 @@ class PaperBot:
                 last_price=raw.get("last_price"),
                 last_error=raw.get("last_error"),
                 last_signal=raw.get("last_signal", "Waiting for enough price data"),
+                scanner_tick_count=int(raw.get("scanner_tick_count", 0) or 0),
+                scanner_last_started_at=raw.get("scanner_last_started_at"),
+                scanner_last_scan_at=raw.get("scanner_last_scan_at"),
+                scanner_last_decision_at=raw.get("scanner_last_decision_at"),
+                scanner_last_tick_completed_at=raw.get("scanner_last_tick_completed_at"),
+                scanner_last_tick_ok=bool(raw.get("scanner_last_tick_ok", False)),
+                scanner_markets_requested=int(raw.get("scanner_markets_requested", 0) or 0),
+                scanner_markets_scanned=int(raw.get("scanner_markets_scanned", 0) or 0),
+                scanner_scan_duration_ms=(int(raw.get("scanner_scan_duration_ms")) if raw.get("scanner_scan_duration_ms") is not None else None),
                 last_action_time=float(raw.get("last_action_time", 0.0)),
                 day_start_equity=float(raw.get("day_start_equity", DEFAULT_SETTINGS["starting_cash"])),
                 day_start_date=raw.get("day_start_date", today_key()),
@@ -5375,6 +5394,17 @@ class PaperBot:
 
             return {
                 "running": self.state.running,
+                "scanner": {
+                    "tick_count": int(self.state.scanner_tick_count or 0),
+                    "last_started_at": self.state.scanner_last_started_at,
+                    "last_scan_at": self.state.scanner_last_scan_at,
+                    "last_decision_at": self.state.scanner_last_decision_at,
+                    "last_tick_completed_at": self.state.scanner_last_tick_completed_at,
+                    "last_tick_ok": bool(self.state.scanner_last_tick_ok),
+                    "markets_requested": int(self.state.scanner_markets_requested or 0),
+                    "markets_scanned": int(self.state.scanner_markets_scanned or 0),
+                    "scan_duration_ms": self.state.scanner_scan_duration_ms,
+                },
                 "live_trade_stats": live_trade_stats,
                 "settings": self._public_safe(dict(self.state.settings)),
                 "starting_cash": round(starting_cash, 2),
@@ -5544,6 +5574,15 @@ class PaperBot:
                 with self.lock:
                     self.state.last_error = str(exc)
                     self.state.last_signal = f"Paused by error: {exc}"
+                    self.state.scanner_last_tick_ok = False
+                    self.state.scanner_last_tick_completed_at = datetime.now(timezone.utc).isoformat()
+                    if self.state.scanner_last_started_at:
+                        try:
+                            started = datetime.fromisoformat(self.state.scanner_last_started_at)
+                            elapsed = max(0.0, (datetime.now(timezone.utc) - started).total_seconds() * 1000.0)
+                            self.state.scanner_scan_duration_ms = int(round(elapsed))
+                        except Exception:
+                            pass
                     self.save_state()
                 logger.info(f"Waiting {self.restart_delay}s before restarting loop...")
                 self.stop_event.wait(self.restart_delay)
@@ -5711,8 +5750,19 @@ class PaperBot:
     # ─── Tick ────────────────────────────────────────────────────────
 
     def tick(self) -> None:
+        scan_started = datetime.now(timezone.utc)
+        scan_started_iso = scan_started.isoformat()
+        scan_started_perf = time.perf_counter()
         with self.lock:
             settings = dict(self.state.settings)
+            self.state.scanner_tick_count = int(self.state.scanner_tick_count or 0) + 1
+            self.state.scanner_last_started_at = scan_started_iso
+            self.state.scanner_last_tick_ok = False
+            self.state.scanner_last_scan_at = None
+            self.state.scanner_last_tick_completed_at = None
+            self.state.scanner_markets_requested = 0
+            self.state.scanner_markets_scanned = 0
+            self.state.scanner_scan_duration_ms = None
 
         if not hasattr(self, '_sync_counter'):
             self._sync_counter = 0
@@ -5735,6 +5785,8 @@ class PaperBot:
                 logger.warning("Kraken spot position reconciliation exception: %s", exc)
 
         watchlist = parse_watchlist(settings.get("watchlist", settings["symbol"]))
+        with self.lock:
+            self.state.scanner_markets_requested = len(watchlist)
         fetched_prices: dict[str, float] = {}
         fetched_candles: dict[str, list[Candle]] = {}
         errors: list[str] = []
@@ -5757,6 +5809,9 @@ class PaperBot:
                 fetched_prices[symbol] = candles[-1].close
             except Exception as exc:
                 errors.append(f"{symbol}: {exc}")
+
+        with self.lock:
+            self.state.scanner_markets_scanned = len(fetched_prices)
 
         if not fetched_prices:
             raise RuntimeError("; ".join(errors) or "No candle data returned")
@@ -5810,8 +5865,13 @@ class PaperBot:
                     # Block all trades if market is dead and regime_block_dead is True
                     if regime == "dead" and settings.get("regime_block_dead", True):
                         self.state.last_signal = "BLOCK: Market regime is DEAD – no trades"
+                        self.state.scanner_last_decision_at = datetime.now(timezone.utc).isoformat()
                         self.journal(chart_symbol, "BLOCK", self.state.last_signal, self.state.last_price)
-                        # Skip decision and wait for next tick
+                        # Scan completed even though the regime blocked trading.
+                        self.state.scanner_last_scan_at = datetime.now(timezone.utc).isoformat()
+                        self.state.scanner_last_tick_completed_at = self.state.scanner_last_scan_at
+                        self.state.scanner_last_tick_ok = True
+                        self.state.scanner_scan_duration_ms = int(round((time.perf_counter() - scan_started_perf) * 1000))
                         self.save_state()
                         return
 
@@ -5876,6 +5936,7 @@ class PaperBot:
                     decision = self.decide_legacy(fetched_prices, watchlist, fetched_candles)
 
             self.state.last_signal = decision
+            self.state.scanner_last_decision_at = datetime.now(timezone.utc).isoformat()
 
             if decision.startswith("BUY"):
                 symbol = decision.split()[1]
@@ -5928,6 +5989,10 @@ class PaperBot:
                 if len(self.state.trades) % 50 == 0 and len(self.state.trades) > 0:
                     self.self_learning_trader.train_xgboost()
 
+            self.state.scanner_last_scan_at = datetime.now(timezone.utc).isoformat()
+            self.state.scanner_last_tick_completed_at = self.state.scanner_last_scan_at
+            self.state.scanner_last_tick_ok = True
+            self.state.scanner_scan_duration_ms = int(round((time.perf_counter() - scan_started_perf) * 1000))
             self.save_state()
 
     def protective_exit_decision(
