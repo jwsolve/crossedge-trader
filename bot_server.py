@@ -1523,6 +1523,7 @@ def position_rows(state: BotState) -> list[dict[str, Any]]:
             "partial_take_profit_done": bool(position.get("partial_take_profit_done", False)),
             "is_short": is_short,
             "exchange": "Paper",
+            "exchange_verified": False,
             "has_tp_sl": bool(stop or target),
             "entry_time": position.get("entry_time", time.time()),
         })
@@ -5552,6 +5553,158 @@ class PaperBot:
         else:
             logger.info("Bot loop stopped")
 
+    # ─── Kraken spot position reconciliation ───────────────────────────
+
+    def reconcile_kraken_spot_positions_runtime(self, force: bool = False) -> dict[str, Any]:
+        """Keep locally managed LONG positions aligned with Kraken spot balances.
+
+        Kraken is authoritative for live spot LONG exposure. A local LONG is only
+        valid while Kraken reports a corresponding base-asset balance. This closes
+        the runtime gap where a stale position could survive in state.json after
+        an exchange-side close/manual action.
+        """
+        if self.live_exchange() != "kraken" or not bool(self.state.settings.get("live_trading_enabled")):
+            return {"ok": True, "skipped": True, "stale": []}
+
+        if not force:
+            counter = int(getattr(self, "_kraken_spot_reconcile_counter", 0)) + 1
+            self._kraken_spot_reconcile_counter = counter
+            # Balance is private API data; avoid calling it on every tick.
+            if counter % 10 != 0:
+                return {"ok": True, "skipped": True, "stale": []}
+
+        with self.lock:
+            positions = {
+                str(sym).upper(): dict(pos)
+                for sym, pos in (self.state.positions or {}).items()
+                if isinstance(pos, dict) and abs(float(pos.get("quantity") or 0.0)) > 1e-12
+            }
+
+        long_positions = {
+            sym: pos for sym, pos in positions.items()
+            if not bool(pos.get("is_short"))
+        }
+        if not long_positions:
+            return {"ok": True, "checked": 0, "stale": []}
+
+        try:
+            raw = kraken_private("/0/private/Balance").get("result") or {}
+        except Exception as exc:
+            self.audit("KRAKEN_SPOT_POSITION_RECONCILE_ERROR", error=str(exc))
+            return {"ok": False, "checked": len(long_positions), "stale": [], "error": str(exc)}
+
+        aliases = {
+            "XXBT": "BTC", "XBT": "BTC", "XXDG": "DOGE", "XDG": "DOGE",
+            "XETH": "ETH", "ZUSD": "USD", "ZGBP": "GBP", "ZEUR": "EUR",
+            "ZUSDT": "USDT",
+        }
+        balances: dict[str, float] = {}
+        for asset, value in raw.items():
+            clean = aliases.get(str(asset).upper(), str(asset).upper())
+            if clean.startswith(("X", "Z")) and len(clean) == 4:
+                clean = clean[1:]
+            try:
+                balances[clean] = balances.get(clean, 0.0) + float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+        stale = []
+        adjusted = []
+        tolerance_abs = 1e-10
+
+        for symbol, pos in long_positions.items():
+            local_qty = abs(float(pos.get("quantity") or 0.0))
+            exchange_qty = max(0.0, float(balances.get(symbol, 0.0) or 0.0))
+
+            if exchange_qty <= tolerance_abs:
+                stale.append({
+                    "symbol": symbol,
+                    "local_quantity": local_qty,
+                    "exchange_quantity": 0.0,
+                    "reason": "No corresponding Kraken spot balance",
+                })
+                continue
+
+            # If Kraken has less than Auxo's claimed quantity, preserve only the
+            # quantity that demonstrably exists. This handles manual/partial closes.
+            if exchange_qty + tolerance_abs < local_qty:
+                pos["quantity"] = exchange_qty
+                adjusted.append({
+                    "symbol": symbol,
+                    "old_quantity": local_qty,
+                    "new_quantity": exchange_qty,
+                    "reason": "Kraken spot balance smaller than local position",
+                })
+
+        if stale or adjusted:
+            with self.lock:
+                for item in stale:
+                    symbol = item["symbol"]
+                    self.state.positions.pop(symbol, None)
+                for item in adjusted:
+                    symbol = item["symbol"]
+                    if symbol in self.state.positions:
+                        self.state.positions[symbol]["quantity"] = item["new_quantity"]
+
+                # Rebuild aggregate long quantity rather than leaving stale coin
+                # from the old single-position accounting model.
+                long_qty = sum(
+                    abs(float(p.get("quantity") or 0.0))
+                    for p in self.state.positions.values()
+                    if isinstance(p, dict) and not bool(p.get("is_short"))
+                )
+                short_qty = sum(
+                    abs(float(p.get("quantity") or 0.0))
+                    for p in self.state.positions.values()
+                    if isinstance(p, dict) and bool(p.get("is_short"))
+                )
+                self.state.coin = long_qty - short_qty
+
+                if self.state.active_symbol and self.state.active_symbol not in self.state.positions:
+                    self.state.active_symbol = next(iter(self.state.positions), None)
+
+                if not self.state.positions:
+                    self.state.entry_price = None
+                    self.state.highest_price = None
+                    self.state.stop_price = None
+                    self.state.target_price = None
+                    self.state.is_short = False
+
+                if stale:
+                    names = ", ".join(x["symbol"] for x in stale)
+                    self.state.last_signal = (
+                        f"Kraken reconciliation removed stale local LONG position(s): {names}"
+                    )
+                else:
+                    names = ", ".join(x["symbol"] for x in adjusted)
+                    self.state.last_signal = (
+                        f"Kraken reconciliation adjusted local LONG quantity from exchange: {names}"
+                    )
+
+                self.journal(
+                    self.state.active_symbol or "",
+                    "RECONCILE",
+                    self.state.last_signal,
+                    self.state.last_price,
+                    {"stale": stale, "adjusted": adjusted},
+                )
+                self.save_state()
+
+            self.audit(
+                "KRAKEN_SPOT_POSITION_RECONCILED",
+                stale=stale,
+                adjusted=adjusted,
+                exchange_balances={x: balances.get(x, 0.0) for x in long_positions},
+            )
+
+        return {
+            "ok": True,
+            "checked": len(long_positions),
+            "stale": stale,
+            "adjusted": adjusted,
+            "exchange_quantities": {x: balances.get(x, 0.0) for x in long_positions},
+        }
+
     # ─── Tick ────────────────────────────────────────────────────────
 
     def tick(self) -> None:
@@ -5565,6 +5718,18 @@ class PaperBot:
         if self._sync_counter % 10 == 0:
             if settings.get("asset_class") == "crypto" and settings.get("exchange") == "coinbase":
                 self.sync_live_balance_always()
+
+        if (
+            settings.get("asset_class") == "crypto"
+            and str(settings.get("exchange") or "").lower() == "kraken"
+            and bool(settings.get("live_trading_enabled"))
+        ):
+            try:
+                spot_reconcile = self.reconcile_kraken_spot_positions_runtime()
+                if not spot_reconcile.get("ok"):
+                    logger.warning("Kraken spot position reconciliation warning: %s", spot_reconcile.get("error"))
+            except Exception as exc:
+                logger.warning("Kraken spot position reconciliation exception: %s", exc)
 
         watchlist = parse_watchlist(settings.get("watchlist", settings["symbol"]))
         fetched_prices: dict[str, float] = {}
@@ -7100,6 +7265,7 @@ class PaperBot:
             self.state.positions[symbol] = {
                 "quantity": abs(filled_units),
                 "entry_price": fill_price,
+                "exchange_verified": self.live_exchange() == "kraken",
                 "highest_price": fill_price,
                 "stop_price": stop_price,
                 "target_price": target_price,
