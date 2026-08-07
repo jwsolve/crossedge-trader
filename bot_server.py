@@ -367,6 +367,10 @@ DEFAULT_SETTINGS = {
     "opening_range_minutes": 15,
     "opening_range_atr_period": 14,
     "opening_range_manipulation_threshold": 0.20,
+    # Blow-off handling is graduated: 1.40x ATR is the soft threshold,
+    # while 2.20x ATR is a hard chase-protection ceiling.
+    "opening_range_blowoff_hard_atr_threshold": 2.20,
+    "opening_range_blowoff_retracement_pct": 25.0,
     "opening_range_stop_loss_atr_multiplier": 1.5,
     "opening_range_take_profit_atr_multiplier": 2.5,
     "oanda_account_type": "standard",
@@ -4598,7 +4602,8 @@ class PaperBot:
             "order_expiry_seconds", "order_retry_limit", "max_oanda_open_trades","max_coinbase_open_trades",
             "news_guard_before_minutes", "news_guard_after_minutes",
             "opening_range_minutes", "opening_range_atr_period",
-            "opening_range_manipulation_threshold", "opening_range_stop_loss_atr_multiplier",
+            "opening_range_manipulation_threshold", "opening_range_blowoff_hard_atr_threshold",
+            "opening_range_blowoff_retracement_pct", "opening_range_stop_loss_atr_multiplier",
             "opening_range_take_profit_atr_multiplier", "max_drawdown_pct",
             "telegram_drawdown_alert_pct", "ema_short", "ema_long",
             "signal_confidence_threshold", "min_signals_required", "learning_history_size",
@@ -4761,6 +4766,8 @@ class PaperBot:
             self.state.settings["opening_range_minutes"] = max(1, int(self.state.settings["opening_range_minutes"]))
             self.state.settings["opening_range_atr_period"] = max(2, int(self.state.settings["opening_range_atr_period"]))
             self.state.settings["opening_range_manipulation_threshold"] = max(0.01, min(1.0, float(self.state.settings["opening_range_manipulation_threshold"])))
+            self.state.settings["opening_range_blowoff_hard_atr_threshold"] = max(1.5, float(self.state.settings.get("opening_range_blowoff_hard_atr_threshold", 2.20)))
+            self.state.settings["opening_range_blowoff_retracement_pct"] = max(5.0, min(80.0, float(self.state.settings.get("opening_range_blowoff_retracement_pct", 25.0))))
             self.state.settings["opening_range_stop_loss_atr_multiplier"] = max(0.1, float(self.state.settings["opening_range_stop_loss_atr_multiplier"]))
             self.state.settings["opening_range_take_profit_atr_multiplier"] = max(0.1, float(self.state.settings["opening_range_take_profit_atr_multiplier"]))
             self.state.settings["max_drawdown_pct"] = max(1.0, float(self.state.settings.get("max_drawdown_pct", 20.0)))
@@ -6441,13 +6448,82 @@ class PaperBot:
         if analysis["blowoff"]:
             direction = "bullish" if analysis.get("is_green") else "bearish"
             blocked_side = "LONG" if analysis.get("is_green") else "SHORT"
+            ratio = float(analysis.get("range_ratio", 0.0))
+            hard_threshold = float(analysis.get("blowoff_hard_threshold", 2.20))
+            retracement_pct = float(analysis.get("blowoff_retracement_pct", 25.0))
+            pullback_confirmed = bool(analysis.get("blowoff_pullback_confirmed"))
+
+            # Extreme impulses remain blocked. We do not want to chase a 2.2x+
+            # ATR candle regardless of the later price action.
+            if ratio >= hard_threshold:
+                return {
+                    "signal": "WAIT",
+                    "reason": (
+                        f"{direction.title()} extreme blow-off: {ratio:.2%} of ATR "
+                        f"(hard threshold {hard_threshold:.0%}); avoiding {blocked_side} chase"
+                    ),
+                    "analysis": analysis,
+                }
+
+            # Between the soft and hard thresholds, allow the setup after a
+            # genuine retracement/reassessment and a fresh break of the opening
+            # range trigger. This is the key change: large candles are cautious,
+            # not automatically disqualified.
+            if not pullback_confirmed:
+                return {
+                    "signal": "WAIT",
+                    "reason": (
+                        f"{direction.title()} blow-off: {ratio:.2%} of ATR "
+                        f"(soft threshold {analysis['blowoff_threshold']:.0%}); "
+                        f"waiting for {retracement_pct:.0f}% pullback/reassessment"
+                    ),
+                    "analysis": analysis,
+                }
+
+            if analysis.get("is_green"):
+                if current_price > trigger:
+                    entry_price = trigger
+                    return {
+                        "signal": "BUY",
+                        "reason": (
+                            f"Bullish blow-off pullback confirmed: {ratio:.2%} of ATR; "
+                            f"re-break above {trigger:.6f}"
+                        ),
+                        "entry": entry_price,
+                        "stop": entry_price - (atr * stop_loss_mult),
+                        "target": entry_price + (atr * take_profit_mult),
+                        "analysis": analysis,
+                        "is_short": False,
+                    }
+                return {
+                    "signal": "WAIT",
+                    "reason": f"Bullish blow-off pullback confirmed; waiting for break above {trigger:.6f}",
+                    "analysis": analysis,
+                }
+
+            if not self.state.settings.get("allow_short_selling", False):
+                return {
+                    "signal": "HOLD",
+                    "reason": "Short selling disabled",
+                    "analysis": analysis,
+                }
+            if current_price < trigger:
+                entry_price = trigger
+                return {
+                    "signal": "SELL",
+                    "reason": (
+                        f"Bearish blow-off pullback confirmed: {ratio:.2%} of ATR; "
+                        f"re-break below {trigger:.6f}"
+                    ),
+                    "entry": entry_price,
+                    "stop": entry_price + (atr * stop_loss_mult),
+                    "target": entry_price - (atr * take_profit_mult),
+                    "analysis": analysis,
+                    "is_short": True,
+                }
             return {
                 "signal": "WAIT",
-                "reason": (
-                    f"{direction.title()} blow-off candle: {analysis['range_ratio']:.2%} of ATR "
-                    f"(threshold {analysis['blowoff_threshold']:.0%}); avoiding {blocked_side} chase, "
-                    "waiting for pullback/reassessment"
-                ),
+                "reason": f"Bearish blow-off pullback confirmed; waiting for break below {trigger:.6f}",
                 "analysis": analysis,
             }
 
@@ -6484,12 +6560,39 @@ class PaperBot:
             atr = candle_range
 
         manipulation_threshold = float(self.state.settings.get("opening_range_manipulation_threshold", 0.20))
+        # Keep 1.40x ATR as the soft blow-off threshold. Extremely large
+        # opening candles remain a hard no-chase condition.
         blowoff_threshold = float(self.state.settings.get("opening_range_blowoff_atr_threshold", 1.40))
         if blowoff_threshold <= manipulation_threshold:
             blowoff_threshold = max(1.40, manipulation_threshold + 0.10)
+        hard_blowoff_threshold = max(
+            blowoff_threshold + 0.10,
+            float(self.state.settings.get("opening_range_blowoff_hard_atr_threshold", 2.20)),
+        )
+        retracement_pct = max(5.0, min(80.0, float(self.state.settings.get("opening_range_blowoff_retracement_pct", 25.0))))
         range_ratio = candle_range / atr if atr > 0 else 0
         manipulation = range_ratio < manipulation_threshold
         blowoff = range_ratio >= blowoff_threshold
+
+        # A soft blow-off becomes tradable only after price has retraced a
+        # meaningful portion of the opening candle and then re-breaks its
+        # trigger. This avoids chasing the initial impulse without making the
+        # strategy so strict that every large move becomes an all-day HOLD.
+        subsequent_candles = []
+        first_index = None
+        for idx, candle in enumerate(candles):
+            if candle is first_candle or candle.time == first_candle.time:
+                first_index = idx
+                break
+        if first_index is not None:
+            subsequent_candles = candles[first_index + 1:]
+        retrace_fraction = retracement_pct / 100.0
+        if is_green:
+            pullback_level = first_candle.high - (candle_range * retrace_fraction)
+            pullback_confirmed = any(c.low <= pullback_level for c in subsequent_candles)
+        else:
+            pullback_level = first_candle.low + (candle_range * retrace_fraction)
+            pullback_confirmed = any(c.high >= pullback_level for c in subsequent_candles)
 
         return {
             "bias": "bullish" if is_green else "bearish",
@@ -6502,6 +6605,10 @@ class PaperBot:
             "range_ratio": round(range_ratio, 4),
             "manipulation_threshold": manipulation_threshold,
             "blowoff_threshold": blowoff_threshold,
+            "blowoff_hard_threshold": hard_blowoff_threshold,
+            "blowoff_retracement_pct": retracement_pct,
+            "blowoff_pullback_level": pullback_level,
+            "blowoff_pullback_confirmed": pullback_confirmed,
             "manipulation": manipulation,
             "blowoff": blowoff,
             "is_green": is_green,
@@ -12025,6 +12132,8 @@ def result_settings_summary(symbol: str, settings: dict[str, Any]) -> dict[str, 
             "opening_range_minutes": int(settings["opening_range_minutes"]),
             "opening_range_atr_period": int(settings["opening_range_atr_period"]),
             "opening_range_manipulation_threshold": float(settings["opening_range_manipulation_threshold"]),
+            "opening_range_blowoff_hard_atr_threshold": float(settings.get("opening_range_blowoff_hard_atr_threshold", 2.20)),
+            "opening_range_blowoff_retracement_pct": float(settings.get("opening_range_blowoff_retracement_pct", 25.0)),
             "opening_range_stop_loss_atr_multiplier": float(settings["opening_range_stop_loss_atr_multiplier"]),
             "opening_range_take_profit_atr_multiplier": float(settings["opening_range_take_profit_atr_multiplier"]),
         })
