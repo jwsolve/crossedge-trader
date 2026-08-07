@@ -7412,12 +7412,16 @@ class PaperBot:
 
     def should_live_trade(self) -> bool:
         settings = self.state.settings
-        return (
-            bool(settings.get("live_trading_enabled"))
-            and settings.get("asset_class", "crypto") == "crypto"
-            and settings.get("exchange") == "coinbase"
-            and coinbase_live_is_armed()
-        )
+        if not bool(settings.get("live_trading_enabled")):
+            return False
+        if settings.get("asset_class", "crypto") != "crypto":
+            return False
+        exchange = self.live_exchange()
+        if exchange == "coinbase":
+            return coinbase_live_is_armed()
+        if exchange == "kraken":
+            return kraken_live_is_armed()
+        return False
 
     def recover_kraken_stale_closed_short(self, symbol: str, position: dict[str,Any], exchange_flat_verified: bool=False) -> dict[str,Any]:
         """Clear stale Auxo SHORT state only when Kraken proves the cover filled.
@@ -8202,6 +8206,14 @@ class PaperBot:
             "risk_pnl": realised + unrealised,
         }
 
+    def live_trading_armed(self) -> bool:
+        """Return whether the selected crypto exchange is actually armed for live orders."""
+        if self.live_exchange() == "kraken":
+            return kraken_live_is_armed()
+        if self.live_exchange() == "coinbase":
+            return coinbase_live_is_armed()
+        return False
+
     def live_exchange(self) -> str:
         # `exchange` is the user's selected trading venue. `active_exchange` is a
         # legacy/UI field whose default is Coinbase and can otherwise mask Kraken.
@@ -8259,7 +8271,7 @@ class PaperBot:
         max_daily_spend = float(settings.get("max_daily_live_spend_quote", 250.0))
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
-        active_exchange=str(settings.get("active_exchange") or settings.get("exchange") or "coinbase").lower()
+        active_exchange=self.live_exchange()
         effective_quote=kraken_margin_quote(settings) if (is_short and active_exchange=="kraken") else str(settings["quote_currency"])
         pair_diag=None
         if is_short:
@@ -8377,7 +8389,7 @@ class PaperBot:
         product_id = f"{symbol}-{settings['quote_currency']}"
         order_type = str(settings.get("live_order_type", "market"))
         limit_offset = float(settings.get("live_limit_offset_pct", 0.05)) / 100
-        active_exchange = str(settings.get("active_exchange") or settings.get("exchange") or "coinbase").lower()
+        active_exchange = self.live_exchange()
         maker_first = ((active_exchange=="coinbase" and settings.get("coinbase_maker_first_enabled",True)) or
                        (active_exchange=="kraken" and settings.get("kraken_maker_first_enabled",True)))
         maker_offset = max(0.0,float(settings.get("kraken_maker_offset_pct" if active_exchange=="kraken" else "coinbase_maker_offset_pct",0.0)))/100
@@ -8449,8 +8461,10 @@ class PaperBot:
                             base_size=base_size,
                         )
                 elif active_exchange == "kraken":
+                    if not kraken_live_is_armed():
+                        raise RuntimeError("Kraken live trading is not armed")
                     px=float(guard.get("ask") if side=="BUY" else guard.get("bid") or price)
-                    base_size=self.live_round_size(quote_size/px,symbol,str(settings["quote_currency"]))
+                    base_size=self.live_round_size(quote_size/px,symbol,effective_quote)
                     order=kraken_order(symbol,effective_quote,side,"market",base_size,leverage=margin_leverage)
                 else:
                     # Preserve the existing connector path for other exchanges.
@@ -8597,6 +8611,8 @@ class PaperBot:
                 return
 
         configured_order_type = str(settings.get("live_order_type", "market"))
+        if active_exchange == "kraken" and not kraken_live_is_armed():
+            raise RuntimeError("Kraken live trading is not armed")
         exit_side = "SELL" if not is_short else "BUY"
         margin_leverage=float(settings.get("kraken_margin_leverage",2)) if (active_exchange=="kraken" and is_short) else None
         maker_first_exit = self.coinbase_maker_exit_allowed(reason) and (
