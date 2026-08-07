@@ -3843,10 +3843,41 @@ Live test actions can place or close real Kraken margin orders when live trading
             els.dashboardStrategy.textContent = `Strategy: ${String(strategy).replaceAll('_',' ')}`;
         }
 
+
+        // ---- Chart symbol selector ----
+        function populateChartSymbolSelect(settings, data = {}) {
+            const select = els.chartSymbolSelect;
+            if (!select) return;
+
+            const raw = settings?.watchlist ?? data.watchlist ?? '';
+            const symbols = String(raw).split(/[,\n]+/)
+                .map(s => s.trim().toUpperCase())
+                .filter(Boolean);
+
+            const active = String(data.active_symbol || settings?.symbol || selectedChartSymbol || '').trim().toUpperCase();
+            if (active && !symbols.includes(active)) symbols.unshift(active);
+            if (!symbols.length) return;
+
+            const current = String(selectedChartSymbol || select.value || active || symbols[0]).toUpperCase();
+            const signature = symbols.join('|');
+            if (select.dataset.symbols === signature && select.options.length) {
+                if (symbols.includes(current)) select.value = current;
+                return;
+            }
+
+            select.innerHTML = symbols.map(sym => `<option value=\"${escapeHtml(sym)}\">${escapeHtml(sym)}</option>`).join('');
+            select.dataset.symbols = signature;
+
+            selectedChartSymbol = symbols.includes(current) ? current : symbols[0];
+            select.value = selectedChartSymbol;
+            localStorage.setItem('cryptobot-chart-symbol', selectedChartSymbol);
+        }
+
         // ---- main render ----
         function render(data) {
             lastStatusData = data;
             const settings = data.settings || {};
+            populateChartSymbolSelect(settings, data);
             displayCurrency = settings.quote_currency || 'GBP';
             displayAssetClass = settings.asset_class || 'crypto';
             chartMode = settings.chart_mode || chartMode;
