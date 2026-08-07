@@ -4363,32 +4363,49 @@ Live test actions can place or close real Kraken margin orders when live trading
         });
         els.stopBtn.addEventListener('click', async () => { await post('/api/stop');
             refresh(); });
-        els.resetBtn.addEventListener('click', async () => {
-            if (!confirm('Reset paper balance and trades?')) return;
-            await post('/api/reset');
-            refresh();
-        });
+        // Optional controls removed from the Trading three-dot submenu.
+        // Keep their handlers only when those controls are actually present.
+        if (els.resetBtn) {
+            els.resetBtn.addEventListener('click', async () => {
+                if (!confirm('Reset paper balance and trades?')) return;
+                await post('/api/reset');
+                refresh();
+            });
+        }
 
-        // OANDA actions
-        els.syncOandaBalanceBtn.addEventListener('click', async () => {
-            els.syncOandaBalanceBtn.disabled = true;
-            els.tradingStatus.textContent = 'Syncing OANDA…';
-            try {
-                const r = await post('/api/sync-oanda-balance');
-                if (!r.ok) throw new Error(r.error || 'Sync failed');
-                await refresh();
-                els.tradingStatus.textContent = `Synced OANDA: ${money(r.available_cash)}`;
-            } catch (e) { els.tradingStatus.textContent = e.message; } finally { els.syncOandaBalanceBtn.disabled = false; }
-        });
-        els.oandaAuthCheckBtn.addEventListener('click', async () => {
-            els.oandaAuthCheckBtn.disabled = true;
-            els.tradingStatus.textContent = 'Checking OANDA…';
-            try {
-                const r = await post('/api/oanda-auth-check');
-                if (!r.ok) throw new Error(r.error || 'Auth check failed');
-                els.tradingStatus.textContent = `OANDA OK: ${r.account_id || ''} ${money(r.balance)}`;
-            } catch (e) { els.tradingStatus.textContent = e.message; } finally { els.oandaAuthCheckBtn.disabled = false; }
-        });
+        // OANDA actions are optional on the crypto/Kraken dashboard.
+        if (els.syncOandaBalanceBtn) {
+            els.syncOandaBalanceBtn.addEventListener('click', async () => {
+                els.syncOandaBalanceBtn.disabled = true;
+                els.tradingStatus.textContent = 'Syncing OANDA…';
+                try {
+                    const r = await post('/api/sync-oanda-balance');
+                    if (!r.ok) throw new Error(r.error || 'Sync failed');
+                    await refresh();
+                    els.tradingStatus.textContent = `Synced OANDA: ${money(r.available_cash)}`;
+                } catch (e) {
+                    els.tradingStatus.textContent = e.message;
+                } finally {
+                    els.syncOandaBalanceBtn.disabled = false;
+                }
+            });
+        }
+
+        if (els.oandaAuthCheckBtn) {
+            els.oandaAuthCheckBtn.addEventListener('click', async () => {
+                els.oandaAuthCheckBtn.disabled = true;
+                els.tradingStatus.textContent = 'Checking OANDA…';
+                try {
+                    const r = await post('/api/oanda-auth-check');
+                    if (!r.ok) throw new Error(r.error || 'Auth check failed');
+                    els.tradingStatus.textContent = `OANDA OK: ${r.account_id || ''} ${money(r.balance)}`;
+                } catch (e) {
+                    els.tradingStatus.textContent = e.message;
+                } finally {
+                    els.oandaAuthCheckBtn.disabled = false;
+                }
+            });
+        }
 
         // ─── Settings form submission ───
         els.settingsForm.addEventListener('submit', async (e) => {
