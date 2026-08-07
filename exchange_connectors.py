@@ -94,8 +94,8 @@ class CoinbaseConnector:
 # ─── Binance connector ─────────────────────────────────────────────
 class BinanceConnector:
     def __init__(self, api_key, api_secret, quote_currency="GBP"):
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_key = api_key or ""
+        self.api_secret = api_secret or ""
         self.quote = quote_currency.upper()
         if BINANCE_AVAILABLE:
             self.client = BinanceClient(api_key, api_secret)
@@ -149,8 +149,11 @@ class KrakenConnector:
         self.api_secret = api_secret
         self.quote = quote_currency.upper()
         if KRAKEN_AVAILABLE:
-            self.client = krakenex.API()
-            self.client.load_key(api_key, api_secret)
+            # krakenex.load_key() expects a FILE PATH, not (api_key, api_secret).
+            # Passing the credentials to load_key() makes krakenex try to open
+            # the API key string as a filename during Auxo startup.
+            # krakenex.API accepts key/secret directly.
+            self.client = krakenex.API(key=api_key, secret=api_secret)
         else:
             self.client = None
 
