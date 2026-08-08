@@ -7933,16 +7933,28 @@ class PaperBot:
             # notably XBT for BTC and XDG for DOGE). Strategy state deliberately
             # uses user-facing symbols (BTC/DOGE). Never compare them by substring.
             def _kraken_canonical_pair(raw_pair: str) -> tuple[str, str]:
-                p=str(raw_pair or "").upper().replace("/","").replace("-","").replace("_","")
-                # Strip Kraken's legacy asset prefixes where applicable.
+                # Kraken has returned several pair formats over time, e.g.
+                # XBTUSDT, XBT/USDT, XXBTZUSD and (on some account/API
+                # surfaces) XBT/USDT:USDT.  Normalise all of them before
+                # comparing with Auxo's user-facing BTC/DOGE/etc symbols.
+                p=str(raw_pair or "").upper().strip()
+                p=p.replace("/", "").replace("-", "").replace("_", "")
+                p=p.replace(":", "")
+                p=p.replace(".", "")
                 p=p.replace("XXBT","XBT").replace("XXDG","XDG")
-                quote_candidates=("USDT","USDC","GBP","USD","EUR","BTC","XBT")
-                q=next((x for x in quote_candidates if p.endswith(x)), "")
-                b=p[:-len(q)] if q else p
+                p=p.replace("XETH","ETH")
                 aliases={"XBT":"BTC","XXBT":"BTC","XDG":"DOGE","XXDG":"DOGE",
                          "XETH":"ETH","ZUSD":"USD","ZGBP":"GBP","ZEUR":"EUR",
-                         "ZUSDT":"USDT"}
-                return aliases.get(b,b), aliases.get(q,q)
+                         "ZUSDT":"USDT","XXBTZUSD":"BTCUSD"}
+                # Prefer the configured margin quote so a symbol such as
+                # XBTUSDT is split deterministically rather than accidentally
+                # treating USDT as part of the base.
+                quote_order=(_margin_quote,"USDT","USDC","GBP","USD","EUR","XBT","BTC")
+                q=next((x for x in quote_order if x and p.endswith(x)), "")
+                b=p[:-len(q)] if q else p
+                b=aliases.get(b,b)
+                q=aliases.get(q,q)
+                return b,q
 
             def _kraken_position_matches_symbol(kp: dict[str,Any], symbol: str) -> bool:
                 base,_quote=_kraken_canonical_pair(str(kp.get("pair") or ""))
@@ -7978,6 +7990,7 @@ class PaperBot:
             for lp in local:
                 if not any(
                     max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
+                    and str(k.get("type") or "").upper() == "SELL"
                     and _kraken_position_matches_symbol(k,lp["symbol"])
                     for k in result["positions"]
                 ):
