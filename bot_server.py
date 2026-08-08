@@ -10341,18 +10341,117 @@ def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,lev
     return {"order_id":str(ids[0]),"raw":data}
 
 def kraken_reconcile_order(oid):
-    result=kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}
-    row=result.get(oid)
-    if not isinstance(row,dict) or not row:
-        raise RuntimeError(f"Kraken QueryOrders could not verify order {oid}")
-    status=str(row.get("status") or "UNKNOWN").upper()
-    size=float(row.get("vol_exec") or 0); requested=float(row.get("vol") or 0)
-    cost=float(row.get("cost") or 0); reported=float(row.get("price") or 0)
-    avg=(cost/size) if (size>0 and cost>0) else reported
-    return {"order_id":oid,"status":status,"filled_size":size,"requested_size":requested,
-            "filled_value":cost,"total_fee":float(row.get("fee") or 0),"average_price":avg,
-            "reported_price":reported,"fills_count":len(row.get("trades") or []),
-            "exchange_confirmed_complete":bool(status=="CLOSED" and size>0),"order":row}
+    """Resolve a just-submitted Kraken order without treating a transient
+    QueryOrders omission as a failed order.
+
+    Kraken can briefly return no row immediately after AddOrder. Also, an
+    order may have moved from the open-order set into trade history between
+    two calls. QueryOrders is preferred, but OpenOrders and TradesHistory are
+    authoritative fallbacks before Auxo declares verification failure.
+    """
+    oid = str(oid or "").strip()
+    if not oid:
+        raise RuntimeError("Kraken order id is empty")
+
+    # 1) QueryOrders: retry briefly because AddOrder -> QueryOrders is not
+    # guaranteed to be immediately consistent.
+    last_error = None
+    for delay in (0.0, 0.25, 0.75, 1.5):
+        if delay:
+            time.sleep(delay)
+        try:
+            result = kraken_private(
+                "/0/private/QueryOrders",
+                {"txid": oid, "trades": "true"},
+            ).get("result") or {}
+            row = result.get(oid)
+            if isinstance(row, dict) and row:
+                return _kraken_reconcile_row(oid, row)
+        except Exception as exc:
+            last_error = exc
+            if "rate limit" in str(exc).lower():
+                time.sleep(1.5)
+
+    # 2) OpenOrders: the order may be live but not yet visible to QueryOrders.
+    try:
+        result = kraken_private(
+            "/0/private/OpenOrders",
+            {"trades": "true"},
+        ).get("result") or {}
+        orders = result.get("open") if isinstance(result, dict) else {}
+        row = orders.get(oid) if isinstance(orders, dict) else None
+        if isinstance(row, dict) and row:
+            return _kraken_reconcile_row(oid, row, forced_status="OPEN")
+    except Exception as exc:
+        last_error = exc
+
+    # 3) TradesHistory: if the order filled/closed quickly, QueryOrders can
+    # miss the transition while TradesHistory already has the authoritative
+    # fill. Aggregate all fills belonging to this order.
+    try:
+        result = kraken_private(
+            "/0/private/TradesHistory",
+            {"type": "all", "trades": "true"},
+        ).get("result") or {}
+        fills = result.get("trades") if isinstance(result, dict) else {}
+        if isinstance(fills, dict):
+            matched = [
+                f for f in fills.values()
+                if isinstance(f, dict)
+                and str(f.get("ordertxid") or "").strip() == oid
+            ]
+            if matched:
+                qty = sum(float(f.get("vol") or 0.0) for f in matched)
+                cost = sum(
+                    float(f.get("vol") or 0.0) * float(f.get("price") or 0.0)
+                    for f in matched
+                )
+                fee = sum(max(0.0, float(f.get("fee") or 0.0)) for f in matched)
+                avg = (cost / qty) if qty > 0 and cost > 0 else 0.0
+                side = str(matched[0].get("type") or "").lower()
+                pair = str(matched[0].get("pair") or "")
+                synthetic = {
+                    "status": "closed",
+                    "vol": qty,
+                    "vol_exec": qty,
+                    "cost": cost,
+                    "fee": fee,
+                    "price": avg,
+                    "trades": [
+                        str(k) for k, f in fills.items()
+                        if isinstance(f, dict)
+                        and str(f.get("ordertxid") or "").strip() == oid
+                    ],
+                    "descr": {"type": side, "pair": pair},
+                }
+                return _kraken_reconcile_row(oid, synthetic)
+    except Exception as exc:
+        last_error = exc
+
+    detail = f": {last_error}" if last_error else ""
+    raise RuntimeError(f"Kraken order {oid} could not be verified via QueryOrders/OpenOrders/TradesHistory{detail}")
+
+
+def _kraken_reconcile_row(oid, row, forced_status=None):
+    status = str(forced_status or row.get("status") or "UNKNOWN").upper()
+    size = float(row.get("vol_exec") or 0)
+    requested = float(row.get("vol") or 0)
+    cost = float(row.get("cost") or 0)
+    reported = float(row.get("price") or 0)
+    avg = (cost / size) if (size > 0 and cost > 0) else reported
+    return {
+        "order_id": oid,
+        "status": status,
+        "filled_size": size,
+        "requested_size": requested,
+        "filled_value": cost,
+        "total_fee": float(row.get("fee") or 0),
+        "average_price": avg,
+        "reported_price": reported,
+        "fills_count": len(row.get("trades") or []),
+        "exchange_confirmed_complete": bool(status == "CLOSED" and size > 0),
+        "order": row,
+    }
 
 def kraken_cancel_order(oid):
     if not kraken_live_is_armed():
