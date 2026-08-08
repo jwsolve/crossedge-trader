@@ -1554,6 +1554,11 @@
                                     <option value="self_learning">Self-Learning (AI)</option>
                                 </select>
                             </label>
+                            <label class="strategy-switch-control" style="display:flex;align-items:center;gap:10px;grid-column:1 / -1;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel-hover);">
+                                <span style="flex:1;"><strong>Allow automatic strategy switching</strong><small style="display:block;margin-top:4px;color:var(--muted);">When off, Auxo keeps the strategy you selected and will not switch it automatically.</small></span>
+                                <input type="hidden" name="strategy_switching_enabled" value="false">
+                                <input id="strategySwitchingEnabled" name="strategy_switching_enabled" type="checkbox" value="true" checked style="width:20px;height:20px;flex:0 0 auto;">
+                            </label>
                             <label>Allow Short Selling 🔻 <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
 <label>Kraken Live Margin Shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled (paper only)</option><option value="true">Enabled</option></select></label>
 <label>Kraken Margin Leverage <input type="number" name="kraken_margin_leverage" min="2" max="5" step="1" value="2"></label>
@@ -1684,12 +1689,6 @@
                 <option value="false">Disabled</option>
                 <option value="true">Enabled</option>
             </select>
-        </label>
-        <label class="strategy-switch-control">
-            <span>Allow automatic strategy switching</span>
-            <input type="hidden" name="strategy_switching_enabled" value="false">
-            <input name="strategy_switching_enabled" type="checkbox" value="true" checked style="width:auto;">
-            <small style="display:block; margin-top:4px; color:var(--muted);">When off, Auxo keeps the strategy you selected and will not switch it automatically.</small>
         </label>
         <label>Auto-Select Best Strategy
             <select name="strategy_auto_select">
@@ -3628,11 +3627,7 @@ Live test actions can place or close real Kraken margin orders when live trading
             Object.entries(preset).forEach(([key, value]) => {
                 const field = els.settingsForm.elements[key];
                 if (field) {
-                    if (field.type === 'checkbox') {
-                        field.checked = Boolean(value);
-                    } else {
-                        field.value = String(value);
-                    }
+                    field.value = String(value);
                 }
             });
 
@@ -3812,14 +3807,18 @@ Live test actions can place or close real Kraken margin orders when live trading
             const settings = data.settings || {};
             Object.entries(settings).forEach(([k, v]) => {
                 const field = els.settingsForm.elements[k];
-                if (field) {
-                    if (field.type === 'checkbox') {
-                        field.checked = Boolean(v);
-                    } else {
-                        field.value = String(v);
-                    }
+                if (!field) return;
+                if (field.type === 'checkbox') {
+                    field.checked = (v === true || String(v).toLowerCase() === 'true' || String(v) === '1' || String(v).toLowerCase() === 'on');
+                } else {
+                    field.value = String(v);
                 }
             });
+            // Default the master switch ON for older saved settings that predate it.
+            const strategySwitch = els.settingsForm.elements['strategy_switching_enabled'];
+            if (strategySwitch && strategySwitch.type === 'checkbox' && !Object.prototype.hasOwnProperty.call(settings, 'strategy_switching_enabled')) {
+                strategySwitch.checked = true;
+            }
             updateEMASettingsVisibility();
             settingsLoaded = true;
             els.settingsStatus.textContent = 'Settings loaded.';
@@ -4500,7 +4499,8 @@ Live test actions can place or close real Kraken margin orders when live trading
 
             const booleanFields = [
                 'websocket_enabled', 'oanda_demo_trading_enabled', 'live_trading_enabled',
-                'telegram_enabled', 'news_guard_enabled', 'self_learning_enabled'
+                'telegram_enabled', 'news_guard_enabled', 'self_learning_enabled',
+                'strategy_switching_enabled'
             ];
             booleanFields.forEach(field => {
                 if (field in payload) {
