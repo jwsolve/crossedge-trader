@@ -10219,8 +10219,25 @@ def kraken_margin_capability_matrix(settings:dict[str,Any], symbols:list[str]|No
 
 def kraken_round_price(v,s,q): return round(float(v),kraken_pair_info(s,q)["price_decimals"])
 def kraken_round_size(v,s,q):
-    d=kraken_pair_info(s,q)["lot_decimals"]; f=10**d
-    return math.floor(float(v)*f)/f
+    info = kraken_pair_info(s,q)
+    d = int(info["lot_decimals"])
+    f = 10 ** d
+    raw = float(v or 0.0)
+
+    # Kraken rejects quantities such as 4.99995 when the pair minimum is
+    # exactly 5.0. The old floor-to-lot-step logic could turn an otherwise
+    # valid order into a quantity just below the exchange minimum. Round
+    # normally, then promote tiny floating-point/price-conversion shortfalls
+    # to the exact minimum. Do not promote genuinely undersized orders.
+    rounded = math.floor(raw * f + 1e-10) / f
+    minimum = float(info.get("ordermin") or 0.0)
+
+    lot_step = 1.0 / f
+    if minimum > 0 and rounded < minimum:
+        if raw >= (minimum - lot_step - 1e-10):
+            rounded = minimum
+
+    return rounded
 
 def kraken_available_balance(currency:str)->float:
     raw=(kraken_private("/0/private/Balance").get("result") or {})
@@ -10298,9 +10315,21 @@ def kraken_margin_snapshot(ledger_limit:int=100, quote_asset:str="USD")->dict[st
 def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
     if not kraken_live_is_armed():
         raise RuntimeError("Kraken order placement locked: LIVE_TRADING_CONFIRM is not armed")
-    info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)
-    if size<=0 or (info["ordermin"] and size<info["ordermin"]):
-        raise RuntimeError(f"Kraken size {size} below minimum {info['ordermin']}")
+
+    info = kraken_pair_info(symbol, quote)
+    raw_size = float(base_size or 0.0)
+    size = kraken_round_size(raw_size, symbol, quote)
+    minimum = float(info.get("ordermin") or 0.0)
+    lot_step = 1.0 / (10 ** int(info["lot_decimals"]))
+
+    # Protect against the final floating-point boundary: if the requested
+    # amount was genuinely within one lot step of Kraken's minimum, submit
+    # exactly the minimum rather than 4.99995 vs 5.0.
+    if minimum > 0 and size < minimum and raw_size >= minimum - lot_step - 1e-10:
+        size = minimum
+
+    if size<=0 or (minimum and size<minimum):
+        raise RuntimeError(f"Kraken size {size} below minimum {minimum}")
     p={"pair":info["pair"],"type":side.lower(),"ordertype":kind.lower(),
        "volume":decimal_text(size,info["lot_decimals"])}
     if kind=="limit":
