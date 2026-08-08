@@ -2498,7 +2498,10 @@ class PaperBot:
             return state
 
         try:
-            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+            raw_text = self.state_file.read_text(encoding="utf-8")
+            raw = json.loads(raw_text)
+            if not isinstance(raw, dict):
+                raise ValueError("state JSON root is not an object")
             state = BotState(
                 running=False,
                 settings={**DEFAULT_SETTINGS, **raw.get("settings", {})},
@@ -2705,11 +2708,95 @@ class PaperBot:
             logger.info(f"State loaded: cash={state.cash}, active_symbol={state.active_symbol}, coin={state.coin}")
             return state
         except (OSError, ValueError, TypeError) as e:
-            logger.error(f"Failed to load state: {e} – starting fresh")
+            logger.error(f"Failed to load state: {e}")
+
+            # A process killed during write can leave a truncated JSON state
+            # file. Never overwrite that only copy. Try the last known-good
+            # backup first.
+            backup_candidates = [
+                self.state_file.with_suffix(self.state_file.suffix + ".bak"),
+                self.state_file.with_suffix(self.state_file.suffix + ".prev"),
+            ]
+            for backup in backup_candidates:
+                try:
+                    if not backup.exists():
+                        continue
+                    backup_raw = json.loads(backup.read_text(encoding="utf-8"))
+                    if not isinstance(backup_raw, dict):
+                        continue
+                    logger.warning(f"Recovered state from backup: {backup}")
+                    # Reuse the normal loader by temporarily reading the valid
+                    # backup payload without touching the corrupt primary.
+                    raw = backup_raw
+                    state = BotState(
+                        running=False,
+                        settings={**DEFAULT_SETTINGS, **raw.get("settings", {})},
+                        cash=float(raw.get("cash", DEFAULT_SETTINGS["starting_cash"])),
+                        coin=float(raw.get("coin", 0.0)),
+                        active_symbol=raw.get("active_symbol"),
+                        entry_price=raw.get("entry_price"),
+                        highest_price=raw.get("highest_price"),
+                        active_stop_order_id=raw.get("active_stop_order_id"),
+                        partial_take_profit_done=bool(raw.get("partial_take_profit_done", False)),
+                        last_price=raw.get("last_price"),
+                        last_error=None,
+                        last_signal=raw.get("last_signal", "Waiting for enough price data"),
+                        scanner_tick_count=int(raw.get("scanner_tick_count", 0) or 0),
+                        scanner_last_started_at=raw.get("scanner_last_started_at"),
+                        scanner_last_scan_at=raw.get("scanner_last_scan_at"),
+                        scanner_last_decision_at=raw.get("scanner_last_decision_at"),
+                        scanner_last_tick_completed_at=raw.get("scanner_last_tick_completed_at"),
+                        scanner_last_tick_ok=bool(raw.get("scanner_last_tick_ok", False)),
+                        scanner_markets_requested=int(raw.get("scanner_markets_requested", 0) or 0),
+                        scanner_markets_scanned=int(raw.get("scanner_markets_scanned", 0) or 0),
+                        scanner_scan_duration_ms=(int(raw.get("scanner_scan_duration_ms")) if raw.get("scanner_scan_duration_ms") is not None else None),
+                        last_action_time=float(raw.get("last_action_time", 0.0)),
+                        day_start_equity=float(raw.get("day_start_equity", DEFAULT_SETTINGS["starting_cash"])),
+                        day_start_date=raw.get("day_start_date", today_key()),
+                        live_day_start_date=raw.get("live_day_start_date", today_key()),
+                        live_daily_spend=float(raw.get("live_daily_spend", 0.0)),
+                        prices=[float(item) for item in raw.get("prices", [])][-300:],
+                        price_history={
+                            str(symbol): [float(item) for item in prices][-300:]
+                            for symbol, prices in raw.get("price_history", {}).items()
+                        },
+                        candle_history={
+                            str(symbol): [
+                                {
+                                    "time": int(item.get("time", 0)),
+                                    "open": float(item.get("open", 0.0)),
+                                    "high": float(item.get("high", 0.0)),
+                                    "low": float(item.get("low", 0.0)),
+                                    "close": float(item.get("close", 0.0)),
+                                    "volume": float(item.get("volume", 0.0)),
+                                }
+                                for item in candles
+                            ][-300:]
+                            for symbol, candles in raw.get("candle_history", {}).items()
+                            if isinstance(candles, list)
+                        },
+                        positions=raw.get("positions", {}),
+                        scan_rows=raw.get("scan_rows", []),
+                        trades=[],
+                        journal=[],
+                        setup_records=[],
+                        open_orders=[],
+                        kraken_margin_owned=raw.get("kraken_margin_owned", {}),
+                        peak_equity=float(raw.get("peak_equity", raw.get("cash", DEFAULT_SETTINGS["starting_cash"]))),
+                        db_initialized=bool(raw.get("db_initialized", False)),
+                    )
+                    state.db_initialized = bool(raw.get("db_initialized", False))
+                    return state
+                except Exception as backup_exc:
+                    logger.warning(f"Could not recover backup {backup}: {backup_exc}")
+
+            # No valid backup exists. Start fresh, but do NOT overwrite the
+            # corrupt primary state here. The database remains authoritative
+            # for persisted trades.
             state = BotState()
             state.day_start_date = today_key()
             state.peak_equity = float(state.settings["starting_cash"])
-            state.last_error = "State file could not be read; started fresh."
+            state.last_error = "State file could not be read; preserved original and started fresh."
             state.signal_history = {}
             state.db_initialized = False
             return state
@@ -2717,7 +2804,35 @@ class PaperBot:
     def save_state(self) -> None:
         with self.lock:
             data = asdict(self.state)
-        self.state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        payload = json.dumps(data, indent=2)
+
+        # Atomic state writes: write a complete temporary file, fsync it,
+        # retain the previous valid state as .bak, then replace the primary.
+        tmp = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
+        bak = self.state_file.with_suffix(self.state_file.suffix + ".bak")
+        try:
+            if self.state_file.exists():
+                try:
+                    # Only promote the existing file to .bak if it is valid
+                    # JSON; never back up a known-corrupt file.
+                    json.loads(self.state_file.read_text(encoding="utf-8"))
+                    tmp_bak = bak.with_suffix(bak.suffix + ".tmp")
+                    tmp_bak.write_text(self.state_file.read_text(encoding="utf-8"), encoding="utf-8")
+                    tmp_bak.replace(bak)
+                except Exception:
+                    pass
+
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp.replace(self.state_file)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
         logger.debug("State saved")
 
     def backfill_tpsl_from_positions(self) -> None:
@@ -13132,12 +13247,48 @@ def live_market_guard(
     if spread_pct > max_spread_pct:
         return {"ok": False, "reason": f"spread {spread_pct:.3f}% > limit {max_spread_pct:.3f}%", "spread_pct": round(spread_pct,4), "bid": bid, "ask": ask}
 
-    candles = fetch_candles(exchange=exchange, symbol=symbol, quote_currency=quote_currency, granularity=granularity, candle_count=min(50, max(20, candle_count)))
-    quote_volume = sum(candle.close * candle.volume for candle in candles)
-    if quote_volume < min_quote_volume:
-        return {"ok": False, "reason": f"recent quote volume {quote_currency} {quote_volume:.2f} < minimum {quote_currency} {min_quote_volume:.2f}", "spread_pct": round(spread_pct,4), "quote_volume": round(quote_volume,2), "bid": bid, "ask": ask}
+    # Coinbase candles contain usable volume directly. Kraken's OHLC
+    # endpoint can return sparse/limited history and is not the right source
+    # for this liquidity gate. For Kraken use the public ticker's 24h base
+    # volume multiplied by the 24h VWAP, giving an actual quote-currency
+    # turnover figure (USDT for BTC/USDT, etc.).
+    if exchange == "kraken":
+        quote_volume = float(ticker.get("quote_volume_24h") or 0.0)
+        volume_source = "Kraken 24h ticker turnover"
+    else:
+        candles = fetch_candles(
+            exchange=exchange,
+            symbol=symbol,
+            quote_currency=quote_currency,
+            granularity=granularity,
+            candle_count=min(50, max(20, candle_count)),
+        )
+        quote_volume = sum(candle.close * candle.volume for candle in candles)
+        volume_source = "recent candles"
 
-    return {"ok": True, "reason": "market liquid enough", "spread_pct": round(spread_pct,4), "quote_volume": round(quote_volume,2), "bid": bid, "ask": ask}
+    if quote_volume < min_quote_volume:
+        return {
+            "ok": False,
+            "reason": (
+                f"recent quote volume {quote_currency} {quote_volume:.2f} "
+                f"< minimum {quote_currency} {min_quote_volume:.2f}"
+            ),
+            "spread_pct": round(spread_pct, 4),
+            "quote_volume": round(quote_volume, 2),
+            "volume_source": volume_source,
+            "bid": bid,
+            "ask": ask,
+        }
+
+    return {
+        "ok": True,
+        "reason": "market liquid enough",
+        "spread_pct": round(spread_pct, 4),
+        "quote_volume": round(quote_volume, 2),
+        "volume_source": volume_source,
+        "bid": bid,
+        "ask": ask,
+    }
 
 def fetch_coinbase_ticker(symbol: str, quote_currency: str) -> dict[str, Any]:
     product = f"{symbol.upper()}-{quote_currency.upper()}"
@@ -13160,7 +13311,26 @@ def fetch_kraken_ticker(symbol: str, quote_currency: str) -> dict[str, Any]:
     ask = float((row.get("a") or [0])[0] or 0.0)
     bid = float((row.get("b") or [0])[0] or 0.0)
     last = float((row.get("c") or [0])[0] or 0.0)
-    return {"bid": bid, "ask": ask, "price": last, "pair": pair}
+
+    # Kraken ticker fields:
+    #   v[0] = today's volume, v[1] = last 24h volume (base units)
+    #   p[0] = today's VWAP, p[1] = last 24h VWAP
+    # Use the 24h values to calculate quote-currency turnover.
+    volumes = row.get("v") or []
+    vwaps = row.get("p") or []
+    volume_24h = float(volumes[1] if len(volumes) > 1 else (volumes[0] if volumes else 0.0))
+    vwap_24h = float(vwaps[1] if len(vwaps) > 1 else (vwaps[0] if vwaps else last))
+    quote_volume_24h = volume_24h * (vwap_24h or last)
+
+    return {
+        "bid": bid,
+        "ask": ask,
+        "price": last,
+        "pair": pair,
+        "base_volume_24h": volume_24h,
+        "vwap_24h": vwap_24h,
+        "quote_volume_24h": quote_volume_24h,
+    }
 
 def coinbase_products_for_quote(quote_currency: str = "GBP") -> dict[str, Any]:
     quote_currency = quote_currency.upper()
