@@ -8624,11 +8624,44 @@ class PaperBot:
                 if active_entry.status in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}:
                     active_entry = None
             except Exception as exc:
-                logger.warning(
-                    "Existing %s entry %s for %s could not yet be reconciled; "
-                    "not placing a duplicate: %s",
-                    desired_side, active_entry.order_id, symbol, exc,
-                )
+                # Do not let a locally-tracked order become a permanent
+                # "pending" phantom. Kraken may briefly be inconsistent after
+                # AddOrder, so keep a short grace period; after that, if
+                # QueryOrders/OpenOrders/TradesHistory still cannot find it,
+                # treat the local order as cancelled/unknown and allow a fresh
+                # signal rather than blocking the market forever.
+                age = max(0.0, time.time() - float(active_entry.created_at_epoch or 0.0))
+                grace = float(self.state.settings.get("order_reconcile_grace_seconds", 45.0))
+                if age >= grace:
+                    active_entry.status = "CANCELLED"
+                    active_entry.updated_at = now_iso()
+                    active_entry.details["reconcile_note"] = (
+                        "Kraken order no longer verifiable after grace period; "
+                        "removed from local pending-entry guard"
+                    )
+                    self.audit(
+                        "ORDER_LOCAL_CLEANUP",
+                        order_id=active_entry.order_id,
+                        symbol=symbol,
+                        error=str(exc),
+                        age_seconds=round(age, 1),
+                    )
+                    self.journal(
+                        symbol,
+                        "INFO",
+                        f"LIVE {('SHORT' if is_short else 'BUY')} stale pending order "
+                        f"{active_entry.order_id} cleared; Kraken could not verify it",
+                        price,
+                        {"order_id": active_entry.order_id, "age_seconds": round(age, 1)},
+                    )
+                    self.save_state()
+                    active_entry = None
+                else:
+                    logger.warning(
+                        "Existing %s entry %s for %s could not yet be reconciled; "
+                        "not placing a duplicate: %s",
+                        desired_side, active_entry.order_id, symbol, exc,
+                    )
 
         if active_entry is not None:
             with self.lock:
