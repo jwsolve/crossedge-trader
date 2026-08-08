@@ -2456,16 +2456,23 @@ Live test actions can place or close real Kraken margin orders when live trading
             try {
                 const r = await getJson('/api/auth/me');
                 if (!r.authenticated) { window.location.href = 'login.html'; return; }
-                const isOwner = Number(r.user?.id || 0) === 1;
-                currentEntitlements=r.entitlements || null;
-                applyEntitlementUI();
-                if (els.adminTabBtn) els.adminTabBtn.style.display = isOwner ? '' : 'none';
-                if (els.accountSelector) {
-                    const rawAccounts = Array.isArray(r.accounts)
-                        ? r.accounts
-                        : (Array.isArray(r.user?.accounts) ? r.user.accounts : []);
 
-                    const enabledAccounts = rawAccounts.filter(a => {
+                const userId = Number(r.user?.id || 0);
+                const isOwner = userId === 1 ||
+                    r.user?.is_owner === true ||
+                    r.user?.role === 'owner' ||
+                    r.user?.role === 'admin';
+
+                currentEntitlements = r.entitlements || null;
+                applyEntitlementUI();
+
+                if (els.adminTabBtn) {
+                    els.adminTabBtn.style.display = isOwner ? '' : 'none';
+                }
+
+                if (els.accountSelector) {
+                    const accounts = Array.isArray(r.accounts) ? r.accounts : [];
+                    const enabledAccounts = accounts.filter(a => {
                         const v = a?.enabled;
                         return v === undefined || v === null ||
                             v === true || v === 1 ||
@@ -2474,19 +2481,24 @@ Live test actions can place or close real Kraken margin orders when live trading
                     });
 
                     els.accountSelector.innerHTML = enabledAccounts.map(a =>
-                        `<option value="${a.id}" ${Number(a.id)===Number(r.default_account_id)?'selected':''}>${adminEscape(a.account_label || a.label || ('Account #' + a.id))} · ${adminEscape(a.exchange || '')}</option>`
+                        `<option value="${a.id}" ${Number(a.id)===Number(r.default_account_id)?'selected':''}>${adminEscape(a.account_label || ('Account #' + a.id))} · ${adminEscape(a.exchange || '')}</option>`
                     ).join('');
 
                     if (!enabledAccounts.length) {
-                        els.accountSelector.innerHTML = '<option value="">No trading accounts returned</option>';
+                        els.accountSelector.innerHTML =
+                            '<option value="">No trading accounts returned</option>';
                         els.accountSelector.disabled = true;
                         els.accountSelector.style.display = '';
                     } else {
                         els.accountSelector.disabled = enabledAccounts.length < 2;
-                        els.accountSelector.style.display = enabledAccounts.length > 1 ? '' : 'none';
+                        els.accountSelector.style.display =
+                            enabledAccounts.length > 1 ? '' : 'none';
                     }
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.error('Failed to load authenticated account context:', e);
+                // Do not hide the Users link because account loading failed.
+            }
         }
 
         function adminEscape(v) {
@@ -3834,12 +3846,10 @@ Live test actions can place or close real Kraken margin orders when live trading
                 const field = els.settingsForm.elements[k];
                 if (!field) return;
 
-                // A checkbox with a hidden false input is exposed as a
-                // RadioNodeList by form.elements[name]. Find the actual
-                // checkbox so saved true/false values restore correctly.
                 const checkbox = els.settingsForm.querySelector(
                     `input[type="checkbox"][name="${CSS.escape(k)}"]`
                 );
+
                 if (checkbox) {
                     checkbox.checked = (
                         v === true || v === 1 ||
