@@ -2975,6 +2975,9 @@ class PaperBot:
                 return
 
             self.stop_event.clear()
+            self.shutdown_requested = False
+            self.websocket_stop_event.clear()
+            self.news_guard_stop_event.clear()
             self.state.running = True
 
             if self.should_oanda_demo_trade():
@@ -5163,6 +5166,16 @@ class PaperBot:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            # state.running survives in state.json, but the worker thread does
+            # not survive a process restart. Only report Running when the
+            # actual run-loop thread is alive.
+            actual_running = bool(
+                self.thread and self.thread.is_alive()
+                and not self.stop_event.is_set()
+                and not self.shutdown_requested
+            )
+            if self.state.running != actual_running:
+                self.state.running = actual_running
             chart_symbol = self.state.active_symbol or self.state.settings["symbol"]
             chart_prices = self.state.price_history.get(chart_symbol, self.state.prices)
             chart_candles = self.state.candle_history.get(chart_symbol, [])
@@ -13964,30 +13977,68 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/auth/select-account":
             p=parse_json_body(self)
             try:
-                aid=int(p.get("account_id"))
-                if not db.account_belongs_to_user(int(self.current_user_id),aid):
+                uid = int(self.current_user_id)
+                aid = int(p.get("account_id"))
+
+                if not db.account_belongs_to_user(uid, aid):
                     raise PermissionError("Account does not belong to authenticated user or is disabled")
-                account=db.get_trading_account(aid)
+
+                account = db.get_trading_account(aid)
                 if not self.engine_manager.has_engine(aid):
                     raise RuntimeError("Trading engine is not provisioned for this account")
 
-                # Keep the selected engine's exchange identity authoritative.
-                # A previous profile could have left a stale Coinbase exchange in
-                # its settings even though the selected trading account is Kraken.
-                # Synchronise both exchange fields immediately when the account is
-                # selected so status, balance sync and live order routing all use the
-                # selected account's actual venue.
-                engine=self.engine_manager.get_engine(aid)
-                exchange=str(account.get("exchange") or "").lower()
-                if engine is not None and exchange:
-                    with engine.lock:
-                        engine.state.settings["exchange"]=exchange
-                        engine.state.settings["active_exchange"]=exchange
-                        engine.save_state()
+                previous = self._selected_account()
+                previous_id = int(previous["id"]) if previous else None
+                previous_engine = (
+                    self.engine_manager.get_engine(previous_id)
+                    if previous_id is not None else None
+                )
+                was_running = bool(
+                    previous_engine and previous_engine.thread and
+                    previous_engine.thread.is_alive() and
+                    not previous_engine.stop_event.is_set() and
+                    not previous_engine.shutdown_requested
+                )
 
-                db.write_audit(int(self.current_user_id),aid,"select_account",{"label":account.get("account_label"),"exchange":exchange})
-                self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._set_account_cookie(aid); self.end_headers()
-                self.wfile.write(json.dumps({"ok":True,"account":account,"selected_exchange":exchange}).encode()); return
+                new_engine = self.engine_manager.get_engine(aid)
+
+                # If the dashboard was actively running, switch the worker to
+                # the newly selected profile as well. This prevents a selected
+                # Kraken profile from showing an old/stale scan state while its
+                # actual worker is still the Coinbase profile.
+                if previous_id != aid and was_running and previous_engine is not None:
+                    previous_engine.stop()
+
+                exchange = str(account.get("exchange") or "").lower()
+                if new_engine is not None:
+                    with new_engine.lock:
+                        if exchange:
+                            new_engine.state.settings["exchange"] = exchange
+                            new_engine.state.settings["active_exchange"] = exchange
+                        new_engine.state.settings["account_id"] = aid
+                        new_engine.state.running = False
+                        new_engine.save_state()
+
+                if previous_id != aid and was_running and new_engine is not None:
+                    new_engine.start()
+
+                db.write_audit(
+                    uid, aid, "select_account",
+                    {"label": account.get("account_label"), "exchange": exchange}
+                )
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type","application/json")
+                self._set_account_cookie(aid)
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "ok": True,
+                    "account": account,
+                    "selected_exchange": exchange,
+                    "running": bool(
+                        new_engine and new_engine.thread and new_engine.thread.is_alive()
+                    ),
+                }).encode())
+                return
             except Exception as exc:
                 self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST); return
 
@@ -14500,6 +14551,11 @@ def main() -> None:
             engine.state.settings["active_exchange"] = engine.state.settings["exchange"]
             engine.state.settings["live_trading_enabled"] = False
             engine.state.settings["oanda_demo_trading_enabled"] = False
+            # Worker state is process-local; a restarted server must not claim
+            # this engine is running until its thread has actually been started.
+            engine.state.running = False
+            engine.shutdown_requested = False
+            engine.stop_event.clear()
             engine.state.db_initialized = True
             engine.save_state()
         engine_manager.register_engine(aid, engine)
