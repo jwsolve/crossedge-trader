@@ -8594,6 +8594,57 @@ class PaperBot:
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
         active_exchange=self.live_exchange()
+
+        # Never stack live entry orders for the same market/side while an
+        # earlier entry is still pending. Kraken maker/limit orders reserve
+        # quote balance, so repeatedly submitting the same signal every scan
+        # can consume the available balance and eventually produce
+        # EOrder:Insufficient funds even though the account itself has funds.
+        desired_side = "SELL" if is_short else "BUY"
+        with self.lock:
+            active_entry = next(
+                (
+                    o for o in self.state.open_orders
+                    if str(getattr(o, "symbol", "")).upper() == str(symbol).upper()
+                    and str(getattr(o, "role", "")).upper() == "ENTRY"
+                    and str(getattr(o, "side", "")).upper() == desired_side
+                    and str(getattr(o, "status", "")).upper()
+                        not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}
+                ),
+                None,
+            )
+
+        if active_entry is not None:
+            # Try to reconcile the existing order once before deciding to wait.
+            # If Kraken still cannot confirm it, conservatively leave it alone;
+            # placing another order could reserve another chunk of balance.
+            try:
+                fill = self.live_reconcile(active_entry.order_id)
+                self.apply_reconciled_order(active_entry, fill)
+                if active_entry.status in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}:
+                    active_entry = None
+            except Exception as exc:
+                logger.warning(
+                    "Existing %s entry %s for %s could not yet be reconciled; "
+                    "not placing a duplicate: %s",
+                    desired_side, active_entry.order_id, symbol, exc,
+                )
+
+        if active_entry is not None:
+            with self.lock:
+                self.state.last_signal = (
+                    f"LIVE {('SHORT' if is_short else 'BUY')} waiting: "
+                    f"entry {active_entry.order_id} already pending for {symbol}"
+                )
+                self.journal(
+                    symbol,
+                    "INFO",
+                    self.state.last_signal,
+                    price,
+                    {"order_id": active_entry.order_id, "status": active_entry.status},
+                )
+            return
+
         effective_quote=kraken_margin_quote(settings) if (is_short and active_exchange=="kraken") else str(settings["quote_currency"])
         pair_diag=None
         if is_short:
