@@ -8601,6 +8601,118 @@ class PaperBot:
         # can consume the available balance and eventually produce
         # EOrder:Insufficient funds even though the account itself has funds.
         desired_side = "SELL" if is_short else "BUY"
+
+        # Kraken is the source of truth for live order state. Before allowing
+        # any new entry, inspect the exchange itself. This prevents a local
+        # Auxo state record from either creating duplicate orders or blocking
+        # a trade after the exchange order was cancelled.
+        if active_exchange == "kraken":
+            try:
+                open_result = kraken_private(
+                    "/0/private/OpenOrders",
+                    {"trades": "true"},
+                ).get("result") or {}
+                open_rows = open_result.get("open") if isinstance(open_result, dict) else {}
+                exchange_open = None
+                wanted_symbol = str(symbol).upper()
+                if isinstance(open_rows, dict):
+                    for oid, row in open_rows.items():
+                        if not isinstance(row, dict):
+                            continue
+                        descr = row.get("descr") or {}
+                        pair = str(descr.get("pair") or "").upper()
+                        order_side = str(descr.get("type") or "").upper()
+                        pair_match = wanted_symbol in pair or (
+                            wanted_symbol == "BTC" and "XBT" in pair
+                        )
+                        if pair_match and order_side == desired_side:
+                            exchange_open = (str(oid), row)
+                            break
+
+                with self.lock:
+                    local_entries = [
+                        o for o in self.state.open_orders
+                        if str(getattr(o, "symbol", "")).upper() == wanted_symbol
+                        and str(getattr(o, "role", "")).upper() == "ENTRY"
+                        and str(getattr(o, "side", "")).upper() == desired_side
+                        and str(getattr(o, "status", "")).upper()
+                            not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED",
+                                    "CLOSED", "CANCELED", "REJECTED", "DENIED"}
+                    ]
+
+                    if exchange_open is None:
+                        # Kraken has no matching live order: clear every local
+                        # phantom immediately. Do not wait 45 seconds.
+                        for stale in local_entries:
+                            stale.status = "CANCELLED"
+                            stale.updated_at = now_iso()
+                            stale.details["reconcile_note"] = (
+                                "Kraken OpenOrders contains no matching live entry"
+                            )
+                            self.audit(
+                                "ORDER_LOCAL_CLEANUP",
+                                order_id=stale.order_id,
+                                symbol=symbol,
+                                reason="not_present_in_kraken_open_orders",
+                            )
+                        if local_entries:
+                            self.save_state()
+                        active_entry = None
+                    else:
+                        # Kraken really has an open order. If Auxo lost it,
+                        # adopt the exchange order so the next scan cannot
+                        # submit a duplicate.
+                        exchange_oid, exchange_row = exchange_open
+                        active_entry = next(
+                            (o for o in local_entries
+                             if str(getattr(o, "order_id", "")) == exchange_oid),
+                            None,
+                        )
+                        if active_entry is None:
+                            quote = str(settings.get("quote_currency") or "USDT").upper()
+                            active_entry = self.track_order(
+                                exchange_oid,
+                                symbol,
+                                f"{symbol}-{quote}",
+                                desired_side,
+                                "ENTRY",
+                                str(exchange_row.get("ordertype") or "unknown"),
+                                price=float(exchange_row.get("price") or 0.0),
+                                base_size=float(exchange_row.get("vol") or 0.0),
+                                reason="Adopted existing Kraken open order",
+                                details={"adopted_from_exchange": True, "is_short": is_short},
+                            )
+                            self.save_state()
+
+                        self.state.last_signal = (
+                            f"LIVE {('SHORT' if is_short else 'BUY')} waiting: "
+                            f"Kraken order {exchange_oid} is already open for {symbol}"
+                        )
+                        self.journal(
+                            symbol,
+                            "INFO",
+                            self.state.last_signal,
+                            price,
+                            {"order_id": exchange_oid, "status": "OPEN"},
+                        )
+                        return
+
+            except Exception as exc:
+                # If the exchange state cannot be checked, fail closed: do
+                # not submit another live order based only on local state.
+                logger.warning(
+                    "Kraken OpenOrders pre-entry check failed for %s; "
+                    "blocking new live entry: %s",
+                    symbol, exc,
+                )
+                with self.lock:
+                    self.state.last_signal = (
+                        f"LIVE {'SHORT' if is_short else 'BUY'} blocked: "
+                        f"Kraken open-order check failed"
+                    )
+                    self.journal(symbol, "ERROR", self.state.last_signal, price, {"error": str(exc)})
+                return
+
         with self.lock:
             active_entry = next(
                 (
@@ -8683,7 +8795,7 @@ class PaperBot:
                         desired_side, active_entry.order_id, symbol, exc,
                     )
 
-        if active_entry is not None and str(active_entry.status or "").upper() in {terminal}:
+        if active_entry is not None and str(active_entry.status or "").upper() in {"FILLED", "CANCELLED", "FAILED", "EXPIRED", "CLOSED", "CANCELED", "REJECTED", "DENIED"}:
             active_entry.updated_at = now_iso()
             self.save_state()
             active_entry = None
