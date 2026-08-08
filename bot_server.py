@@ -8609,7 +8609,7 @@ class PaperBot:
                     and str(getattr(o, "role", "")).upper() == "ENTRY"
                     and str(getattr(o, "side", "")).upper() == desired_side
                     and str(getattr(o, "status", "")).upper()
-                        not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}
+                        not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED", "CLOSED", "CANCELED", "REJECTED", "DENIED"}
                 ),
                 None,
             )
@@ -8621,7 +8621,9 @@ class PaperBot:
             try:
                 fill = self.live_reconcile(active_entry.order_id)
                 self.apply_reconciled_order(active_entry, fill)
-                if active_entry.status in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}:
+                if str(active_entry.status or "").upper() in {"FILLED", "CANCELLED", "FAILED", "EXPIRED", "CLOSED", "CANCELED", "REJECTED", "DENIED"}:
+                    active_entry.updated_at = now_iso()
+                    self.save_state()
                     active_entry = None
             except Exception as exc:
                 # Do not let a locally-tracked order become a permanent
@@ -8680,6 +8682,11 @@ class PaperBot:
                         "not placing a duplicate: %s",
                         desired_side, active_entry.order_id, symbol, exc,
                     )
+
+        if active_entry is not None and str(active_entry.status or "").upper() in {terminal}:
+            active_entry.updated_at = now_iso()
+            self.save_state()
+            active_entry = None
 
         if active_entry is not None:
             with self.lock:
