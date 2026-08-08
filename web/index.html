@@ -1685,6 +1685,12 @@
                 <option value="true">Enabled</option>
             </select>
         </label>
+        <label class="strategy-switch-control">
+            <span>Allow automatic strategy switching</span>
+            <input type="hidden" name="strategy_switching_enabled" value="false">
+            <input name="strategy_switching_enabled" type="checkbox" value="true" checked style="width:auto;">
+            <small style="display:block; margin-top:4px; color:var(--muted);">When off, Auxo keeps the strategy you selected and will not switch it automatically.</small>
+        </label>
         <label>Auto-Select Best Strategy
             <select name="strategy_auto_select">
                 <option value="false">Disabled</option>
@@ -3622,7 +3628,11 @@ Live test actions can place or close real Kraken margin orders when live trading
             Object.entries(preset).forEach(([key, value]) => {
                 const field = els.settingsForm.elements[key];
                 if (field) {
-                    field.value = String(value);
+                    if (field.type === 'checkbox') {
+                        field.checked = Boolean(value);
+                    } else {
+                        field.value = String(value);
+                    }
                 }
             });
 
@@ -3803,7 +3813,11 @@ Live test actions can place or close real Kraken margin orders when live trading
             Object.entries(settings).forEach(([k, v]) => {
                 const field = els.settingsForm.elements[k];
                 if (field) {
-                    field.value = String(v);
+                    if (field.type === 'checkbox') {
+                        field.checked = Boolean(v);
+                    } else {
+                        field.value = String(v);
+                    }
                 }
             });
             updateEMASettingsVisibility();
