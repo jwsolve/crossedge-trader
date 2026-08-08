@@ -7956,9 +7956,30 @@ class PaperBot:
                 q=aliases.get(q,q)
                 return b,q
 
+            def _canonical_local_symbol(symbol: str) -> str:
+                # Local state normally stores BTC/DOGE, but older state files
+                # can contain BTC/USDT, BTC-USDT or Kraken's XBT form.
+                raw=str(symbol or "").upper().strip()
+                base,_quote=_kraken_canonical_pair(raw)
+                return base or {"XBT":"BTC","XDG":"DOGE"}.get(raw,raw)
+
             def _kraken_position_matches_symbol(kp: dict[str,Any], symbol: str) -> bool:
                 base,_quote=_kraken_canonical_pair(str(kp.get("pair") or ""))
-                return base == str(symbol or "").upper()
+                local_base=_canonical_local_symbol(symbol)
+                return bool(base) and base == local_base
+
+            def _is_kraken_short_position(kp: dict[str,Any]) -> bool:
+                # OpenPositions normally exposes `type=SELL`. Some Kraken
+                # response variants/accounts expose the direction under
+                # `side`, so accept either representation.
+                direction=str(kp.get("type") or kp.get("side") or "").upper()
+                if direction in {"SELL","SHORT"}:
+                    return True
+                # Last-resort fallback for a position explicitly marked short
+                # in the raw Kraken payload.
+                raw=kp.get("raw") if isinstance(kp.get("raw"),dict) else {}
+                raw_direction=str(raw.get("type") or raw.get("side") or raw.get("position_side") or "").upper()
+                return raw_direction in {"SELL","SHORT"}
 
             for kp in result["positions"]:
                 pair=str(kp.get("pair") or "").upper()
@@ -7990,7 +8011,7 @@ class PaperBot:
             for lp in local:
                 if not any(
                     max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
-                    and str(k.get("type") or "").upper() == "SELL"
+                    and _is_kraken_short_position(k)
                     and _kraken_position_matches_symbol(k,lp["symbol"])
                     for k in result["positions"]
                 ):
@@ -8028,6 +8049,20 @@ class PaperBot:
                             {"symbol":sym,"reason":recovery.get("reason")}
                         )
                     result["mismatches"].append(f"Auxo SHORT {sym} missing at Kraken")
+                    result.setdefault("diagnostics", []).append({
+                        "local_symbol": sym,
+                        "canonical_local_symbol": _canonical_local_symbol(sym),
+                        "kraken_positions_seen": [
+                            {
+                                "pair": k.get("pair"),
+                                "type": k.get("type"),
+                                "side": k.get("side"),
+                                "volume": k.get("volume"),
+                                "volume_closed": k.get("volume_closed"),
+                            }
+                            for k in result.get("positions", [])
+                        ],
+                    })
             if result.get("recovered_closed_positions"):
                 # Kraken was already flat; refresh the authoritative account figures
                 # after local stale state has been cleared. Do not recursively call
@@ -8044,7 +8079,7 @@ class PaperBot:
                 except Exception as exc:
                     result.setdefault("warnings",[]).append(f"Post-recovery Kraken refresh failed: {exc}")
 
-            shorts=[p for p in result["positions"] if str(p.get("type") or "").upper()=="SELL"
+            shorts=[p for p in result["positions"] if _is_kraken_short_position(p)
                     and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
             max_shorts=max(1,int(float(self.state.settings.get("kraken_margin_max_open_shorts",1))))
             max_exp=max(0.0,float(self.state.settings.get("kraken_margin_max_exposure_quote",25)))
