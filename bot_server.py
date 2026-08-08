@@ -367,10 +367,6 @@ DEFAULT_SETTINGS = {
     "opening_range_minutes": 15,
     "opening_range_atr_period": 14,
     "opening_range_manipulation_threshold": 0.20,
-    # Graduated blow-off protection: soft threshold remains 1.40x ATR;
-    # extreme impulses at 2.20x ATR remain a hard no-chase condition.
-    "opening_range_blowoff_hard_atr_threshold": 2.20,
-    "opening_range_blowoff_retracement_pct": 25.0,
     "opening_range_stop_loss_atr_multiplier": 1.5,
     "opening_range_take_profit_atr_multiplier": 2.5,
     "oanda_account_type": "standard",
@@ -407,8 +403,6 @@ DEFAULT_SETTINGS = {
     "strategy_population_size": 50,
     "strategy_confidence_threshold": 0.5,
     "strategy_auto_select": False,
-    # Master switch: when False, Auxo keeps the manually selected strategy.
-    "strategy_switching_enabled": True,
     "strategy_evolution_frequency": 24,
     "strategy_max_active": 5,
     # ─── ATR-based exits ──────────────────────────────────────────────
@@ -433,6 +427,7 @@ DEFAULT_SETTINGS = {
     "ma_exit_period": 20,
     "active_exchange": "coinbase",
     "regime_adaptation_enabled": True,
+    "strategy_switching_enabled": True,
     "min_regime_confidence": 0.5,
     "regime_force_strategy": True,       # If True, override strategy based on regime
     "regime_block_dead": True,           # If True, block all trades when regime is "dead"
@@ -2498,10 +2493,7 @@ class PaperBot:
             return state
 
         try:
-            raw_text = self.state_file.read_text(encoding="utf-8")
-            raw = json.loads(raw_text)
-            if not isinstance(raw, dict):
-                raise ValueError("state JSON root is not an object")
+            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
             state = BotState(
                 running=False,
                 settings={**DEFAULT_SETTINGS, **raw.get("settings", {})},
@@ -2708,95 +2700,11 @@ class PaperBot:
             logger.info(f"State loaded: cash={state.cash}, active_symbol={state.active_symbol}, coin={state.coin}")
             return state
         except (OSError, ValueError, TypeError) as e:
-            logger.error(f"Failed to load state: {e}")
-
-            # A process killed during write can leave a truncated JSON state
-            # file. Never overwrite that only copy. Try the last known-good
-            # backup first.
-            backup_candidates = [
-                self.state_file.with_suffix(self.state_file.suffix + ".bak"),
-                self.state_file.with_suffix(self.state_file.suffix + ".prev"),
-            ]
-            for backup in backup_candidates:
-                try:
-                    if not backup.exists():
-                        continue
-                    backup_raw = json.loads(backup.read_text(encoding="utf-8"))
-                    if not isinstance(backup_raw, dict):
-                        continue
-                    logger.warning(f"Recovered state from backup: {backup}")
-                    # Reuse the normal loader by temporarily reading the valid
-                    # backup payload without touching the corrupt primary.
-                    raw = backup_raw
-                    state = BotState(
-                        running=False,
-                        settings={**DEFAULT_SETTINGS, **raw.get("settings", {})},
-                        cash=float(raw.get("cash", DEFAULT_SETTINGS["starting_cash"])),
-                        coin=float(raw.get("coin", 0.0)),
-                        active_symbol=raw.get("active_symbol"),
-                        entry_price=raw.get("entry_price"),
-                        highest_price=raw.get("highest_price"),
-                        active_stop_order_id=raw.get("active_stop_order_id"),
-                        partial_take_profit_done=bool(raw.get("partial_take_profit_done", False)),
-                        last_price=raw.get("last_price"),
-                        last_error=None,
-                        last_signal=raw.get("last_signal", "Waiting for enough price data"),
-                        scanner_tick_count=int(raw.get("scanner_tick_count", 0) or 0),
-                        scanner_last_started_at=raw.get("scanner_last_started_at"),
-                        scanner_last_scan_at=raw.get("scanner_last_scan_at"),
-                        scanner_last_decision_at=raw.get("scanner_last_decision_at"),
-                        scanner_last_tick_completed_at=raw.get("scanner_last_tick_completed_at"),
-                        scanner_last_tick_ok=bool(raw.get("scanner_last_tick_ok", False)),
-                        scanner_markets_requested=int(raw.get("scanner_markets_requested", 0) or 0),
-                        scanner_markets_scanned=int(raw.get("scanner_markets_scanned", 0) or 0),
-                        scanner_scan_duration_ms=(int(raw.get("scanner_scan_duration_ms")) if raw.get("scanner_scan_duration_ms") is not None else None),
-                        last_action_time=float(raw.get("last_action_time", 0.0)),
-                        day_start_equity=float(raw.get("day_start_equity", DEFAULT_SETTINGS["starting_cash"])),
-                        day_start_date=raw.get("day_start_date", today_key()),
-                        live_day_start_date=raw.get("live_day_start_date", today_key()),
-                        live_daily_spend=float(raw.get("live_daily_spend", 0.0)),
-                        prices=[float(item) for item in raw.get("prices", [])][-300:],
-                        price_history={
-                            str(symbol): [float(item) for item in prices][-300:]
-                            for symbol, prices in raw.get("price_history", {}).items()
-                        },
-                        candle_history={
-                            str(symbol): [
-                                {
-                                    "time": int(item.get("time", 0)),
-                                    "open": float(item.get("open", 0.0)),
-                                    "high": float(item.get("high", 0.0)),
-                                    "low": float(item.get("low", 0.0)),
-                                    "close": float(item.get("close", 0.0)),
-                                    "volume": float(item.get("volume", 0.0)),
-                                }
-                                for item in candles
-                            ][-300:]
-                            for symbol, candles in raw.get("candle_history", {}).items()
-                            if isinstance(candles, list)
-                        },
-                        positions=raw.get("positions", {}),
-                        scan_rows=raw.get("scan_rows", []),
-                        trades=[],
-                        journal=[],
-                        setup_records=[],
-                        open_orders=[],
-                        kraken_margin_owned=raw.get("kraken_margin_owned", {}),
-                        peak_equity=float(raw.get("peak_equity", raw.get("cash", DEFAULT_SETTINGS["starting_cash"]))),
-                        db_initialized=bool(raw.get("db_initialized", False)),
-                    )
-                    state.db_initialized = bool(raw.get("db_initialized", False))
-                    return state
-                except Exception as backup_exc:
-                    logger.warning(f"Could not recover backup {backup}: {backup_exc}")
-
-            # No valid backup exists. Start fresh, but do NOT overwrite the
-            # corrupt primary state here. The database remains authoritative
-            # for persisted trades.
+            logger.error(f"Failed to load state: {e} – starting fresh")
             state = BotState()
             state.day_start_date = today_key()
             state.peak_equity = float(state.settings["starting_cash"])
-            state.last_error = "State file could not be read; preserved original and started fresh."
+            state.last_error = "State file could not be read; started fresh."
             state.signal_history = {}
             state.db_initialized = False
             return state
@@ -2804,35 +2712,7 @@ class PaperBot:
     def save_state(self) -> None:
         with self.lock:
             data = asdict(self.state)
-        payload = json.dumps(data, indent=2)
-
-        # Atomic state writes: write a complete temporary file, fsync it,
-        # retain the previous valid state as .bak, then replace the primary.
-        tmp = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
-        bak = self.state_file.with_suffix(self.state_file.suffix + ".bak")
-        try:
-            if self.state_file.exists():
-                try:
-                    # Only promote the existing file to .bak if it is valid
-                    # JSON; never back up a known-corrupt file.
-                    json.loads(self.state_file.read_text(encoding="utf-8"))
-                    tmp_bak = bak.with_suffix(bak.suffix + ".tmp")
-                    tmp_bak.write_text(self.state_file.read_text(encoding="utf-8"), encoding="utf-8")
-                    tmp_bak.replace(bak)
-                except Exception:
-                    pass
-
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            tmp.replace(self.state_file)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+        self.state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         logger.debug("State saved")
 
     def backfill_tpsl_from_positions(self) -> None:
@@ -3090,9 +2970,6 @@ class PaperBot:
                 return
 
             self.stop_event.clear()
-            self.shutdown_requested = False
-            self.websocket_stop_event.clear()
-            self.news_guard_stop_event.clear()
             self.state.running = True
 
             if self.should_oanda_demo_trade():
@@ -4721,8 +4598,7 @@ class PaperBot:
             "order_expiry_seconds", "order_retry_limit", "max_oanda_open_trades","max_coinbase_open_trades",
             "news_guard_before_minutes", "news_guard_after_minutes",
             "opening_range_minutes", "opening_range_atr_period",
-            "opening_range_manipulation_threshold", "opening_range_blowoff_hard_atr_threshold",
-            "opening_range_blowoff_retracement_pct", "opening_range_stop_loss_atr_multiplier",
+            "opening_range_manipulation_threshold", "opening_range_stop_loss_atr_multiplier",
             "opening_range_take_profit_atr_multiplier", "max_drawdown_pct",
             "telegram_drawdown_alert_pct", "ema_short", "ema_long",
             "signal_confidence_threshold", "min_signals_required", "learning_history_size",
@@ -4885,8 +4761,6 @@ class PaperBot:
             self.state.settings["opening_range_minutes"] = max(1, int(self.state.settings["opening_range_minutes"]))
             self.state.settings["opening_range_atr_period"] = max(2, int(self.state.settings["opening_range_atr_period"]))
             self.state.settings["opening_range_manipulation_threshold"] = max(0.01, min(1.0, float(self.state.settings["opening_range_manipulation_threshold"])))
-            self.state.settings["opening_range_blowoff_hard_atr_threshold"] = max(1.5, float(self.state.settings.get("opening_range_blowoff_hard_atr_threshold", 2.20)))
-            self.state.settings["opening_range_blowoff_retracement_pct"] = max(5.0, min(80.0, float(self.state.settings.get("opening_range_blowoff_retracement_pct", 25.0))))
             self.state.settings["opening_range_stop_loss_atr_multiplier"] = max(0.1, float(self.state.settings["opening_range_stop_loss_atr_multiplier"]))
             self.state.settings["opening_range_take_profit_atr_multiplier"] = max(0.1, float(self.state.settings["opening_range_take_profit_atr_multiplier"]))
             self.state.settings["max_drawdown_pct"] = max(1.0, float(self.state.settings.get("max_drawdown_pct", 20.0)))
@@ -5281,16 +5155,6 @@ class PaperBot:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            # state.running survives in state.json, but the worker thread does
-            # not survive a process restart. Only report Running when the
-            # actual run-loop thread is alive.
-            actual_running = bool(
-                self.thread and self.thread.is_alive()
-                and not self.stop_event.is_set()
-                and not self.shutdown_requested
-            )
-            if self.state.running != actual_running:
-                self.state.running = actual_running
             chart_symbol = self.state.active_symbol or self.state.settings["symbol"]
             chart_prices = self.state.price_history.get(chart_symbol, self.state.prices)
             chart_candles = self.state.candle_history.get(chart_symbol, [])
@@ -5995,10 +5859,7 @@ class PaperBot:
                     logger.info(f"Strategy switched: {old_strategy} → {recommended} (regime: {self.state.current_regime.regime if self.state.current_regime else 'unknown'})")
 
             # ─── Priority 4: Regime-driven strategy selection & dead market block ──────────
-            # The user-facing strategy-switching control is the master switch.
-            # When disabled, neither the normal regime selector nor the force-strategy
-            # path may change the manually selected strategy.
-            if settings.get("strategy_switching_enabled", True) and settings.get("regime_force_strategy", True):
+            if settings.get("regime_force_strategy", True):
                 if self.state.current_regime and self.state.current_regime.confidence >= settings.get("min_regime_confidence", 0.5):
                     regime = self.state.current_regime.regime
                     # Block all trades if market is dead and regime_block_dead is True
@@ -6580,79 +6441,13 @@ class PaperBot:
         if analysis["blowoff"]:
             direction = "bullish" if analysis.get("is_green") else "bearish"
             blocked_side = "LONG" if analysis.get("is_green") else "SHORT"
-            ratio = float(analysis.get("range_ratio", 0.0))
-            hard_threshold = float(analysis.get("blowoff_hard_threshold", 2.20))
-            retracement_pct = float(analysis.get("blowoff_retracement_pct", 25.0))
-            pullback_confirmed = bool(analysis.get("blowoff_pullback_confirmed"))
-
-            # Extreme impulses remain blocked. We do not chase a 2.2x+ ATR candle.
-            if ratio >= hard_threshold:
-                return {
-                    "signal": "WAIT",
-                    "reason": (
-                        f"{direction.title()} extreme blow-off: {ratio:.2%} of ATR "
-                        f"(hard threshold {hard_threshold:.0%}); avoiding {blocked_side} chase"
-                    ),
-                    "analysis": analysis,
-                }
-
-            # Between the soft and hard thresholds, require a genuine retracement
-            # and then a fresh break of the opening trigger.
-            if not pullback_confirmed:
-                return {
-                    "signal": "WAIT",
-                    "reason": (
-                        f"{direction.title()} blow-off: {ratio:.2%} of ATR "
-                        f"(soft threshold {analysis['blowoff_threshold']:.0%}); "
-                        f"waiting for {retracement_pct:.0f}% pullback/reassessment"
-                    ),
-                    "analysis": analysis,
-                }
-
-            if analysis.get("is_green"):
-                if current_price > trigger:
-                    entry_price = trigger
-                    return {
-                        "signal": "BUY",
-                        "reason": (
-                            f"Bullish blow-off pullback confirmed: {ratio:.2%} of ATR; "
-                            f"re-break above {trigger:.6f}"
-                        ),
-                        "entry": entry_price,
-                        "stop": entry_price - (atr * stop_loss_mult),
-                        "target": entry_price + (atr * take_profit_mult),
-                        "analysis": analysis,
-                        "is_short": False,
-                    }
-                return {
-                    "signal": "WAIT",
-                    "reason": f"Bullish blow-off pullback confirmed; waiting for break above {trigger:.6f}",
-                    "analysis": analysis,
-                }
-
-            if not self.state.settings.get("allow_short_selling", False):
-                return {
-                    "signal": "HOLD",
-                    "reason": "Short selling disabled",
-                    "analysis": analysis,
-                }
-            if current_price < trigger:
-                entry_price = trigger
-                return {
-                    "signal": "SELL",
-                    "reason": (
-                        f"Bearish blow-off pullback confirmed: {ratio:.2%} of ATR; "
-                        f"re-break below {trigger:.6f}"
-                    ),
-                    "entry": entry_price,
-                    "stop": entry_price + (atr * stop_loss_mult),
-                    "target": entry_price - (atr * take_profit_mult),
-                    "analysis": analysis,
-                    "is_short": True,
-                }
             return {
                 "signal": "WAIT",
-                "reason": f"Bearish blow-off pullback confirmed; waiting for break below {trigger:.6f}",
+                "reason": (
+                    f"{direction.title()} blow-off candle: {analysis['range_ratio']:.2%} of ATR "
+                    f"(threshold {analysis['blowoff_threshold']:.0%}); avoiding {blocked_side} chase, "
+                    "waiting for pullback/reassessment"
+                ),
                 "analysis": analysis,
             }
 
@@ -6689,35 +6484,12 @@ class PaperBot:
             atr = candle_range
 
         manipulation_threshold = float(self.state.settings.get("opening_range_manipulation_threshold", 0.20))
-        # 1.40x ATR remains the soft blow-off threshold. Extremely large
-        # opening candles remain a hard no-chase condition.
         blowoff_threshold = float(self.state.settings.get("opening_range_blowoff_atr_threshold", 1.40))
         if blowoff_threshold <= manipulation_threshold:
             blowoff_threshold = max(1.40, manipulation_threshold + 0.10)
-        hard_blowoff_threshold = max(
-            blowoff_threshold + 0.10,
-            float(self.state.settings.get("opening_range_blowoff_hard_atr_threshold", 2.20)),
-        )
-        retracement_pct = max(5.0, min(80.0, float(self.state.settings.get("opening_range_blowoff_retracement_pct", 25.0))))
         range_ratio = candle_range / atr if atr > 0 else 0
         manipulation = range_ratio < manipulation_threshold
         blowoff = range_ratio >= blowoff_threshold
-
-        subsequent_candles = []
-        first_index = None
-        for idx, candle in enumerate(candles):
-            if candle is first_candle or candle.time == first_candle.time:
-                first_index = idx
-                break
-        if first_index is not None:
-            subsequent_candles = candles[first_index + 1:]
-        retrace_fraction = retracement_pct / 100.0
-        if is_green:
-            pullback_level = first_candle.high - (candle_range * retrace_fraction)
-            pullback_confirmed = any(c.low <= pullback_level for c in subsequent_candles)
-        else:
-            pullback_level = first_candle.low + (candle_range * retrace_fraction)
-            pullback_confirmed = any(c.high >= pullback_level for c in subsequent_candles)
 
         return {
             "bias": "bullish" if is_green else "bearish",
@@ -6730,10 +6502,6 @@ class PaperBot:
             "range_ratio": round(range_ratio, 4),
             "manipulation_threshold": manipulation_threshold,
             "blowoff_threshold": blowoff_threshold,
-            "blowoff_hard_threshold": hard_blowoff_threshold,
-            "blowoff_retracement_pct": retracement_pct,
-            "blowoff_pullback_level": pullback_level,
-            "blowoff_pullback_confirmed": pullback_confirmed,
             "manipulation": manipulation,
             "blowoff": blowoff,
             "is_green": is_green,
@@ -7076,46 +6844,21 @@ class PaperBot:
                 self.state.last_action_time = time.time()
                 self.state.is_short = True
 
-                existing = self.state.positions.get(symbol)
-                if existing and bool(existing.get("is_short")):
-                    old_qty = abs(float(existing.get("quantity") or 0.0))
-                    new_qty = old_qty + coin_bought
-                    old_cost = abs(float(existing.get("entry_cost") or 0.0))
-                    total_cost = old_cost + spend
-                    weighted_entry = (
-                        ((old_qty * float(existing.get("entry_price") or price)) + (coin_bought * price)) / new_qty
-                        if new_qty > 0 else price
-                    )
-                    self.state.positions[symbol] = {
-                        **existing,
-                        "quantity": -new_qty,
-                        "entry_price": weighted_entry,
-                        "highest_price": max(float(existing.get("highest_price") or price), price),
-                        "stop_price": stop_price,
-                        "target_price": target_price,
-                        "exit_mode": exit_mode,
-                        "partial_take_profit_done": False,
-                        "entry_cost": total_cost,
-                        "is_short": True,
-                        "entry_time": min(float(existing.get("entry_time") or time.time()), time.time()),
-                        "lowest_price": min(float(existing.get("lowest_price") or price), price),
-                    }
-                else:
-                    self.state.positions[symbol] = {
-                        "quantity": -coin_bought,
-                        "entry_price": price,
-                        "highest_price": price,
-                        "stop_price": stop_price,
-                        "target_price": target_price,
-                        "exit_mode": exit_mode,
-                        "partial_take_profit_done": False,
-                        "entry_cost": spend,
-                        "opened_at": now_iso(),
-                        "is_short": True,
-                        "entry_time": time.time(),
-                        "lowest_price": price,
-                        "learning_context": self.build_learning_context(symbol, price, settings),
-                    }
+                self.state.positions[symbol] = {
+                    "quantity": -coin_bought,
+                    "entry_price": price,
+                    "highest_price": price,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                    "exit_mode": exit_mode,
+                    "partial_take_profit_done": False,
+                    "entry_cost": spend,
+                    "opened_at": now_iso(),
+                    "is_short": True,
+                    "entry_time": time.time(),
+                    "lowest_price": price,
+                    "learning_context": self.build_learning_context(symbol, price, settings),
+                }
 
                 trade = Trade(
                     time=now_iso(),
@@ -7154,46 +6897,21 @@ class PaperBot:
                 self.state.last_action_time = time.time()
                 self.state.is_short = False
 
-                existing = self.state.positions.get(symbol)
-                if existing and not bool(existing.get("is_short")):
-                    old_qty = max(0.0, float(existing.get("quantity") or 0.0))
-                    new_qty = old_qty + coin_bought
-                    old_cost = max(0.0, float(existing.get("entry_cost") or 0.0))
-                    total_cost = old_cost + spend
-                    weighted_entry = (
-                        ((old_qty * float(existing.get("entry_price") or price)) + (coin_bought * price)) / new_qty
-                        if new_qty > 0 else price
-                    )
-                    self.state.positions[symbol] = {
-                        **existing,
-                        "quantity": new_qty,
-                        "entry_price": weighted_entry,
-                        "highest_price": max(float(existing.get("highest_price") or price), price),
-                        "stop_price": stop_price,
-                        "target_price": target_price,
-                        "exit_mode": exit_mode,
-                        "partial_take_profit_done": False,
-                        "entry_cost": total_cost,
-                        "is_short": False,
-                        "entry_time": min(float(existing.get("entry_time") or time.time()), time.time()),
-                        "lowest_price": min(float(existing.get("lowest_price") or price), price),
-                    }
-                else:
-                    self.state.positions[symbol] = {
-                        "quantity": coin_bought,
-                        "entry_price": price,
-                        "highest_price": price,
-                        "stop_price": stop_price,
-                        "target_price": target_price,
-                        "exit_mode": exit_mode,
-                        "partial_take_profit_done": False,
-                        "entry_cost": spend,
-                        "opened_at": now_iso(),
-                        "is_short": False,
-                        "entry_time": time.time(),
-                        "lowest_price": price,
-                        "learning_context": self.build_learning_context(symbol, price, settings),
-                    }
+                self.state.positions[symbol] = {
+                    "quantity": coin_bought,
+                    "entry_price": price,
+                    "highest_price": price,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                    "exit_mode": exit_mode,
+                    "partial_take_profit_done": False,
+                    "entry_cost": spend,
+                    "opened_at": now_iso(),
+                    "is_short": False,
+                    "entry_time": time.time(),
+                    "lowest_price": price,
+                    "learning_context": self.build_learning_context(symbol, price, settings),
+                }
 
                 trade = Trade(
                     time=now_iso(),
@@ -7932,60 +7650,66 @@ class PaperBot:
             # Kraken uses exchange-native asset codes in margin positions (most
             # notably XBT for BTC and XDG for DOGE). Strategy state deliberately
             # uses user-facing symbols (BTC/DOGE). Never compare them by substring.
-            def _kraken_canonical_pair(raw_pair: str) -> tuple[str, str]:
-                # Kraken has returned several pair formats over time, e.g.
-                # XBTUSDT, XBT/USDT, XXBTZUSD and (on some account/API
-                # surfaces) XBT/USDT:USDT.  Normalise all of them before
-                # comparing with Auxo's user-facing BTC/DOGE/etc symbols.
-                p=str(raw_pair or "").upper().strip()
-                p=p.replace("/", "").replace("-", "").replace("_", "")
-                p=p.replace(":", "")
-                p=p.replace(".", "")
-                p=p.replace("XXBT","XBT").replace("XXDG","XDG")
-                p=p.replace("XETH","ETH")
-                aliases={"XBT":"BTC","XXBT":"BTC","XDG":"DOGE","XXDG":"DOGE",
-                         "XETH":"ETH","ZUSD":"USD","ZGBP":"GBP","ZEUR":"EUR",
-                         "ZUSDT":"USDT","XXBTZUSD":"BTCUSD"}
-                # Prefer the configured margin quote so a symbol such as
-                # XBTUSDT is split deterministically rather than accidentally
-                # treating USDT as part of the base.
-                quote_order=(_margin_quote,"USDT","USDC","GBP","USD","EUR","XBT","BTC")
-                q=next((x for x in quote_order if x and p.endswith(x)), "")
-                b=p[:-len(q)] if q else p
-                b=aliases.get(b,b)
-                q=aliases.get(q,q)
-                return b,q
+            def _kraken_canonical_asset(raw_asset: str) -> str:
+                a=str(raw_asset or "").upper().strip()
+                a=a.replace("/","").replace("-","").replace("_","").replace(":","")
+                aliases={
+                    "XBT":"BTC","XXBT":"BTC","XDG":"DOGE","XXDG":"DOGE",
+                    "XETH":"ETH","XXETH":"ETH",
+                    "ZUSD":"USD","ZGBP":"GBP","ZEUR":"EUR","ZUSDT":"USDT",
+                }
+                return aliases.get(a,a)
 
-            def _canonical_local_symbol(symbol: str) -> str:
-                # Local state normally stores BTC/DOGE, but older state files
-                # can contain BTC/USDT, BTC-USDT or Kraken's XBT form.
-                raw=str(symbol or "").upper().strip()
-                base,_quote=_kraken_canonical_pair(raw)
-                return base or {"XBT":"BTC","XDG":"DOGE"}.get(raw,raw)
+            def _kraken_canonical_pair(raw_pair: str) -> tuple[str, str]:
+                p=str(raw_pair or "").upper().strip()
+                p=p.replace("/","").replace("-","").replace("_","").replace(":","")
+                p=p.replace("XXBT","XBT").replace("XXDG","XDG").replace("XXETH","XETH")
+                quote_candidates=(
+                    _margin_quote, "USDT", "USDC", "GBP", "USD", "EUR", "BTC", "XBT"
+                )
+                q=next((x for x in quote_candidates if x and p.endswith(x)), "")
+                b=p[:-len(q)] if q else p
+                return _kraken_canonical_asset(b), _kraken_canonical_asset(q)
+
+            def _kraken_position_base(kp: dict[str,Any]) -> str:
+                candidates=[
+                    kp.get("pair"), kp.get("symbol"), kp.get("asset"), kp.get("base")
+                ]
+                raw=kp.get("raw") if isinstance(kp.get("raw"),dict) else {}
+                candidates += [raw.get("pair"), raw.get("symbol"), raw.get("asset"), raw.get("base")]
+                for candidate in candidates:
+                    if not candidate:
+                        continue
+                    base,_quote=_kraken_canonical_pair(str(candidate))
+                    if base:
+                        return base
+                    asset=_kraken_canonical_asset(str(candidate))
+                    if asset:
+                        return asset
+                return ""
 
             def _kraken_position_matches_symbol(kp: dict[str,Any], symbol: str) -> bool:
-                base,_quote=_kraken_canonical_pair(str(kp.get("pair") or ""))
-                local_base=_canonical_local_symbol(symbol)
-                return bool(base) and base == local_base
+                local_base=_kraken_canonical_asset(str(symbol or ""))
+                return bool(local_base) and _kraken_position_base(kp) == local_base
 
-            def _is_kraken_short_position(kp: dict[str,Any]) -> bool:
-                # OpenPositions normally exposes `type=SELL`. Some Kraken
-                # response variants/accounts expose the direction under
-                # `side`, so accept either representation.
+            def _kraken_position_is_short(kp: dict[str,Any]) -> bool:
                 direction=str(kp.get("type") or kp.get("side") or "").upper()
                 if direction in {"SELL","SHORT"}:
                     return True
-                # Last-resort fallback for a position explicitly marked short
-                # in the raw Kraken payload.
                 raw=kp.get("raw") if isinstance(kp.get("raw"),dict) else {}
-                raw_direction=str(raw.get("type") or raw.get("side") or raw.get("position_side") or "").upper()
+                raw_direction=str(
+                    raw.get("type") or raw.get("side") or raw.get("position_side") or ""
+                ).upper()
                 return raw_direction in {"SELL","SHORT"}
 
             for kp in result["positions"]:
                 pair=str(kp.get("pair") or "").upper()
                 qty=max(0.0,float(kp.get("volume") or 0)-float(kp.get("volume_closed") or 0))
                 if qty<=0: continue
-                owners=[x for x in local if x["symbol"] and _kraken_position_matches_symbol(kp,x["symbol"])]
+                owners=[x for x in local
+                        if x["symbol"]
+                        and _kraken_position_is_short(kp)
+                        and _kraken_position_matches_symbol(kp,x["symbol"])]
                 if owners:
                     result.setdefault("owned_positions",[]).append({
                         "position_id":kp.get("position_id"),"pair":pair,
@@ -8011,7 +7735,7 @@ class PaperBot:
             for lp in local:
                 if not any(
                     max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
-                    and _is_kraken_short_position(k)
+                    and _kraken_position_is_short(k)
                     and _kraken_position_matches_symbol(k,lp["symbol"])
                     for k in result["positions"]
                 ):
@@ -8049,20 +7773,6 @@ class PaperBot:
                             {"symbol":sym,"reason":recovery.get("reason")}
                         )
                     result["mismatches"].append(f"Auxo SHORT {sym} missing at Kraken")
-                    result.setdefault("diagnostics", []).append({
-                        "local_symbol": sym,
-                        "canonical_local_symbol": _canonical_local_symbol(sym),
-                        "kraken_positions_seen": [
-                            {
-                                "pair": k.get("pair"),
-                                "type": k.get("type"),
-                                "side": k.get("side"),
-                                "volume": k.get("volume"),
-                                "volume_closed": k.get("volume_closed"),
-                            }
-                            for k in result.get("positions", [])
-                        ],
-                    })
             if result.get("recovered_closed_positions"):
                 # Kraken was already flat; refresh the authoritative account figures
                 # after local stale state has been cleared. Do not recursively call
@@ -8079,7 +7789,7 @@ class PaperBot:
                 except Exception as exc:
                     result.setdefault("warnings",[]).append(f"Post-recovery Kraken refresh failed: {exc}")
 
-            shorts=[p for p in result["positions"] if _is_kraken_short_position(p)
+            shorts=[p for p in result["positions"] if _kraken_position_is_short(p)
                     and float(p.get("volume") or 0)>float(p.get("volume_closed") or 0)]
             max_shorts=max(1,int(float(self.state.settings.get("kraken_margin_max_open_shorts",1))))
             max_exp=max(0.0,float(self.state.settings.get("kraken_margin_max_exposure_quote",25)))
@@ -8692,227 +8402,6 @@ class PaperBot:
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
         active_exchange=self.live_exchange()
-
-        # Never stack live entry orders for the same market/side while an
-        # earlier entry is still pending. Kraken maker/limit orders reserve
-        # quote balance, so repeatedly submitting the same signal every scan
-        # can consume the available balance and eventually produce
-        # EOrder:Insufficient funds even though the account itself has funds.
-        desired_side = "SELL" if is_short else "BUY"
-
-        # Kraken is the source of truth for live order state. Before allowing
-        # any new entry, inspect the exchange itself. This prevents a local
-        # Auxo state record from either creating duplicate orders or blocking
-        # a trade after the exchange order was cancelled.
-        if active_exchange == "kraken":
-            try:
-                open_result = kraken_private(
-                    "/0/private/OpenOrders",
-                    {"trades": "true"},
-                ).get("result") or {}
-                open_rows = open_result.get("open") if isinstance(open_result, dict) else {}
-                exchange_open = None
-                wanted_symbol = str(symbol).upper()
-                if isinstance(open_rows, dict):
-                    for oid, row in open_rows.items():
-                        if not isinstance(row, dict):
-                            continue
-                        descr = row.get("descr") or {}
-                        pair = str(descr.get("pair") or "").upper()
-                        order_side = str(descr.get("type") or "").upper()
-                        pair_match = wanted_symbol in pair or (
-                            wanted_symbol == "BTC" and "XBT" in pair
-                        )
-                        if pair_match and order_side == desired_side:
-                            exchange_open = (str(oid), row)
-                            break
-
-                with self.lock:
-                    local_entries = [
-                        o for o in self.state.open_orders
-                        if str(getattr(o, "symbol", "")).upper() == wanted_symbol
-                        and str(getattr(o, "role", "")).upper() == "ENTRY"
-                        and str(getattr(o, "side", "")).upper() == desired_side
-                        and str(getattr(o, "status", "")).upper()
-                            not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED",
-                                    "CLOSED", "CANCELED", "REJECTED", "DENIED"}
-                    ]
-
-                    if exchange_open is None:
-                        # Kraken has no matching live order: clear every local
-                        # phantom immediately. Do not wait 45 seconds.
-                        for stale in local_entries:
-                            stale.status = "CANCELLED"
-                            stale.updated_at = now_iso()
-                            stale.details["reconcile_note"] = (
-                                "Kraken OpenOrders contains no matching live entry"
-                            )
-                            self.audit(
-                                "ORDER_LOCAL_CLEANUP",
-                                order_id=stale.order_id,
-                                symbol=symbol,
-                                reason="not_present_in_kraken_open_orders",
-                            )
-                        if local_entries:
-                            self.save_state()
-                        active_entry = None
-                    else:
-                        # Kraken really has an open order. If Auxo lost it,
-                        # adopt the exchange order so the next scan cannot
-                        # submit a duplicate.
-                        exchange_oid, exchange_row = exchange_open
-                        active_entry = next(
-                            (o for o in local_entries
-                             if str(getattr(o, "order_id", "")) == exchange_oid),
-                            None,
-                        )
-                        if active_entry is None:
-                            quote = str(settings.get("quote_currency") or "USDT").upper()
-                            active_entry = self.track_order(
-                                exchange_oid,
-                                symbol,
-                                f"{symbol}-{quote}",
-                                desired_side,
-                                "ENTRY",
-                                str(exchange_row.get("ordertype") or "unknown"),
-                                price=float(exchange_row.get("price") or 0.0),
-                                base_size=float(exchange_row.get("vol") or 0.0),
-                                reason="Adopted existing Kraken open order",
-                                details={"adopted_from_exchange": True, "is_short": is_short},
-                            )
-                            self.save_state()
-
-                        self.state.last_signal = (
-                            f"LIVE {('SHORT' if is_short else 'BUY')} waiting: "
-                            f"Kraken order {exchange_oid} is already open for {symbol}"
-                        )
-                        self.journal(
-                            symbol,
-                            "INFO",
-                            self.state.last_signal,
-                            price,
-                            {"order_id": exchange_oid, "status": "OPEN"},
-                        )
-                        return
-
-            except Exception as exc:
-                # If the exchange state cannot be checked, fail closed: do
-                # not submit another live order based only on local state.
-                logger.warning(
-                    "Kraken OpenOrders pre-entry check failed for %s; "
-                    "blocking new live entry: %s",
-                    symbol, exc,
-                )
-                with self.lock:
-                    self.state.last_signal = (
-                        f"LIVE {'SHORT' if is_short else 'BUY'} blocked: "
-                        f"Kraken open-order check failed"
-                    )
-                    self.journal(symbol, "ERROR", self.state.last_signal, price, {"error": str(exc)})
-                return
-
-        with self.lock:
-            active_entry = next(
-                (
-                    o for o in self.state.open_orders
-                    if str(getattr(o, "symbol", "")).upper() == str(symbol).upper()
-                    and str(getattr(o, "role", "")).upper() == "ENTRY"
-                    and str(getattr(o, "side", "")).upper() == desired_side
-                    and str(getattr(o, "status", "")).upper()
-                        not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED", "CLOSED", "CANCELED", "REJECTED", "DENIED"}
-                ),
-                None,
-            )
-
-        if active_entry is not None:
-            # Try to reconcile the existing order once before deciding to wait.
-            # If Kraken still cannot confirm it, conservatively leave it alone;
-            # placing another order could reserve another chunk of balance.
-            try:
-                fill = self.live_reconcile(active_entry.order_id)
-                self.apply_reconciled_order(active_entry, fill)
-                if str(active_entry.status or "").upper() in {"FILLED", "CANCELLED", "FAILED", "EXPIRED", "CLOSED", "CANCELED", "REJECTED", "DENIED"}:
-                    active_entry.updated_at = now_iso()
-                    self.save_state()
-                    active_entry = None
-            except Exception as exc:
-                # Do not let a locally-tracked order become a permanent
-                # "pending" phantom. Kraken may briefly be inconsistent after
-                # AddOrder, so keep a short grace period; after that, if
-                # QueryOrders/OpenOrders/TradesHistory still cannot find it,
-                # treat the local order as cancelled/unknown and allow a fresh
-                # signal rather than blocking the market forever.
-                created_epoch = getattr(active_entry, "created_at_epoch", None)
-                if created_epoch is None:
-                    created_epoch = getattr(active_entry, "created_at", None)
-                try:
-                    created_epoch = float(created_epoch or 0.0)
-                except (TypeError, ValueError):
-                    created_epoch = 0.0
-
-                # If the legacy order has no epoch at all, use its ISO
-                # timestamp when available. Never treat a missing timestamp
-                # as "brand new" forever.
-                if created_epoch <= 0:
-                    iso = getattr(active_entry, "created_at", None) or getattr(active_entry, "updated_at", None)
-                    try:
-                        created_epoch = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
-                    except Exception:
-                        created_epoch = time.time() - 3600
-
-                age = max(0.0, time.time() - created_epoch)
-                grace = float(self.state.settings.get("order_reconcile_grace_seconds", 45.0))
-                if age >= grace:
-                    active_entry.status = "CANCELLED"
-                    active_entry.updated_at = now_iso()
-                    active_entry.details["reconcile_note"] = (
-                        "Kraken order no longer verifiable after grace period; "
-                        "removed from local pending-entry guard"
-                    )
-                    self.audit(
-                        "ORDER_LOCAL_CLEANUP",
-                        order_id=active_entry.order_id,
-                        symbol=symbol,
-                        error=str(exc),
-                        age_seconds=round(age, 1),
-                    )
-                    self.journal(
-                        symbol,
-                        "INFO",
-                        f"LIVE {('SHORT' if is_short else 'BUY')} stale pending order "
-                        f"{active_entry.order_id} cleared; Kraken could not verify it",
-                        price,
-                        {"order_id": active_entry.order_id, "age_seconds": round(age, 1)},
-                    )
-                    self.save_state()
-                    active_entry = None
-                else:
-                    logger.warning(
-                        "Existing %s entry %s for %s could not yet be reconciled; "
-                        "not placing a duplicate: %s",
-                        desired_side, active_entry.order_id, symbol, exc,
-                    )
-
-        if active_entry is not None and str(active_entry.status or "").upper() in {"FILLED", "CANCELLED", "FAILED", "EXPIRED", "CLOSED", "CANCELED", "REJECTED", "DENIED"}:
-            active_entry.updated_at = now_iso()
-            self.save_state()
-            active_entry = None
-
-        if active_entry is not None:
-            with self.lock:
-                self.state.last_signal = (
-                    f"LIVE {('SHORT' if is_short else 'BUY')} waiting: "
-                    f"entry {active_entry.order_id} already pending for {symbol}"
-                )
-                self.journal(
-                    symbol,
-                    "INFO",
-                    self.state.last_signal,
-                    price,
-                    {"order_id": active_entry.order_id, "status": active_entry.status},
-                )
-            return
-
         effective_quote=kraken_margin_quote(settings) if (is_short and active_exchange=="kraken") else str(settings["quote_currency"])
         pair_diag=None
         if is_short:
@@ -9057,14 +8546,9 @@ class PaperBot:
                     bid = float(guard.get("bid") or 0.0)
                     ask = float(guard.get("ask") or 0.0)
                     if bid <= 0 or ask <= 0:
-                        fallback_key = "kraken_maker_market_fallback" if active_exchange == "kraken" else "coinbase_maker_market_fallback"
-                        if bool(settings.get(fallback_key, True)):
-                            order_type = "market"
-                        else:
-                            raise RuntimeError(f"Maker-first entry requires a valid {active_exchange.title()} bid/ask")
-                    if order_type == "maker":
-                        raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
-                        limit_price = self.live_round_price(raw_maker_price,symbol,str(settings["quote_currency"]))
+                        raise RuntimeError("Maker-first entry requires a valid Coinbase bid/ask")
+                    raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
+                    limit_price = self.live_round_price(raw_maker_price,symbol,str(settings["quote_currency"]))
                 else:
                     best_price, _, _ = self.price_aggregator.get_best_price(symbol, side=side)
                     if side == "BUY":
@@ -9269,16 +8753,11 @@ class PaperBot:
                 float(settings["max_live_spread_pct"]),0.0)
             bid=float(g.get("bid") or 0); ask=float(g.get("ask") or 0)
             if bid <= 0 or ask <= 0:
-                fallback_key = "kraken_maker_market_fallback" if active_exchange == "kraken" else "coinbase_maker_market_fallback"
-                if bool(settings.get(fallback_key, True)):
-                    order_type = "market"
-                else:
-                    raise RuntimeError(f"Maker-first exit requires a valid {active_exchange.title()} bid/ask")
-            else:
-                maker_offset = max(0.0,float(settings.get("kraken_maker_offset_pct" if active_exchange=="kraken" else "coinbase_maker_offset_pct",0.0)))/100.0
-                raw_limit = ask * (1.0 + maker_offset) if exit_side == "SELL" else bid * (1.0 - maker_offset)
-                limit_price = self.live_round_price(raw_limit,symbol,str(settings["quote_currency"]))
-                order_type = "maker"
+                raise RuntimeError("Maker-first exit requires a valid Coinbase bid/ask")
+            maker_offset = max(0.0,float(settings.get("kraken_maker_offset_pct" if active_exchange=="kraken" else "coinbase_maker_offset_pct",0.0)))/100.0
+            raw_limit = ask * (1.0 + maker_offset) if exit_side == "SELL" else bid * (1.0 - maker_offset)
+            limit_price = self.live_round_price(raw_limit,symbol,str(settings["quote_currency"]))
+            order_type = "maker"
             order = (kraken_order(symbol,str(settings["quote_currency"]),exit_side,"limit",base_size,limit_price,True,leverage=margin_leverage)
                      if active_exchange=="kraken" else coinbase_limit_order(product_id,exit_side,base_size,limit_price,post_only=True))
         elif configured_order_type == "limit" and self.coinbase_maker_exit_allowed(reason):
@@ -10538,25 +10017,8 @@ def kraken_margin_capability_matrix(settings:dict[str,Any], symbols:list[str]|No
 
 def kraken_round_price(v,s,q): return round(float(v),kraken_pair_info(s,q)["price_decimals"])
 def kraken_round_size(v,s,q):
-    info = kraken_pair_info(s,q)
-    d = int(info["lot_decimals"])
-    f = 10 ** d
-    raw = float(v or 0.0)
-
-    # Kraken rejects quantities such as 4.99995 when the pair minimum is
-    # exactly 5.0. The old floor-to-lot-step logic could turn an otherwise
-    # valid order into a quantity just below the exchange minimum. Round
-    # normally, then promote tiny floating-point/price-conversion shortfalls
-    # to the exact minimum. Do not promote genuinely undersized orders.
-    rounded = math.floor(raw * f + 1e-10) / f
-    minimum = float(info.get("ordermin") or 0.0)
-
-    lot_step = 1.0 / f
-    if minimum > 0 and rounded < minimum:
-        if raw >= (minimum - lot_step - 1e-10):
-            rounded = minimum
-
-    return rounded
+    d=kraken_pair_info(s,q)["lot_decimals"]; f=10**d
+    return math.floor(float(v)*f)/f
 
 def kraken_available_balance(currency:str)->float:
     raw=(kraken_private("/0/private/Balance").get("result") or {})
@@ -10634,21 +10096,9 @@ def kraken_margin_snapshot(ledger_limit:int=100, quote_asset:str="USD")->dict[st
 def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,leverage=None):
     if not kraken_live_is_armed():
         raise RuntimeError("Kraken order placement locked: LIVE_TRADING_CONFIRM is not armed")
-
-    info = kraken_pair_info(symbol, quote)
-    raw_size = float(base_size or 0.0)
-    size = kraken_round_size(raw_size, symbol, quote)
-    minimum = float(info.get("ordermin") or 0.0)
-    lot_step = 1.0 / (10 ** int(info["lot_decimals"]))
-
-    # Protect against the final floating-point boundary: if the requested
-    # amount was genuinely within one lot step of Kraken's minimum, submit
-    # exactly the minimum rather than 4.99995 vs 5.0.
-    if minimum > 0 and size < minimum and raw_size >= minimum - lot_step - 1e-10:
-        size = minimum
-
-    if size<=0 or (minimum and size<minimum):
-        raise RuntimeError(f"Kraken size {size} below minimum {minimum}")
+    info=kraken_pair_info(symbol,quote); size=kraken_round_size(base_size,symbol,quote)
+    if size<=0 or (info["ordermin"] and size<info["ordermin"]):
+        raise RuntimeError(f"Kraken size {size} below minimum {info['ordermin']}")
     p={"pair":info["pair"],"type":side.lower(),"ordertype":kind.lower(),
        "volume":decimal_text(size,info["lot_decimals"])}
     if kind=="limit":
@@ -10660,136 +10110,18 @@ def kraken_order(symbol,quote,side,kind,base_size,price=None,post_only=False,lev
     return {"order_id":str(ids[0]),"raw":data}
 
 def kraken_reconcile_order(oid):
-    """Resolve a just-submitted Kraken order without treating a transient
-    QueryOrders omission as a failed order.
-
-    Kraken can briefly return no row immediately after AddOrder. Also, an
-    order may have moved from the open-order set into trade history between
-    two calls. QueryOrders is preferred, but OpenOrders and TradesHistory are
-    authoritative fallbacks before Auxo declares verification failure.
-    """
-    oid = str(oid or "").strip()
-    if not oid:
-        raise RuntimeError("Kraken order id is empty")
-
-    # 1) QueryOrders: retry briefly because AddOrder -> QueryOrders is not
-    # guaranteed to be immediately consistent.
-    last_error = None
-    for delay in (0.0, 0.25, 0.75, 1.5):
-        if delay:
-            time.sleep(delay)
-        try:
-            result = kraken_private(
-                "/0/private/QueryOrders",
-                {"txid": oid, "trades": "true"},
-            ).get("result") or {}
-            row = result.get(oid)
-            if isinstance(row, dict) and row:
-                status = str(row.get("status") or "").upper()
-                if status not in {"OPEN", "PENDING"}:
-                    return _kraken_reconcile_row(oid, row)
-
-                # QueryOrders can transiently report an order as OPEN even
-                # after it has disappeared from Kraken's live open-order set.
-                # Verify that OPEN really means open before Auxo blocks a new
-                # entry on this local record.
-                try:
-                    open_result = kraken_private(
-                        "/0/private/OpenOrders",
-                        {"trades": "true"},
-                    ).get("result") or {}
-                    open_rows = open_result.get("open") if isinstance(open_result, dict) else {}
-                    if isinstance(open_rows, dict) and oid in open_rows:
-                        return _kraken_reconcile_row(oid, row, forced_status="OPEN")
-                except Exception as exc:
-                    last_error = exc
-                # Not in OpenOrders: continue to TradesHistory rather than
-                # accepting a stale OPEN QueryOrders response.
-        except Exception as exc:
-            last_error = exc
-            if "rate limit" in str(exc).lower():
-                time.sleep(1.5)
-
-    # 2) OpenOrders: the order may be live but not yet visible to QueryOrders.
-    try:
-        result = kraken_private(
-            "/0/private/OpenOrders",
-            {"trades": "true"},
-        ).get("result") or {}
-        orders = result.get("open") if isinstance(result, dict) else {}
-        row = orders.get(oid) if isinstance(orders, dict) else None
-        if isinstance(row, dict) and row:
-            return _kraken_reconcile_row(oid, row, forced_status="OPEN")
-    except Exception as exc:
-        last_error = exc
-
-    # 3) TradesHistory: if the order filled/closed quickly, QueryOrders can
-    # miss the transition while TradesHistory already has the authoritative
-    # fill. Aggregate all fills belonging to this order.
-    try:
-        result = kraken_private(
-            "/0/private/TradesHistory",
-            {"type": "all", "trades": "true"},
-        ).get("result") or {}
-        fills = result.get("trades") if isinstance(result, dict) else {}
-        if isinstance(fills, dict):
-            matched = [
-                f for f in fills.values()
-                if isinstance(f, dict)
-                and str(f.get("ordertxid") or "").strip() == oid
-            ]
-            if matched:
-                qty = sum(float(f.get("vol") or 0.0) for f in matched)
-                cost = sum(
-                    float(f.get("vol") or 0.0) * float(f.get("price") or 0.0)
-                    for f in matched
-                )
-                fee = sum(max(0.0, float(f.get("fee") or 0.0)) for f in matched)
-                avg = (cost / qty) if qty > 0 and cost > 0 else 0.0
-                side = str(matched[0].get("type") or "").lower()
-                pair = str(matched[0].get("pair") or "")
-                synthetic = {
-                    "status": "closed",
-                    "vol": qty,
-                    "vol_exec": qty,
-                    "cost": cost,
-                    "fee": fee,
-                    "price": avg,
-                    "trades": [
-                        str(k) for k, f in fills.items()
-                        if isinstance(f, dict)
-                        and str(f.get("ordertxid") or "").strip() == oid
-                    ],
-                    "descr": {"type": side, "pair": pair},
-                }
-                return _kraken_reconcile_row(oid, synthetic)
-    except Exception as exc:
-        last_error = exc
-
-    detail = f": {last_error}" if last_error else ""
-    raise RuntimeError(f"Kraken order {oid} could not be verified via QueryOrders/OpenOrders/TradesHistory{detail}")
-
-
-def _kraken_reconcile_row(oid, row, forced_status=None):
-    status = str(forced_status or row.get("status") or "UNKNOWN").upper()
-    size = float(row.get("vol_exec") or 0)
-    requested = float(row.get("vol") or 0)
-    cost = float(row.get("cost") or 0)
-    reported = float(row.get("price") or 0)
-    avg = (cost / size) if (size > 0 and cost > 0) else reported
-    return {
-        "order_id": oid,
-        "status": status,
-        "filled_size": size,
-        "requested_size": requested,
-        "filled_value": cost,
-        "total_fee": float(row.get("fee") or 0),
-        "average_price": avg,
-        "reported_price": reported,
-        "fills_count": len(row.get("trades") or []),
-        "exchange_confirmed_complete": bool(status == "CLOSED" and size > 0),
-        "order": row,
-    }
+    result=kraken_private("/0/private/QueryOrders",{"txid":oid,"trades":"true"}).get("result") or {}
+    row=result.get(oid)
+    if not isinstance(row,dict) or not row:
+        raise RuntimeError(f"Kraken QueryOrders could not verify order {oid}")
+    status=str(row.get("status") or "UNKNOWN").upper()
+    size=float(row.get("vol_exec") or 0); requested=float(row.get("vol") or 0)
+    cost=float(row.get("cost") or 0); reported=float(row.get("price") or 0)
+    avg=(cost/size) if (size>0 and cost>0) else reported
+    return {"order_id":oid,"status":status,"filled_size":size,"requested_size":requested,
+            "filled_value":cost,"total_fee":float(row.get("fee") or 0),"average_price":avg,
+            "reported_price":reported,"fills_count":len(row.get("trades") or []),
+            "exchange_confirmed_complete":bool(status=="CLOSED" and size>0),"order":row}
 
 def kraken_cancel_order(oid):
     if not kraken_live_is_armed():
@@ -12733,8 +12065,6 @@ def result_settings_summary(symbol: str, settings: dict[str, Any]) -> dict[str, 
             "opening_range_minutes": int(settings["opening_range_minutes"]),
             "opening_range_atr_period": int(settings["opening_range_atr_period"]),
             "opening_range_manipulation_threshold": float(settings["opening_range_manipulation_threshold"]),
-            "opening_range_blowoff_hard_atr_threshold": float(settings.get("opening_range_blowoff_hard_atr_threshold", 2.20)),
-            "opening_range_blowoff_retracement_pct": float(settings.get("opening_range_blowoff_retracement_pct", 25.0)),
             "opening_range_stop_loss_atr_multiplier": float(settings["opening_range_stop_loss_atr_multiplier"]),
             "opening_range_take_profit_atr_multiplier": float(settings["opening_range_take_profit_atr_multiplier"]),
         })
@@ -13413,20 +12743,12 @@ def exit_prices(
     entry_price: float,
     candles: list[Candle],
     settings: dict[str, Any],
-    position_side: str = "LONG",
 ) -> tuple[float, float, str]:
-    """Backtest-safe exit calculation without PaperBot instance state.
-
-    Supports both LONG and SHORT.  The live strategy already passes
-    position_side, so the standalone helper must accept it too.
-    """
-    short = str(position_side or "LONG").upper() == "SHORT"
+    """Backtest-safe exit calculation without PaperBot instance state."""
     if not candles or len(candles) < 14:
-        sl = float(settings["stop_loss_pct"]) / 100
-        tp = float(settings["take_profit_pct"]) / 100
         return (
-            entry_price * (1 + sl) if short else entry_price * (1 - sl),
-            entry_price * (1 - tp) if short else entry_price * (1 + tp),
+            entry_price * (1 - float(settings["stop_loss_pct"]) / 100),
+            entry_price * (1 + float(settings["take_profit_pct"]) / 100),
             "fixed",
         )
 
@@ -13436,9 +12758,9 @@ def exit_prices(
         if atr_value > 0:
             stop_mult = float(settings.get("atr_stop_multiplier", 1.5))
             target_mult = float(settings.get("atr_target_multiplier", 2.5))
-            stop = entry_price + (atr_value * stop_mult) if short else entry_price - (atr_value * stop_mult)
-            target = entry_price - (atr_value * target_mult) if short else entry_price + (atr_value * target_mult)
-            if abs(entry_price - stop) / entry_price * 100 >= 0.2:
+            stop = entry_price - (atr_value * stop_mult)
+            target = entry_price + (atr_value * target_mult)
+            if (entry_price - stop) / entry_price * 100 >= 0.2:
                 return stop, target, f"ATR ({atr_value:.4f})"
 
     if settings.get("use_dynamic_sr_exits"):
@@ -13449,22 +12771,14 @@ def exit_prices(
         if support and resistance and confirmed:
             stop_buffer = float(settings.get("support_stop_buffer_pct", 2.0)) / 100
             target_buffer = float(settings.get("resistance_target_buffer_pct", 0.5)) / 100
-            if short:
-                sr_stop = float(resistance) * (1 + stop_buffer)
-                sr_target = float(support) * (1 + target_buffer)
-                if sr_target < entry_price < sr_stop:
-                    return sr_stop, sr_target, "S/R"
-            else:
-                sr_stop = float(support) * (1 - stop_buffer)
-                sr_target = float(resistance) * (1 - target_buffer)
-                if sr_stop < entry_price < sr_target:
-                    return sr_stop, sr_target, "S/R"
+            sr_stop = float(support) * (1 - stop_buffer)
+            sr_target = float(resistance) * (1 - target_buffer)
+            if sr_stop < entry_price < sr_target:
+                return sr_stop, sr_target, "S/R"
 
-    sl = float(settings["stop_loss_pct"]) / 100
-    tp = float(settings["take_profit_pct"]) / 100
     return (
-        entry_price * (1 + sl) if short else entry_price * (1 - sl),
-        entry_price * (1 - tp) if short else entry_price * (1 + tp),
+        entry_price * (1 - float(settings["stop_loss_pct"]) / 100),
+        entry_price * (1 + float(settings["take_profit_pct"]) / 100),
         "fixed",
     )
 
@@ -13710,44 +13024,34 @@ def live_market_guard(
     max_spread_pct: float,
     min_quote_volume: float,
 ) -> dict[str, Any]:
-    """Exchange-aware live market guard with top-of-book for Coinbase and Kraken."""
-    exchange = str(exchange or "").lower()
-    if exchange == "coinbase":
-        ticker = fetch_coinbase_ticker(symbol, quote_currency)
-    elif exchange == "kraken":
-        ticker = fetch_kraken_ticker(symbol, quote_currency)
-    else:
-        return {"ok": True, "reason": f"Guard not enforced for {exchange or 'unknown'}"}
+    if exchange.lower() != "coinbase":
+        return {"ok": True, "reason": "Guard only enforced for Coinbase live trading"}
 
+    ticker = fetch_coinbase_ticker(symbol, quote_currency)
     bid = float(ticker.get("bid") or 0.0)
     ask = float(ticker.get("ask") or 0.0)
     if bid <= 0 or ask <= 0 or ask < bid:
-        return {"ok": False, "reason": f"invalid {exchange.title()} bid/ask", "bid": bid, "ask": ask}
+        return {"ok": False, "reason": "invalid Coinbase bid/ask"}
 
     midpoint = (bid + ask) / 2
     spread_pct = ((ask - bid) / midpoint) * 100 if midpoint else 100.0
     if spread_pct > max_spread_pct:
-        return {"ok": False, "reason": f"spread {spread_pct:.3f}% > limit {max_spread_pct:.3f}%", "spread_pct": round(spread_pct,4), "bid": bid, "ask": ask}
+        return {
+            "ok": False,
+            "reason": f"spread {spread_pct:.3f}% > limit {max_spread_pct:.3f}%",
+            "spread_pct": round(spread_pct, 4),
+            "bid": bid,
+            "ask": ask,
+        }
 
-    # Coinbase candles contain usable volume directly. Kraken's OHLC
-    # endpoint can return sparse/limited history and is not the right source
-    # for this liquidity gate. For Kraken use the public ticker's 24h base
-    # volume multiplied by the 24h VWAP, giving an actual quote-currency
-    # turnover figure (USDT for BTC/USDT, etc.).
-    if exchange == "kraken":
-        quote_volume = float(ticker.get("quote_volume_24h") or 0.0)
-        volume_source = "Kraken 24h ticker turnover"
-    else:
-        candles = fetch_candles(
-            exchange=exchange,
-            symbol=symbol,
-            quote_currency=quote_currency,
-            granularity=granularity,
-            candle_count=min(50, max(20, candle_count)),
-        )
-        quote_volume = sum(candle.close * candle.volume for candle in candles)
-        volume_source = "recent candles"
-
+    candles = fetch_candles(
+        exchange=exchange,
+        symbol=symbol,
+        quote_currency=quote_currency,
+        granularity=granularity,
+        candle_count=min(50, max(20, candle_count)),
+    )
+    quote_volume = sum(candle.close * candle.volume for candle in candles)
     if quote_volume < min_quote_volume:
         return {
             "ok": False,
@@ -13757,7 +13061,6 @@ def live_market_guard(
             ),
             "spread_pct": round(spread_pct, 4),
             "quote_volume": round(quote_volume, 2),
-            "volume_source": volume_source,
             "bid": bid,
             "ask": ask,
         }
@@ -13767,7 +13070,6 @@ def live_market_guard(
         "reason": "market liquid enough",
         "spread_pct": round(spread_pct, 4),
         "quote_volume": round(quote_volume, 2),
-        "volume_source": volume_source,
         "bid": bid,
         "ask": ask,
     }
@@ -13775,44 +13077,6 @@ def live_market_guard(
 def fetch_coinbase_ticker(symbol: str, quote_currency: str) -> dict[str, Any]:
     product = f"{symbol.upper()}-{quote_currency.upper()}"
     return fetch_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
-
-def fetch_kraken_ticker(symbol: str, quote_currency: str) -> dict[str, Any]:
-    """Fetch Kraken public top-of-book prices; no private auth is required."""
-    symbol = str(symbol or "").upper()
-    quote_currency = str(quote_currency or "").upper()
-    symbol_map = {"BTC": "XBT", "DOGE": "XDG"}
-    pair = f"{symbol_map.get(symbol, symbol)}{quote_currency}"
-    data = fetch_json("https://api.kraken.com/0/public/Ticker?" + urllib.parse.urlencode({"pair": pair}))
-    errors = data.get("error") or []
-    if errors:
-        raise RuntimeError("Kraken ticker: " + "; ".join(str(e) for e in errors))
-    result = data.get("result") or {}
-    if not result:
-        raise RuntimeError(f"Kraken ticker returned no result for {pair}")
-    row = next(iter(result.values()))
-    ask = float((row.get("a") or [0])[0] or 0.0)
-    bid = float((row.get("b") or [0])[0] or 0.0)
-    last = float((row.get("c") or [0])[0] or 0.0)
-
-    # Kraken ticker fields:
-    #   v[0] = today's volume, v[1] = last 24h volume (base units)
-    #   p[0] = today's VWAP, p[1] = last 24h VWAP
-    # Use the 24h values to calculate quote-currency turnover.
-    volumes = row.get("v") or []
-    vwaps = row.get("p") or []
-    volume_24h = float(volumes[1] if len(volumes) > 1 else (volumes[0] if volumes else 0.0))
-    vwap_24h = float(vwaps[1] if len(vwaps) > 1 else (vwaps[0] if vwaps else last))
-    quote_volume_24h = volume_24h * (vwap_24h or last)
-
-    return {
-        "bid": bid,
-        "ask": ask,
-        "price": last,
-        "pair": pair,
-        "base_volume_24h": volume_24h,
-        "vwap_24h": vwap_24h,
-        "quote_volume_24h": quote_volume_24h,
-    }
 
 def coinbase_products_for_quote(quote_currency: str = "GBP") -> dict[str, Any]:
     quote_currency = quote_currency.upper()
@@ -14629,68 +13893,15 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/auth/select-account":
             p=parse_json_body(self)
             try:
-                uid = int(self.current_user_id)
-                aid = int(p.get("account_id"))
-
-                if not db.account_belongs_to_user(uid, aid):
+                aid=int(p.get("account_id"))
+                if not db.account_belongs_to_user(int(self.current_user_id),aid):
                     raise PermissionError("Account does not belong to authenticated user or is disabled")
-
-                account = db.get_trading_account(aid)
+                account=db.get_trading_account(aid)
                 if not self.engine_manager.has_engine(aid):
                     raise RuntimeError("Trading engine is not provisioned for this account")
-
-                previous = self._selected_account()
-                previous_id = int(previous["id"]) if previous else None
-                previous_engine = (
-                    self.engine_manager.get_engine(previous_id)
-                    if previous_id is not None else None
-                )
-                was_running = bool(
-                    previous_engine and previous_engine.thread and
-                    previous_engine.thread.is_alive() and
-                    not previous_engine.stop_event.is_set() and
-                    not previous_engine.shutdown_requested
-                )
-
-                new_engine = self.engine_manager.get_engine(aid)
-
-                # If the dashboard was actively running, switch the worker to
-                # the newly selected profile as well. This prevents a selected
-                # Kraken profile from showing an old/stale scan state while its
-                # actual worker is still the Coinbase profile.
-                if previous_id != aid and was_running and previous_engine is not None:
-                    previous_engine.stop()
-
-                exchange = str(account.get("exchange") or "").lower()
-                if new_engine is not None:
-                    with new_engine.lock:
-                        if exchange:
-                            new_engine.state.settings["exchange"] = exchange
-                            new_engine.state.settings["active_exchange"] = exchange
-                        new_engine.state.settings["account_id"] = aid
-                        new_engine.state.running = False
-                        new_engine.save_state()
-
-                if previous_id != aid and was_running and new_engine is not None:
-                    new_engine.start()
-
-                db.write_audit(
-                    uid, aid, "select_account",
-                    {"label": account.get("account_label"), "exchange": exchange}
-                )
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type","application/json")
-                self._set_account_cookie(aid)
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "ok": True,
-                    "account": account,
-                    "selected_exchange": exchange,
-                    "running": bool(
-                        new_engine and new_engine.thread and new_engine.thread.is_alive()
-                    ),
-                }).encode())
-                return
+                db.write_audit(int(self.current_user_id),aid,"select_account",{"label":account.get("account_label")})
+                self.send_response(HTTPStatus.OK); self.send_header("Content-Type","application/json"); self._set_account_cookie(aid); self.end_headers()
+                self.wfile.write(json.dumps({"ok":True,"account":account}).encode()); return
             except Exception as exc:
                 self.send_json({"ok":False,"error":str(exc)},HTTPStatus.BAD_REQUEST); return
 
@@ -15203,11 +14414,6 @@ def main() -> None:
             engine.state.settings["active_exchange"] = engine.state.settings["exchange"]
             engine.state.settings["live_trading_enabled"] = False
             engine.state.settings["oanda_demo_trading_enabled"] = False
-            # Worker state is process-local; a restarted server must not claim
-            # this engine is running until its thread has actually been started.
-            engine.state.running = False
-            engine.shutdown_requested = False
-            engine.stop_event.clear()
             engine.state.db_initialized = True
             engine.save_state()
         engine_manager.register_engine(aid, engine)
