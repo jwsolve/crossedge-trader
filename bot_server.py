@@ -7549,19 +7549,25 @@ class PaperBot:
         dust=float(self.state.settings.get("kraken_margin_dust_quote",0.10))
         history_proved = not (covered<=0 or (covered+1e-12<local_qty and missing_quote>dust))
         if not history_proved:
-            # D10.6: TradesHistory is not a reliable sole source of truth for old/restarted
-            # positions (pagination, missing entry timestamps and Kraken consolidation can
-            # hide the exact cover fill). If OpenPositions AND OpenOrders are authoritatively
-            # flat for this symbol, only permit recovery when Auxo has persisted ownership
-            # for the same symbol. This cannot silently discard an unrelated/manual trade.
-            owned=getattr(self.state,"kraken_margin_owned",{}) or {}
-            owned_records=[
-                (oid,rec) for oid,rec in owned.items()
-                if str(rec.get("symbol") or "").upper()==symbol
-                and str(rec.get("status") or "").lower() in {"open","pending","adopted"}
-            ]
-            if not exchange_flat_verified or not owned_records:
-                return {"ok":False,"reason":"No sufficient Kraken cover fills found and authoritative owned-flat recovery was not available",
+            # Kraken is authoritative for the CURRENT live position. If both
+            # OpenPositions and OpenOrders prove that this symbol is flat, the
+            # local SHORT is stale regardless of whether TradesHistory contains
+            # the covering fill or whether the position survived a restart.
+            #
+            # This is deliberately different from trusting local state: local
+            # state is precisely what we are repairing here. An open Kraken
+            # order prevents this path from running, so we cannot accidentally
+            # clear a genuinely pending cover/entry.
+            if exchange_flat_verified:
+                history_proved = False
+            else:
+                owned=getattr(self.state,"kraken_margin_owned",{}) or {}
+                owned_records=[
+                    (oid,rec) for oid,rec in owned.items()
+                    if str(rec.get("symbol") or "").upper()==symbol
+                    and str(rec.get("status") or "").lower() in {"open","pending","adopted"}
+                ]
+                return {"ok":False,"reason":"Kraken still has an open order/position or exchange flat state was not verified",
                         "local_quantity":local_qty,"covered_quantity":covered,
                         "missing_quantity":missing,"missing_quote":missing_quote,
                         "exchange_flat_verified":bool(exchange_flat_verified),
