@@ -1685,12 +1685,6 @@
                 <option value="true">Enabled</option>
             </select>
         </label>
-        <label class="strategy-switch-control">
-            <span>Allow automatic strategy switching</span>
-            <input type="hidden" name="strategy_switching_enabled" value="false">
-            <input name="strategy_switching_enabled" type="checkbox" value="true" checked style="width:auto;">
-            <small style="display:block; margin-top:4px; color:var(--muted);">When off, Auxo keeps the strategy you selected and will not switch it automatically.</small>
-        </label>
         <label>Auto-Select Best Strategy
             <select name="strategy_auto_select">
                 <option value="false">Disabled</option>
@@ -2399,7 +2393,6 @@ Live test actions can place or close real Kraken margin orders when live trading
             self_learning_enabled:'setup_learning',
             regime_filter_enabled:'regime_detection',
             regime_adaptation_enabled:'regime_detection',
-            strategy_switching_enabled:'regime_detection',
             auto_disable_weak_pairs:'auto_disable_weak_pairs',
             strategy_creator_enabled:'strategy_evolution',
             strategy_evolution_enabled:'strategy_evolution'
@@ -2453,20 +2446,74 @@ Live test actions can place or close real Kraken margin orders when live trading
         }
 
         async function loadCurrentUser() {
+            let r = null;
             try {
-                const r = await getJson('/api/auth/me');
+                r = await getJson('/api/auth/me');
                 if (!r.authenticated) { window.location.href = 'login.html'; return; }
-                const isOwner = Number(r.user?.id || 0) === 1;
-                currentEntitlements=r.entitlements || null;
-                applyEntitlementUI();
-                if (els.adminTabBtn) els.adminTabBtn.style.display = isOwner ? '' : 'none';
-                if (els.accountSelector) {
-                    els.accountSelector.innerHTML=(r.accounts||[]).filter(a=>Number(a.enabled)===1).map(a =>
-                        `<option value="${a.id}" ${Number(a.id)===Number(r.default_account_id)?'selected':''}>${adminEscape(a.account_label)} · ${adminEscape(a.exchange)}</option>`
-                    ).join('');
-                    els.accountSelector.style.display=(r.accounts||[]).filter(a=>Number(a.enabled)===1).length > 1 ? '' : 'none';
+            } catch (e) {
+                console.error('Unable to load /api/auth/me:', e);
+            }
+
+            // Account selection is independent from entitlement rendering. This
+            // prevents a UI entitlement error from blanking Coinbase/Kraken and
+            // hiding the owner Users link.
+            try {
+                const isOwner = Number(r?.user?.id || 0) === 1;
+                let accounts = Array.isArray(r?.accounts) ? r.accounts : [];
+                accounts = accounts.filter(a => {
+                    const v = a?.enabled;
+                    return v === undefined || v === null || v === true || v === 1 ||
+                        String(v).toLowerCase() === 'true' || String(v) === '1';
+                });
+
+                // Owner fallback: if /api/auth/me has an incomplete account list,
+                // use the admin account list to recover the Coinbase/Kraken options.
+                if (!accounts.length && isOwner) {
+                    try {
+                        const admin = await getJson('/api/admin/users');
+                        accounts = (admin.accounts || []).filter(a => {
+                            const v = a?.enabled;
+                            return Number(a.user_id) === 1 &&
+                                (v === undefined || v === null || v === true || v === 1 ||
+                                 String(v).toLowerCase() === 'true' || String(v) === '1');
+                        });
+                    } catch (e) {
+                        console.error('Unable to load admin account fallback:', e);
+                    }
                 }
-            } catch (e) {}
+
+                if (els.accountSelector) {
+                    els.accountSelector.innerHTML = accounts.map(a => {
+                        const label = a.account_label || a.label || `Account #${a.id}`;
+                        return `<option value="${a.id}" ${Number(a.id)===Number(r?.default_account_id)?'selected':''}>${adminEscape(label)} · ${adminEscape(a.exchange || '')}</option>`;
+                    }).join('');
+                    els.accountSelector.style.display = '';
+                    els.accountSelector.disabled = accounts.length === 0;
+                    if (!accounts.length) {
+                        els.accountSelector.innerHTML = '<option value="">No trading accounts returned</option>';
+                    }
+                }
+
+                if (els.adminTabBtn) els.adminTabBtn.style.display = isOwner ? '' : 'none';
+            } catch (e) {
+                console.error('Account selector population failed:', e);
+                if (els.accountSelector) {
+                    els.accountSelector.style.display = '';
+                    els.accountSelector.disabled = true;
+                    els.accountSelector.innerHTML = '<option value="">Unable to load trading accounts</option>';
+                }
+            }
+
+            // Entitlements are deliberately last so they cannot break account
+            // selection or the owner Users link.
+            try {
+                if (r) {
+                    currentEntitlements = r.entitlements || null;
+                    applyEntitlementUI();
+                }
+            } catch (e) {
+                console.error('Entitlement UI failed:', e);
+            }
         }
 
         function adminEscape(v) {
