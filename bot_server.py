@@ -2822,7 +2822,14 @@ class PaperBot:
                             return _canon_start_symbol(p[:-len(q)])
                     return _canon_start_symbol(p)
 
-                for sym in list(local_shorts):
+                startup_symbols=set(local_shorts)
+                startup_symbols.update(
+                    str(rec.get("symbol") or "").upper()
+                    for rec in open_owned.values()
+                    if str(rec.get("symbol") or "").strip()
+                )
+
+                for sym in list(startup_symbols):
                     target=_canon_start_symbol(sym)
                     has_position=any(
                         max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
@@ -2883,8 +2890,58 @@ class PaperBot:
                 # A mismatch is still a startup blocker if Kraken actually shows
                 # a position/order, or if the private snapshot itself failed.
                 if not margin.get("healthy"):
-                    detail = margin.get("error") or "; ".join(margin.get("mismatches") or []) or margin.get("status") or "unknown margin reconciliation failure"
-                    raise RuntimeError(f"Kraken margin reconciliation failed: {detail}")
+                    # Last startup safety check: if Kraken is demonstrably flat
+                    # for every local/owned symbol and there are no corresponding
+                    # open orders, stale local reconciliation must never prevent
+                    # startup.
+                    positions_now=margin.get("positions") or []
+                    orders_now=margin.get("open_orders") or []
+                    remaining_symbols=set(_canon_start_symbol(x) for x in startup_symbols)
+
+                    def _has_current_state(sym):
+                        return any(
+                            _base_from_pair(k.get("pair") or k.get("symbol") or k.get("asset")) == sym
+                            and max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
+                            for k in positions_now
+                        ) or any(
+                            _base_from_pair(o.get("pair") or o.get("symbol") or o.get("asset")) == sym
+                            and max(0.0,float(o.get("volume") or 0)-float(o.get("executed") or 0)) > 1e-12
+                            for o in orders_now
+                        )
+
+                    exchange_snapshot_valid = (
+                        isinstance(margin.get("positions"), list)
+                        and isinstance(margin.get("open_orders"), list)
+                        and not margin.get("error")
+                    )
+                    if exchange_snapshot_valid and not any(_has_current_state(s) for s in remaining_symbols):
+                        with self.lock:
+                            for sym in list(startup_symbols):
+                                self.state.positions.pop(sym, None)
+                            if self.state.active_symbol in startup_symbols:
+                                self.state.active_symbol=None
+                                self.state.coin=0.0
+                                self.state.is_short=False
+                                self.state.entry_price=None
+                                self.state.entry_time=None
+                                self.state.highest_price=None
+                                self.state.stop_price=None
+                                self.state.target_price=None
+                                self.state.active_stop_order_id=None
+                            for oid,rec in (getattr(self.state,"kraken_margin_owned",{}) or {}).items():
+                                if _canon_start_symbol(rec.get("symbol")) in remaining_symbols:
+                                    if str(rec.get("status") or "").lower() in {"open","pending","adopted"}:
+                                        rec["status"]="closed_recovered"
+                                        rec["closed_ts"]=time.time()
+                                        rec["close_source"]="kraken_startup_flat"
+                            self.state.last_error=None
+                            self.state.last_signal="Kraken startup cleared stale local/owned exposure; exchange is flat"
+                            self.save_state()
+                        margin=self.reconcile_kraken_margin(force=True)
+
+                    if not margin.get("healthy"):
+                        detail = margin.get("error") or "; ".join(margin.get("mismatches") or []) or margin.get("status") or "unknown margin reconciliation failure"
+                        raise RuntimeError(f"Kraken margin reconciliation failed: {detail}")
 
             if margin.get("recovered_closed_positions"):
                 with self.lock:
@@ -7837,8 +7894,39 @@ class PaperBot:
                     if lp.get("source")=="kraken_margin_owned":
                         rec=owned.get(lp.get("order_id"),{})
                         age=now-float(rec.get("created_ts") or now)
+
+                        # If Kraken has neither the position nor the order anymore,
+                        # this ownership record is stale. It must NOT lock startup.
+                        # A very recent ownership record is still given a short
+                        # grace period because the order may have just been submitted
+                        # and OpenOrders can lag briefly.
                         if age<30:
-                            result.setdefault("pending_owned_orders",[]).append({"order_id":lp.get("order_id"),"symbol":lp["symbol"],"age_seconds":age})
+                            result.setdefault("pending_owned_orders",[]).append({
+                                "order_id":lp.get("order_id"),
+                                "symbol":lp["symbol"],
+                                "age_seconds":age
+                            })
+                            continue
+
+                        has_any_current_exchange_state = any(
+                            _kraken_position_matches_symbol(k,lp["symbol"])
+                            and max(0.0,float(k.get("volume") or 0)-float(k.get("volume_closed") or 0)) > 0
+                            for k in result.get("positions",[])
+                        ) or any(
+                            _kraken_position_matches_symbol({"pair":o.get("pair")},lp["symbol"])
+                            and max(0.0,float(o.get("volume") or 0)-float(o.get("executed") or 0)) > 1e-12
+                            for o in result.get("open_orders",[])
+                        )
+
+                        if not has_any_current_exchange_state:
+                            rec["status"]="closed_recovered"
+                            rec["closed_ts"]=time.time()
+                            rec["close_source"]="kraken_current_state_flat"
+                            result.setdefault("recovered_closed_positions",[]).append({
+                                "symbol":lp["symbol"],
+                                "order_id":lp.get("order_id"),
+                                "reason":"Kraken has no current position or open order"
+                            })
                             continue
 
                     # D10.5: Kraken may already have filled Auxo's TP/SL cover while
