@@ -7076,21 +7076,46 @@ class PaperBot:
                 self.state.last_action_time = time.time()
                 self.state.is_short = True
 
-                self.state.positions[symbol] = {
-                    "quantity": -coin_bought,
-                    "entry_price": price,
-                    "highest_price": price,
-                    "stop_price": stop_price,
-                    "target_price": target_price,
-                    "exit_mode": exit_mode,
-                    "partial_take_profit_done": False,
-                    "entry_cost": spend,
-                    "opened_at": now_iso(),
-                    "is_short": True,
-                    "entry_time": time.time(),
-                    "lowest_price": price,
-                    "learning_context": self.build_learning_context(symbol, price, settings),
-                }
+                existing = self.state.positions.get(symbol)
+                if existing and bool(existing.get("is_short")):
+                    old_qty = abs(float(existing.get("quantity") or 0.0))
+                    new_qty = old_qty + coin_bought
+                    old_cost = abs(float(existing.get("entry_cost") or 0.0))
+                    total_cost = old_cost + spend
+                    weighted_entry = (
+                        ((old_qty * float(existing.get("entry_price") or price)) + (coin_bought * price)) / new_qty
+                        if new_qty > 0 else price
+                    )
+                    self.state.positions[symbol] = {
+                        **existing,
+                        "quantity": -new_qty,
+                        "entry_price": weighted_entry,
+                        "highest_price": max(float(existing.get("highest_price") or price), price),
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "exit_mode": exit_mode,
+                        "partial_take_profit_done": False,
+                        "entry_cost": total_cost,
+                        "is_short": True,
+                        "entry_time": min(float(existing.get("entry_time") or time.time()), time.time()),
+                        "lowest_price": min(float(existing.get("lowest_price") or price), price),
+                    }
+                else:
+                    self.state.positions[symbol] = {
+                        "quantity": -coin_bought,
+                        "entry_price": price,
+                        "highest_price": price,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "exit_mode": exit_mode,
+                        "partial_take_profit_done": False,
+                        "entry_cost": spend,
+                        "opened_at": now_iso(),
+                        "is_short": True,
+                        "entry_time": time.time(),
+                        "lowest_price": price,
+                        "learning_context": self.build_learning_context(symbol, price, settings),
+                    }
 
                 trade = Trade(
                     time=now_iso(),
@@ -7129,21 +7154,46 @@ class PaperBot:
                 self.state.last_action_time = time.time()
                 self.state.is_short = False
 
-                self.state.positions[symbol] = {
-                    "quantity": coin_bought,
-                    "entry_price": price,
-                    "highest_price": price,
-                    "stop_price": stop_price,
-                    "target_price": target_price,
-                    "exit_mode": exit_mode,
-                    "partial_take_profit_done": False,
-                    "entry_cost": spend,
-                    "opened_at": now_iso(),
-                    "is_short": False,
-                    "entry_time": time.time(),
-                    "lowest_price": price,
-                    "learning_context": self.build_learning_context(symbol, price, settings),
-                }
+                existing = self.state.positions.get(symbol)
+                if existing and not bool(existing.get("is_short")):
+                    old_qty = max(0.0, float(existing.get("quantity") or 0.0))
+                    new_qty = old_qty + coin_bought
+                    old_cost = max(0.0, float(existing.get("entry_cost") or 0.0))
+                    total_cost = old_cost + spend
+                    weighted_entry = (
+                        ((old_qty * float(existing.get("entry_price") or price)) + (coin_bought * price)) / new_qty
+                        if new_qty > 0 else price
+                    )
+                    self.state.positions[symbol] = {
+                        **existing,
+                        "quantity": new_qty,
+                        "entry_price": weighted_entry,
+                        "highest_price": max(float(existing.get("highest_price") or price), price),
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "exit_mode": exit_mode,
+                        "partial_take_profit_done": False,
+                        "entry_cost": total_cost,
+                        "is_short": False,
+                        "entry_time": min(float(existing.get("entry_time") or time.time()), time.time()),
+                        "lowest_price": min(float(existing.get("lowest_price") or price), price),
+                    }
+                else:
+                    self.state.positions[symbol] = {
+                        "quantity": coin_bought,
+                        "entry_price": price,
+                        "highest_price": price,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "exit_mode": exit_mode,
+                        "partial_take_profit_done": False,
+                        "entry_cost": spend,
+                        "opened_at": now_iso(),
+                        "is_short": False,
+                        "entry_time": time.time(),
+                        "lowest_price": price,
+                        "learning_context": self.build_learning_context(symbol, price, settings),
+                    }
 
                 trade = Trade(
                     time=now_iso(),
@@ -13315,12 +13365,20 @@ def exit_prices(
     entry_price: float,
     candles: list[Candle],
     settings: dict[str, Any],
+    position_side: str = "LONG",
 ) -> tuple[float, float, str]:
-    """Backtest-safe exit calculation without PaperBot instance state."""
+    """Backtest-safe exit calculation without PaperBot instance state.
+
+    Supports both LONG and SHORT.  The live strategy already passes
+    position_side, so the standalone helper must accept it too.
+    """
+    short = str(position_side or "LONG").upper() == "SHORT"
     if not candles or len(candles) < 14:
+        sl = float(settings["stop_loss_pct"]) / 100
+        tp = float(settings["take_profit_pct"]) / 100
         return (
-            entry_price * (1 - float(settings["stop_loss_pct"]) / 100),
-            entry_price * (1 + float(settings["take_profit_pct"]) / 100),
+            entry_price * (1 + sl) if short else entry_price * (1 - sl),
+            entry_price * (1 - tp) if short else entry_price * (1 + tp),
             "fixed",
         )
 
@@ -13330,9 +13388,9 @@ def exit_prices(
         if atr_value > 0:
             stop_mult = float(settings.get("atr_stop_multiplier", 1.5))
             target_mult = float(settings.get("atr_target_multiplier", 2.5))
-            stop = entry_price - (atr_value * stop_mult)
-            target = entry_price + (atr_value * target_mult)
-            if (entry_price - stop) / entry_price * 100 >= 0.2:
+            stop = entry_price + (atr_value * stop_mult) if short else entry_price - (atr_value * stop_mult)
+            target = entry_price - (atr_value * target_mult) if short else entry_price + (atr_value * target_mult)
+            if abs(entry_price - stop) / entry_price * 100 >= 0.2:
                 return stop, target, f"ATR ({atr_value:.4f})"
 
     if settings.get("use_dynamic_sr_exits"):
@@ -13343,14 +13401,22 @@ def exit_prices(
         if support and resistance and confirmed:
             stop_buffer = float(settings.get("support_stop_buffer_pct", 2.0)) / 100
             target_buffer = float(settings.get("resistance_target_buffer_pct", 0.5)) / 100
-            sr_stop = float(support) * (1 - stop_buffer)
-            sr_target = float(resistance) * (1 - target_buffer)
-            if sr_stop < entry_price < sr_target:
-                return sr_stop, sr_target, "S/R"
+            if short:
+                sr_stop = float(resistance) * (1 + stop_buffer)
+                sr_target = float(support) * (1 + target_buffer)
+                if sr_target < entry_price < sr_stop:
+                    return sr_stop, sr_target, "S/R"
+            else:
+                sr_stop = float(support) * (1 - stop_buffer)
+                sr_target = float(resistance) * (1 - target_buffer)
+                if sr_stop < entry_price < sr_target:
+                    return sr_stop, sr_target, "S/R"
 
+    sl = float(settings["stop_loss_pct"]) / 100
+    tp = float(settings["take_profit_pct"]) / 100
     return (
-        entry_price * (1 - float(settings["stop_loss_pct"]) / 100),
-        entry_price * (1 + float(settings["take_profit_pct"]) / 100),
+        entry_price * (1 + sl) if short else entry_price * (1 - sl),
+        entry_price * (1 - tp) if short else entry_price * (1 + tp),
         "fixed",
     )
 
