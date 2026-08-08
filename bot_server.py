@@ -8462,6 +8462,30 @@ class PaperBot:
 
         max_order = float(settings["max_live_order_gbp"])
         max_daily_loss = float(settings["max_daily_live_loss_gbp"])
+
+        # Do not stack live entry orders for the same symbol while one is still
+        # pending. A Kraken maker BUY can reserve quote funds at the exchange.
+        with self.lock:
+            duplicate_entry = next(
+                (
+                    o for o in self.state.open_orders
+                    if o.symbol.upper() == symbol.upper()
+                    and o.role == "ENTRY"
+                    and o.status not in {"FILLED","CANCELLED","CANCELED","FAILED","EXPIRED","REJECTED","RECONCILE_ERROR"}
+                ),
+                None,
+            )
+        if duplicate_entry is not None:
+            with self.lock:
+                self.state.last_signal = (
+                    f"LIVE {'SHORT' if is_short else 'BUY'} blocked: "
+                    f"existing entry order {duplicate_entry.order_id} is still {duplicate_entry.status}"
+                )
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {
+                    "existing_order_id": duplicate_entry.order_id,
+                    "existing_order_status": duplicate_entry.status,
+                })
+            return
         max_daily_spend = float(settings.get("max_daily_live_spend_quote", 250.0))
         max_coinbase_positions = int(settings.get("max_coinbase_open_trades", 3))
 
@@ -8574,10 +8598,24 @@ class PaperBot:
             return
 
         gbp_available = self.live_available_balance(effective_quote)
-        if gbp_available < quote_size:
+        fee_rate = max(0.0, float(settings.get("trade_fee", 0.004)))
+        fee_buffer = 0.001
+        spendable_quote = gbp_available / (1.0 + fee_rate + fee_buffer)
+        if quote_size > spendable_quote:
+            quote_size = round(spendable_quote, 2)
+        if quote_size < minimum_order:
             with self.lock:
-                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: only {settings['quote_currency']} {gbp_available:.2f} available"
-                self.journal(symbol, "BLOCK", self.state.last_signal, price, {"available": gbp_available, "quote_size": quote_size})
+                self.state.last_signal = (
+                    f"LIVE {'SHORT' if is_short else 'BUY'} blocked: "
+                    f"only {gbp_available:.2f} {effective_quote} is spendable after "
+                    f"reserved funds/fees"
+                )
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {
+                    "available": gbp_available,
+                    "spendable": spendable_quote,
+                    "fee_rate": fee_rate,
+                    "quote_size": quote_size,
+                })
             return
 
         product_id = f"{symbol}-{settings['quote_currency']}"
@@ -8719,9 +8757,29 @@ class PaperBot:
                     self.journal(symbol, "INFO", self.state.last_signal, price, {"order": order, "fill": fill})
 
         except Exception as e:
+            msg=str(e)
+            if active_exchange=="kraken" and "EOrder:Insufficient funds" in msg:
+                available_now=None
+                try:
+                    available_now=self.live_available_balance(effective_quote)
+                except Exception:
+                    pass
+                with self.lock:
+                    self.state.last_signal=(
+                        f"LIVE {'SHORT' if is_short else 'BUY'} rejected by Kraken: "
+                        f"insufficient spendable {effective_quote} (no order created)"
+                    )
+                    self.journal(symbol,"ERROR",self.state.last_signal,price,{
+                        "kraken_error":msg,
+                        "available_after_rejection":available_now,
+                        "quote_size":quote_size,
+                        "exchange_order_created":False,
+                    })
+                logger.warning("Kraken rejected live order before creation: %s",msg)
+                return
             with self.lock:
-                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} error: {e}"
-                self.journal(symbol, "ERROR", self.state.last_signal, price)
+                self.state.last_signal=f"LIVE {'SHORT' if is_short else 'BUY'} error: {e}"
+                self.journal(symbol,"ERROR",self.state.last_signal,price)
             logger.error(f"Live order error: {e}")
             raise
 
@@ -9144,71 +9202,80 @@ class PaperBot:
 
     def replace_order(self, order: ManagedOrder) -> None:
         try:
-            replacement_order_type = order.order_type
-            replacement_price = order.price
+            active_exchange=self.live_exchange()
+            replacement_order_type=order.order_type
+            replacement_price=order.price
 
-            if order.order_type == "maker" and order.base_size:
-                retry_limit = int(self.state.settings.get("order_retry_limit", 1))
-                if order.retry_count < retry_limit:
-                    ticker = fetch_coinbase_ticker(
-                        order.symbol,
-                        str(self.state.settings.get("quote_currency", "GBP")),
-                    )
-                    bid = float(ticker.get("bid") or 0.0)
-                    ask = float(ticker.get("ask") or 0.0)
-                    offset = max(0.0, float(self.state.settings.get("coinbase_maker_offset_pct", 0.0))) / 100.0
-                    raw_price = bid * (1.0 - offset) if order.side == "BUY" else ask * (1.0 + offset)
-                    replacement_price = self.coinbase_round_price(raw_price, order.product_id)
-                    replacement = coinbase_limit_order(
-                        product_id=order.product_id,
-                        side=order.side,
-                        base_size=order.base_size,
-                        limit_price=replacement_price,
-                        post_only=True,
-                    )
-                elif bool(self.state.settings.get("coinbase_maker_market_fallback", True)):
-                    replacement_order_type = "market"
-                    if order.side == "BUY" and order.quote_size:
-                        replacement = coinbase_market_order(order.product_id, order.side, quote_size=order.quote_size)
+            if active_exchange=="kraken":
+                quote=str(self.state.settings.get("quote_currency","USDT"))
+                if order.order_type=="maker" and order.base_size:
+                    guard=live_market_guard(
+                        "kraken", order.symbol, quote,
+                        int(self.state.settings.get("live_granularity",3600)),
+                        int(self.state.settings.get("live_candle_count",300)),
+                        float(self.state.settings.get("max_live_spread_pct",0.35)), 0.0)
+                    bid=float(guard.get("bid") or 0)
+                    ask=float(guard.get("ask") or 0)
+                    if bid<=0 or ask<=0:
+                        if not bool(self.state.settings.get("kraken_maker_market_fallback",True)):
+                            return
+                        replacement_order_type="market"
+                        px=ask or bid or float(order.price or self.state.last_price or 0)
+                        qty=self.live_round_size(float(order.quote_size or 0)/px if px>0 else float(order.base_size),order.symbol,quote)
+                        replacement=kraken_order(order.symbol,quote,order.side,"market",qty)
                     else:
-                        replacement = coinbase_market_order(order.product_id, order.side, base_size=order.base_size)
+                        offset=max(0.0,float(self.state.settings.get("kraken_maker_offset_pct",0)))/100
+                        raw=bid*(1-offset) if order.side=="BUY" else ask*(1+offset)
+                        replacement_price=self.live_round_price(raw,order.symbol,quote)
+                        replacement=kraken_order(order.symbol,quote,order.side,"limit",float(order.base_size),replacement_price,post_only=True)
+                elif order.order_type=="limit" and order.price and order.base_size:
+                    replacement=kraken_order(order.symbol,quote,order.side,"limit",float(order.base_size),float(order.price))
+                elif order.side=="BUY" and order.quote_size:
+                    replacement_order_type="market"
+                    px=float(order.price or self.state.last_price or 0)
+                    qty=self.live_round_size(float(order.quote_size)/px if px>0 else 0,order.symbol,quote)
+                    replacement=kraken_order(order.symbol,quote,order.side,"market",qty)
+                elif order.base_size:
+                    replacement_order_type="market"
+                    replacement=kraken_order(order.symbol,quote,order.side,"market",float(order.base_size))
                 else:
                     return
-            elif order.order_type == "limit" and order.price and order.base_size:
-                replacement = coinbase_limit_order(
-                    product_id=order.product_id,
-                    side=order.side,
-                    base_size=order.base_size,
-                    limit_price=order.price,
-                )
-            elif order.side == "BUY" and order.quote_size:
-                replacement_order_type = "market"
-                replacement = coinbase_market_order(order.product_id, order.side, quote_size=order.quote_size)
-            elif order.base_size:
-                replacement_order_type = "market"
-                replacement = coinbase_market_order(order.product_id, order.side, base_size=order.base_size)
+                replacement_id=str(replacement["order_id"])
             else:
-                return
-            replacement_id = coinbase_order_id(replacement)
-            new_order = self.track_order(
-                replacement_id,
-                order.symbol,
-                order.product_id,
-                order.side,
-                order.role,
-                replacement_order_type,
-                price=replacement_price,
-                base_size=order.base_size,
-                quote_size=order.quote_size,
-                reason=order.reason,
-                details=order.details,
-                client_order_id=replacement.get("client_order_id"),
-            )
-            new_order.retry_count = order.retry_count + 1
-            self.audit("ORDER_REPLACED", old_order_id=order.order_id, new_order_id=replacement_id)
-            logger.info(f"Order replaced: {order.order_id} → {replacement_id}")
+                if order.order_type=="maker" and order.base_size:
+                    retry_limit=int(self.state.settings.get("order_retry_limit",1))
+                    if order.retry_count<retry_limit:
+                        ticker=fetch_coinbase_ticker(order.symbol,str(self.state.settings.get("quote_currency","GBP")))
+                        bid=float(ticker.get("bid") or 0); ask=float(ticker.get("ask") or 0)
+                        offset=max(0.0,float(self.state.settings.get("coinbase_maker_offset_pct",0)))/100
+                        raw=bid*(1-offset) if order.side=="BUY" else ask*(1+offset)
+                        replacement_price=self.coinbase_round_price(raw,order.product_id)
+                        replacement=coinbase_limit_order(order.product_id,order.side,order.base_size,replacement_price,post_only=True)
+                    elif bool(self.state.settings.get("coinbase_maker_market_fallback",True)):
+                        replacement_order_type="market"
+                        replacement=coinbase_market_order(order.product_id,order.side,quote_size=order.quote_size) if order.side=="BUY" and order.quote_size else coinbase_market_order(order.product_id,order.side,base_size=order.base_size)
+                    else:
+                        return
+                elif order.order_type=="limit" and order.price and order.base_size:
+                    replacement=coinbase_limit_order(order.product_id,order.side,order.base_size,order.price)
+                elif order.side=="BUY" and order.quote_size:
+                    replacement_order_type="market"; replacement=coinbase_market_order(order.product_id,order.side,quote_size=order.quote_size)
+                elif order.base_size:
+                    replacement_order_type="market"; replacement=coinbase_market_order(order.product_id,order.side,base_size=order.base_size)
+                else:
+                    return
+                replacement_id=coinbase_order_id(replacement)
+
+            new_order=self.track_order(
+                replacement_id,order.symbol,order.product_id,order.side,order.role,
+                replacement_order_type,price=replacement_price,base_size=order.base_size,
+                quote_size=order.quote_size,reason=order.reason,details=order.details,
+                client_order_id=replacement.get("client_order_id") if isinstance(replacement,dict) else None)
+            new_order.retry_count=order.retry_count+1
+            self.audit("ORDER_REPLACED",old_order_id=order.order_id,new_order_id=replacement_id)
+            logger.info(f"Order replaced: {order.order_id} -> {replacement_id}")
         except Exception as exc:
-            self.audit("ORDER_REPLACE_FAILED", order_id=order.order_id, error=str(exc))
+            self.audit("ORDER_REPLACE_FAILED",order_id=order.order_id,error=str(exc))
             logger.warning(f"Order replace failed: {exc}")
 
     def submit_native_stop_for_position(self, entry_order: ManagedOrder, entry_price: float) -> None:
@@ -10095,14 +10162,43 @@ def kraken_round_size(v,s,q):
     return math.floor(float(v)*f)/f
 
 def kraken_available_balance(currency:str)->float:
+    """Return Kraken quote funds actually spendable after open-order reservations."""
     raw=(kraken_private("/0/private/Balance").get("result") or {})
-    aliases={"XXBT":"BTC","XBT":"BTC","XXDG":"DOGE","XDG":"DOGE","ZGBP":"GBP","ZUSD":"USD","ZEUR":"EUR","ZUSDT":"USDT"}
+    aliases={"XXBT":"BTC","XBT":"BTC","XXDG":"DOGE","XDG":"DOGE",
+             "ZGBP":"GBP","ZUSD":"USD","ZEUR":"EUR","ZUSDT":"USDT"}
     total=0.0
     for a,v in raw.items():
         clean=aliases.get(a,a)
-        if clean.startswith(("X","Z")) and len(clean)==4: clean=clean[1:]
-        if clean.upper()==currency.upper(): total+=float(v or 0)
-    return total
+        if clean.startswith(("X","Z")) and len(clean)==4:
+            clean=clean[1:]
+        if clean.upper()==currency.upper():
+            total += float(v or 0)
+
+    reserved=0.0
+    try:
+        result=kraken_private("/0/private/OpenOrders",{"trades":"false"}).get("result") or {}
+        rows=result.get("open") if isinstance(result,dict) else result
+        iterable=rows.values() if isinstance(rows,dict) else (rows if isinstance(rows,list) else [])
+        quote_u=str(currency or "").upper()
+        for row in iterable:
+            if not isinstance(row,dict):
+                continue
+            descr=row.get("descr") if isinstance(row.get("descr"),dict) else {}
+            if str(descr.get("type") or "").lower() != "buy":
+                continue
+            pair=str(descr.get("pair") or "").upper()
+            normalized=pair.replace("ZUSDT","USDT").replace("ZEUR","EUR").replace("ZGBP","GBP").replace("ZUSD","USD")
+            if quote_u and not normalized.endswith(quote_u):
+                continue
+            volume=float(row.get("vol") or 0.0)
+            price=float(row.get("price") or descr.get("price") or 0.0)
+            cost=float(row.get("cost") or 0.0)
+            if cost <= 0 and volume > 0 and price > 0:
+                cost=volume*price
+            reserved += max(0.0,cost)
+    except Exception:
+        pass
+    return max(0.0,total-reserved)
 
 def kraken_margin_snapshot(ledger_limit:int=100, quote_asset:str="USD")->dict[str,Any]:
     """Fetch Kraken margin state defensively across dict/list response shapes."""
