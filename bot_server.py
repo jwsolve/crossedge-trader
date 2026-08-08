@@ -8630,7 +8630,25 @@ class PaperBot:
                 # QueryOrders/OpenOrders/TradesHistory still cannot find it,
                 # treat the local order as cancelled/unknown and allow a fresh
                 # signal rather than blocking the market forever.
-                age = max(0.0, time.time() - float(active_entry.created_at_epoch or 0.0))
+                created_epoch = getattr(active_entry, "created_at_epoch", None)
+                if created_epoch is None:
+                    created_epoch = getattr(active_entry, "created_at", None)
+                try:
+                    created_epoch = float(created_epoch or 0.0)
+                except (TypeError, ValueError):
+                    created_epoch = 0.0
+
+                # If the legacy order has no epoch at all, use its ISO
+                # timestamp when available. Never treat a missing timestamp
+                # as "brand new" forever.
+                if created_epoch <= 0:
+                    iso = getattr(active_entry, "created_at", None) or getattr(active_entry, "updated_at", None)
+                    try:
+                        created_epoch = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        created_epoch = time.time() - 3600
+
+                age = max(0.0, time.time() - created_epoch)
                 grace = float(self.state.settings.get("order_reconcile_grace_seconds", 45.0))
                 if age >= grace:
                     active_entry.status = "CANCELLED"
@@ -10450,7 +10468,26 @@ def kraken_reconcile_order(oid):
             ).get("result") or {}
             row = result.get(oid)
             if isinstance(row, dict) and row:
-                return _kraken_reconcile_row(oid, row)
+                status = str(row.get("status") or "").upper()
+                if status not in {"OPEN", "PENDING"}:
+                    return _kraken_reconcile_row(oid, row)
+
+                # QueryOrders can transiently report an order as OPEN even
+                # after it has disappeared from Kraken's live open-order set.
+                # Verify that OPEN really means open before Auxo blocks a new
+                # entry on this local record.
+                try:
+                    open_result = kraken_private(
+                        "/0/private/OpenOrders",
+                        {"trades": "true"},
+                    ).get("result") or {}
+                    open_rows = open_result.get("open") if isinstance(open_result, dict) else {}
+                    if isinstance(open_rows, dict) and oid in open_rows:
+                        return _kraken_reconcile_row(oid, row, forced_status="OPEN")
+                except Exception as exc:
+                    last_error = exc
+                # Not in OpenOrders: continue to TradesHistory rather than
+                # accepting a stale OPEN QueryOrders response.
         except Exception as exc:
             last_error = exc
             if "rate limit" in str(exc).lower():
