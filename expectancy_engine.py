@@ -126,10 +126,45 @@ class ExpectancyEngine:
 
     # ─── Core computations ─────────────────────────────────────────
 
+    @staticmethod
+    def _is_completed_trade(t: Any) -> bool:
+        """Only include realised/completed trades in performance statistics.
+
+        A cancelled/rejected/expired order with no execution is an order event,
+        not a trade. Open/pending entries are also excluded until they have an
+        exit. Partially filled entries remain eligible as executions but do not
+        become a closed trade until an exit/PnL record exists.
+        """
+        status = str(
+            getattr(t, "exchange_order_status", None)
+            or getattr(t, "status", None)
+            or ""
+        ).upper().strip()
+        filled = getattr(t, "exchange_filled_size", None)
+        if filled is None:
+            filled = getattr(t, "filled_size", None)
+        filled = abs(float(filled or 0.0))
+
+        if status in {"CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED",
+                       "PENDING", "UNFILLED"} and filled <= 1e-12:
+            return False
+
+        # A trade contributes to win/loss/expectancy only after it has an exit
+        # or an explicit completed status. This prevents open entries with the
+        # default pnl=0 from becoming break-even trades.
+        exit_price = getattr(t, "exit_price", None)
+        if exit_price is None and status not in {"FILLED", "CLOSED", "EXECUTED"}:
+            return False
+        return hasattr(t, "pnl")
+
     def compute_stats(self, trades: Optional[List] = None) -> TradeStats:
-        """Compute all statistics for a list of trades."""
+        """Compute statistics from completed/executed trades only."""
         if trades is None:
             trades = self._trades
+        if not trades:
+            return TradeStats()
+
+        trades = [t for t in trades if self._is_completed_trade(t)]
         if not trades:
             return TradeStats()
 

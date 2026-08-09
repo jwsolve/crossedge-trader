@@ -5216,6 +5216,10 @@ class PaperBot:
         def eligible(row:dict[str,Any])->bool:
             reason=str(row.get("reason") or ""); ru=reason.upper()
             rx=str(row.get("exchange") or "").lower()
+            status=str(row.get("exchange_order_status") or row.get("status") or "").upper().strip()
+            filled=float(row.get("exchange_filled_size") or row.get("filled_size") or 0.0)
+            if status in {"CANCELLED","CANCELED","REJECTED","FAILED","EXPIRED","PENDING","UNFILLED"} and abs(filled) <= 1e-12:
+                return False
             if is_live and not row.get("exchange_order_id"): return False
             if active_exchange=="kraken":
                 if rx and rx!="kraken": return False
@@ -8729,7 +8733,7 @@ class PaperBot:
                     bid = float(guard.get("bid") or 0.0)
                     ask = float(guard.get("ask") or 0.0)
                     if bid <= 0 or ask <= 0:
-                        raise RuntimeError(f"Maker-first entry requires a valid {active_exchange.title()} bid/ask")
+                        raise RuntimeError("Maker-first entry requires a valid Coinbase bid/ask")
                     raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
                     limit_price = self.live_round_price(raw_maker_price,symbol,str(settings["quote_currency"]))
                 else:
@@ -13144,11 +13148,40 @@ def setup_edge_score(records: list[SetupRecord], symbol: str, settings_key: str)
 def recent_setup_records(records: list[SetupRecord], limit: int = 40) -> list[dict[str, Any]]:
     return [asdict(record) for record in records[-limit:]][::-1]
 
+def _trade_has_execution(trade: Any) -> bool:
+    """Return True when an order has an actual execution/fill.
+
+    Cancelled/rejected/expired orders with zero filled quantity are order
+    events, not trades, and must not affect trade counts or win/loss stats.
+    """
+    status = str(
+        getattr(trade, "exchange_order_status", None)
+        or getattr(trade, "status", None)
+        or ""
+    ).upper().strip()
+    filled = getattr(trade, "exchange_filled_size", None)
+    if filled is None:
+        filled = getattr(trade, "filled_size", None)
+    qty = abs(float(filled or 0.0))
+    if status in {"CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED", "PENDING", "UNFILLED"} and qty <= 1e-12:
+        return False
+    # A normal paper trade has no exchange status; keep it. A live order with
+    # an explicit status is only considered executable when it actually filled.
+    if status and status not in {"FILLED", "CLOSED", "EXECUTED", "PARTIALLY_FILLED",
+                                "CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED",
+                                "PENDING", "UNFILLED"} and qty <= 1e-12:
+        return False
+    return True
+
+
 def symbol_performance(trades: list[Trade]) -> list[dict[str, Any]]:
     open_buys: dict[str, list[Trade]] = {}
     stats: dict[str, dict[str, Any]] = {}
 
     for trade in trades:
+        if not _trade_has_execution(trade):
+            continue
+
         symbol = trade.symbol
         stats.setdefault(symbol, {
             "symbol": symbol,
@@ -13159,7 +13192,7 @@ def symbol_performance(trades: list[Trade]) -> list[dict[str, Any]]:
             "losses": 0,
             "fees": 0.0,
         })
-        stats[symbol]["fees"] += trade.fee_paid
+        stats[symbol]["fees"] += float(trade.fee_paid or 0.0)
 
         if trade.side == "BUY":
             stats[symbol]["buys"] += 1
@@ -13183,8 +13216,6 @@ def symbol_performance(trades: list[Trade]) -> list[dict[str, Any]]:
                 stats[symbol]["wins"] += 1
             else:
                 stats[symbol]["losses"] += 1
-        elif trade.side == "BUY" and trade.quantity < 0:
-            stats[symbol]["sells"] += 1
 
     rows = []
     for row in stats.values():
@@ -13207,53 +13238,14 @@ def live_market_guard(
     max_spread_pct: float,
     min_quote_volume: float,
 ) -> dict[str, Any]:
-    exchange = str(exchange or "").lower().strip()
+    if exchange.lower() != "coinbase":
+        return {"ok": True, "reason": "Guard only enforced for Coinbase live trading"}
 
-    if exchange == "coinbase":
-        ticker = fetch_coinbase_ticker(symbol, quote_currency)
-        bid = float(ticker.get("bid") or 0.0)
-        ask = float(ticker.get("ask") or 0.0)
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return {"ok": False, "reason": "invalid Coinbase bid/ask"}
-
-    elif exchange == "kraken":
-        # Maker-first Kraken orders need the actual Kraken top-of-book.
-        # Previously this function returned immediately for Kraken, so the
-        # caller received no bid/ask and maker orders failed with:
-        # "Maker-first entry requires a valid Coinbase bid/ask".
-        info = kraken_pair_info(symbol, quote_currency)
-        pair = str(info.get("pair") or "").strip()
-        if not pair:
-            return {"ok": False, "reason": f"Kraken pair unavailable: {symbol}/{quote_currency}"}
-
-        raw = fetch_json(
-            "https://api.kraken.com/0/public/Ticker?"
-            + urllib.parse.urlencode({"pair": pair})
-        )
-        if raw.get("error"):
-            return {
-                "ok": False,
-                "reason": "Kraken ticker error: " + "; ".join(raw.get("error") or [])
-            }
-
-        result = raw.get("result") or {}
-        ticker = next(iter(result.values()), {}) if result else {}
-        try:
-            bid = float((ticker.get("b") or [0])[0])
-            ask = float((ticker.get("a") or [0])[0])
-        except (TypeError, ValueError, IndexError):
-            bid = ask = 0.0
-
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return {
-                "ok": False,
-                "reason": f"invalid Kraken bid/ask for {symbol}/{quote_currency}",
-                "bid": bid,
-                "ask": ask,
-                "pair": pair,
-            }
-    else:
-        return {"ok": False, "reason": f"unsupported live exchange: {exchange}"}
+    ticker = fetch_coinbase_ticker(symbol, quote_currency)
+    bid = float(ticker.get("bid") or 0.0)
+    ask = float(ticker.get("ask") or 0.0)
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return {"ok": False, "reason": "invalid Coinbase bid/ask"}
 
     midpoint = (bid + ask) / 2
     spread_pct = ((ask - bid) / midpoint) * 100 if midpoint else 100.0
