@@ -8729,7 +8729,7 @@ class PaperBot:
                     bid = float(guard.get("bid") or 0.0)
                     ask = float(guard.get("ask") or 0.0)
                     if bid <= 0 or ask <= 0:
-                        raise RuntimeError("Maker-first entry requires a valid Coinbase bid/ask")
+                        raise RuntimeError(f"Maker-first entry requires a valid {active_exchange.title()} bid/ask")
                     raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
                     limit_price = self.live_round_price(raw_maker_price,symbol,str(settings["quote_currency"]))
                 else:
@@ -13207,14 +13207,53 @@ def live_market_guard(
     max_spread_pct: float,
     min_quote_volume: float,
 ) -> dict[str, Any]:
-    if exchange.lower() != "coinbase":
-        return {"ok": True, "reason": "Guard only enforced for Coinbase live trading"}
+    exchange = str(exchange or "").lower().strip()
 
-    ticker = fetch_coinbase_ticker(symbol, quote_currency)
-    bid = float(ticker.get("bid") or 0.0)
-    ask = float(ticker.get("ask") or 0.0)
-    if bid <= 0 or ask <= 0 or ask < bid:
-        return {"ok": False, "reason": "invalid Coinbase bid/ask"}
+    if exchange == "coinbase":
+        ticker = fetch_coinbase_ticker(symbol, quote_currency)
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return {"ok": False, "reason": "invalid Coinbase bid/ask"}
+
+    elif exchange == "kraken":
+        # Maker-first Kraken orders need the actual Kraken top-of-book.
+        # Previously this function returned immediately for Kraken, so the
+        # caller received no bid/ask and maker orders failed with:
+        # "Maker-first entry requires a valid Coinbase bid/ask".
+        info = kraken_pair_info(symbol, quote_currency)
+        pair = str(info.get("pair") or "").strip()
+        if not pair:
+            return {"ok": False, "reason": f"Kraken pair unavailable: {symbol}/{quote_currency}"}
+
+        raw = fetch_json(
+            "https://api.kraken.com/0/public/Ticker?"
+            + urllib.parse.urlencode({"pair": pair})
+        )
+        if raw.get("error"):
+            return {
+                "ok": False,
+                "reason": "Kraken ticker error: " + "; ".join(raw.get("error") or [])
+            }
+
+        result = raw.get("result") or {}
+        ticker = next(iter(result.values()), {}) if result else {}
+        try:
+            bid = float((ticker.get("b") or [0])[0])
+            ask = float((ticker.get("a") or [0])[0])
+        except (TypeError, ValueError, IndexError):
+            bid = ask = 0.0
+
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return {
+                "ok": False,
+                "reason": f"invalid Kraken bid/ask for {symbol}/{quote_currency}",
+                "bid": bid,
+                "ask": ask,
+                "pair": pair,
+            }
+    else:
+        return {"ok": False, "reason": f"unsupported live exchange: {exchange}"}
 
     midpoint = (bid + ask) / 2
     spread_pct = ((ask - bid) / midpoint) * 100 if midpoint else 100.0
