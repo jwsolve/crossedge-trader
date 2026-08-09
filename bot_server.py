@@ -7767,6 +7767,11 @@ class PaperBot:
         backoff_until=float(getattr(self,"_kraken_margin_backoff_until",0) or 0)
 
         # Normal status/safety polling reuses a recent snapshot instead of spending private API quota.
+        # Even forced startup recovery should not issue duplicate private requests
+        # within a few seconds. The first snapshot is authoritative for this
+        # startup pass; repeated recovery calls can reuse it.
+        if cached and now-float(cached.get("_ts",0))<10:
+            return {**cached,"cache":{"used":True,"age_seconds":round(now-float(cached.get("_ts",0)),2),"ttl_seconds":10}}
         if cached and not force and now-float(cached.get("_ts",0))<30:
             return {**cached,"cache":{"used":True,"age_seconds":round(now-float(cached.get("_ts",0)),2),"ttl_seconds":30}}
 
@@ -10087,26 +10092,79 @@ def kraken_live_is_armed() -> bool:
     return bool(kraken_api_configured() and
                 os.environ.get("LIVE_TRADING_CONFIRM","")=="I_UNDERSTAND_THIS_PLACES_REAL_ORDERS")
 
+_KRAKEN_PRIVATE_LOCK = threading.Lock()
+_KRAKEN_PRIVATE_LAST_CALL = 0.0
+_KRAKEN_PRIVATE_MIN_INTERVAL = 1.05
+
 def kraken_private(path: str, params: dict[str, Any] | None=None) -> dict[str, Any]:
-    # Private Kraken endpoints such as OpenPositions, OpenOrders, TradeBalance
-    # and Ledgers are allowed in D8.4 read-only mode. Order-producing helpers
-    # enforce kraken_live_is_armed() separately.
+    """Call a Kraken private endpoint without bursting the API rate limit."""
+    global _KRAKEN_PRIVATE_LAST_CALL
+
     if not kraken_api_configured():
         raise RuntimeError("Kraken private API unavailable: configure KRAKEN_API_KEY and KRAKEN_API_SECRET")
-    p=dict(params or {}); nonce=str(time.time_ns()); p["nonce"]=nonce
-    post=urllib.parse.urlencode(p)
-    msg=path.encode()+hashlib.sha256((nonce+post).encode()).digest()
-    secret=base64.b64decode(os.environ["KRAKEN_API_SECRET"])
-    sig=base64.b64encode(hmac.new(secret,msg,hashlib.sha512).digest()).decode()
-    req=urllib.request.Request("https://api.kraken.com"+path,data=post.encode(),method="POST",
-        headers={"API-Key":os.environ["KRAKEN_API_KEY"].strip(),"API-Sign":sig,
-                 "Content-Type":"application/x-www-form-urlencoded","User-Agent":"auxo/1.0"})
-    try:
-        with urllib.request.urlopen(req,timeout=15) as r: data=json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Kraken API error {e.code}: {e.read().decode(errors='replace')}") from e
-    if data.get("error"): raise RuntimeError("Kraken API rejected request: "+"; ".join(data["error"]))
-    return data
+
+    last_error = None
+
+    # Serialize private calls process-wide. Reconciliation, order handling and
+    # startup recovery must not hammer Kraken concurrently.
+    with _KRAKEN_PRIVATE_LOCK:
+        for attempt in range(2):
+            wait = _KRAKEN_PRIVATE_MIN_INTERVAL - (time.monotonic() - _KRAKEN_PRIVATE_LAST_CALL)
+            if wait > 0:
+                time.sleep(wait)
+
+            p=dict(params or {})
+            p["nonce"]=str(time.time_ns())
+            post=urllib.parse.urlencode(p)
+            path_bytes=path.encode()
+            msg=path_bytes+hashlib.sha256((p["nonce"]+post).encode()).digest()
+            secret=base64.b64decode(os.environ["KRAKEN_API_SECRET"])
+            sig=base64.b64encode(hmac.new(secret,msg,hashlib.sha512).digest()).decode()
+            req=urllib.request.Request(
+                "https://api.kraken.com"+path,
+                data=post.encode(),
+                method="POST",
+                headers={
+                    "API-Key":os.environ["KRAKEN_API_KEY"].strip(),
+                    "API-Sign":sig,
+                    "Content-Type":"application/x-www-form-urlencoded",
+                    "User-Agent":"auxo/1.0",
+                },
+            )
+
+            try:
+                with urllib.request.urlopen(req,timeout=15) as r:
+                    data=json.loads(r.read().decode())
+                _KRAKEN_PRIVATE_LAST_CALL=time.monotonic()
+
+                errors=data.get("error") or []
+                if errors:
+                    msg_text="; ".join(str(x) for x in errors)
+                    if "rate limit" in msg_text.lower() and attempt == 0:
+                        # Kraken's private limiter decays; wait before one controlled
+                        # retry instead of immediately issuing another request.
+                        time.sleep(2.5)
+                        continue
+                    raise RuntimeError("Kraken API rejected request: "+msg_text)
+
+                return data
+
+            except urllib.error.HTTPError as e:
+                _KRAKEN_PRIVATE_LAST_CALL=time.monotonic()
+                body=e.read().decode(errors="replace")
+                if "rate limit" in body.lower() and attempt == 0:
+                    time.sleep(2.5)
+                    continue
+                raise RuntimeError(f"Kraken API error {e.code}: {body}") from e
+            except RuntimeError as exc:
+                last_error = exc
+                if "rate limit" in str(exc).lower() and attempt == 0:
+                    time.sleep(2.5)
+                    continue
+                raise
+
+    raise last_error or RuntimeError("Kraken private API request failed")
+
 
 _KRAKEN_PAIRS={}
 def kraken_pair_info(symbol:str, quote:str)->dict[str,Any]:
@@ -10237,10 +10295,24 @@ def kraken_margin_snapshot(ledger_limit:int=100, quote_asset:str="USD")->dict[st
 
     _qa=str(quote_asset or "USD").upper()
     _tb_asset={"USD":"ZUSD","GBP":"ZGBP","EUR":"ZEUR","BTC":"XXBT","XBT":"XXBT","DOGE":"XXDG","XDG":"XXDG"}.get(_qa,_qa)
-    tb=kraken_private("/0/private/TradeBalance",{"asset":_tb_asset}).get("result") or {}
-    if not isinstance(tb,dict): tb={}
 
-    ledger_result=kraken_private("/0/private/Ledgers",{"type":"all"}).get("result") or {}
+    # Positions and OpenOrders are the authoritative live-state checks. Account
+    # balance and ledger data are useful enrichment but must not make a verified
+    # flat account fail startup simply because Kraken's private rate limiter
+    # rejected an optional accounting request.
+    tb={}
+    optional_errors=[]
+    try:
+        tb=kraken_private("/0/private/TradeBalance",{"asset":_tb_asset}).get("result") or {}
+        if not isinstance(tb,dict): tb={}
+    except Exception as exc:
+        optional_errors.append(f"TradeBalance unavailable: {exc}")
+
+    ledger_result={}
+    try:
+        ledger_result=kraken_private("/0/private/Ledgers",{"type":"all"}).get("result") or {}
+    except Exception as exc:
+        optional_errors.append(f"Ledgers unavailable: {exc}")
     if isinstance(ledger_result,dict):
         ledgers=ledger_result.get("ledger") or {}
     elif isinstance(ledger_result,list):
@@ -10277,6 +10349,7 @@ def kraken_margin_snapshot(ledger_limit:int=100, quote_asset:str="USD")->dict[st
     exposure=sum(abs(float(p.get("value") or p.get("cost") or 0)) for p in positions)
     return {"positions":positions,"open_orders":orders,"trade_balance":tb,"costs":costs,
             "margin_level_pct":margin_level,"open_exposure_quote":exposure,
+            "warnings":optional_errors,
             "response_shapes":{"positions":type(positions_raw).__name__,"orders":type(orders_raw).__name__,
                                "trade_balance":type(tb).__name__,"ledgers":type(ledgers).__name__}}
 
