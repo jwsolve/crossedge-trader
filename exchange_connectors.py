@@ -278,7 +278,7 @@ class PriceAggregator:
             raise RuntimeError("No price available from any exchange.")
         return best_price, best_exchange, best_connector
 
-    def check_liquidity(self, symbol, side, quote_size, min_volume_factor=1.5):
+    def check_liquidity(self, symbol, side, quote_size, min_volume_factor=1.0):
         """
         Check if there is enough liquidity for a desired order size.
         Returns (ok, available_volume, recommended_exchange).

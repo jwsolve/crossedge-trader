@@ -302,6 +302,7 @@ DEFAULT_SETTINGS = {
     "position_sizing_mode": "balance_fraction",
     "risk_per_trade_pct": 1.0,
     "min_order_value": 1.0,
+    "min_order_risk_override_multiple": 5.0,
     "stop_loss_pct": 2.0,
     "take_profit_pct": 3.0,
     "daily_loss_limit_pct": 5.0,
@@ -333,7 +334,7 @@ DEFAULT_SETTINGS = {
     "kraken_paper_maker_fee": 0.0025,
     "kraken_paper_taker_fee": 0.0040,
     "native_stop_enabled": False,
-    "max_live_order_gbp": 5.0,
+    "max_live_order_gbp": 50.0,
     "max_daily_live_loss_gbp": 25.0,  # legacy key: now means max DAILY P/L loss in quote currency
     "max_daily_live_spend_quote": 250.0,
     "max_live_spread_pct": 0.35,
@@ -430,7 +431,7 @@ DEFAULT_SETTINGS = {
     "strategy_switching_enabled": True,
     "min_regime_confidence": 0.5,
     "regime_force_strategy": True,       # If True, override strategy based on regime
-    "regime_block_dead": True,           # If True, block all trades when regime is "dead"
+    "regime_block_dead": False,          # If True, block all trades when regime is "dead"
     "regime_trend_strategy": "ema_golden_cross",
     "regime_ranging_strategy": "opening_range",
     "regime_breakout_strategy": "opening_range",
@@ -1008,7 +1009,7 @@ class SelfLearningTrader:
                 weighted_score -= signal['weight'] * signal['strength']
 
         composite_score = weighted_score / total_weight if total_weight > 0 else 0
-        confidence = min(1.0, total_weight / 4.0)
+        confidence = min(1.0, total_weight / 3.0)
 
         return {
             'signals': signals,
@@ -1041,7 +1042,7 @@ class SelfLearningTrader:
         if abs(analysis['composite_score']) < 0.1:
             return False, f'Composite score too low ({analysis["composite_score"]:.3f})', 0, []
 
-        strong_signals = [s for s in analysis['signals'] if s['weight'] > 1.0]
+        strong_signals = [s for s in analysis['signals'] if s['weight'] >= 1.0]
         if not strong_signals and abs(analysis['composite_score']) < 0.25:
             return False, 'No strong signals and composite score moderate', 0, []
 
@@ -4732,6 +4733,7 @@ class PaperBot:
             "low_offset", "low_offset_2", "high_offset", "high_offset_2",
             "ewo_high", "ewo_high_2", "ewo_low", "rsi_buy",
             "max_position_pct", "risk_per_trade_pct", "min_order_value",
+            "min_order_risk_override_multiple",
             "stop_loss_pct", "take_profit_pct", "daily_loss_limit_pct", "cooldown_seconds",
             "sr_lookback_candles", "near_support_pct", "min_resistance_distance_pct",
             "min_sr_range_pct", "min_reward_risk", "support_stop_buffer_pct",
@@ -7989,7 +7991,17 @@ class PaperBot:
             max_shorts=max(1,int(float(self.state.settings.get("kraken_margin_max_open_shorts",1))))
             max_exp=max(0.0,float(self.state.settings.get("kraken_margin_max_exposure_quote",25)))
             min_lvl=max(0.0,float(self.state.settings.get("kraken_margin_min_level_pct",250)))
-            if len(shorts)>max_shorts: result["mismatches"].append(f"Open shorts {len(shorts)} exceed maximum {max_shorts}")
+            # Enforce the open-short limit per pair, not globally, so an existing
+            # short on one symbol does not lock out a new short on a different pair.
+            shorts_per_pair: dict[str,int]={}
+            for _p in shorts:
+                _k=str(_p.get("pair") or "").upper() or _kraken_position_base(_p) or "?"
+                shorts_per_pair[_k]=shorts_per_pair.get(_k,0)+1
+            worst_pair_count=max(shorts_per_pair.values(), default=0) if shorts_per_pair else 0
+            if worst_pair_count>max_shorts:
+                result["mismatches"].append(
+                    f"Open shorts {worst_pair_count} on one pair exceed maximum {max_shorts} per pair"
+                )
             if max_exp and float(result.get("open_exposure_quote") or 0)>max_exp:
                 result["mismatches"].append("Margin exposure exceeds configured maximum")
             if result.get("margin_level_pct") is not None and float(result["margin_level_pct"])<min_lvl:
@@ -9181,7 +9193,7 @@ class PaperBot:
         reference_price = float(order.price or self.state.positions.get(order.symbol,{}).get("entry_price") or 0.0)
         if reference_price > 0 and filled_price > 0:
             ratio = float(filled_price) / reference_price
-            if ratio < 0.20 or ratio > 5.0:
+            if ratio < 0.05 or ratio > 20.0:
                 order.status = "RECONCILE_ERROR"
                 self.state.last_error = (
                     f"Kraken fill sanity lock for {order.symbol}: fill {filled_price:.8f} "
@@ -13531,7 +13543,7 @@ def live_market_guard(
                     symbol=symbol,
                     quote_currency=quote_currency,
                     granularity=granularity,
-                    candle_count=min(50, max(20, candle_count)),
+                    candle_count=max(20, candle_count),
                 )
                 quote_volume = sum(candle.close * candle.volume for candle in candles)
             except Exception:
@@ -13557,7 +13569,10 @@ def live_market_guard(
             "ask": ask,
         }
 
-    ticker = fetch_coinbase_ticker(symbol, quote_currency)
+    try:
+        ticker = fetch_coinbase_ticker(symbol, quote_currency)
+    except Exception as exc:
+        return {"ok": False, "reason": f"Coinbase ticker unavailable: {exc}"}
     bid = float(ticker.get("bid") or 0.0)
     ask = float(ticker.get("ask") or 0.0)
     if bid <= 0 or ask <= 0 or ask < bid:
@@ -13565,7 +13580,7 @@ def live_market_guard(
 
     midpoint = (bid + ask) / 2
     spread_pct = ((ask - bid) / midpoint) * 100 if midpoint else 100.0
-    if spread_pct > max_spread_pct:
+    if max_spread_pct > 0 and spread_pct > max_spread_pct:
         return {
             "ok": False,
             "reason": f"spread {spread_pct:.3f}% > limit {max_spread_pct:.3f}%",
@@ -13574,26 +13589,31 @@ def live_market_guard(
             "ask": ask,
         }
 
-    candles = fetch_candles(
-        exchange=exchange,
-        symbol=symbol,
-        quote_currency=quote_currency,
-        granularity=granularity,
-        candle_count=min(50, max(20, candle_count)),
-    )
-    quote_volume = sum(candle.close * candle.volume for candle in candles)
-    if quote_volume < min_quote_volume:
-        return {
-            "ok": False,
-            "reason": (
-                f"recent quote volume {quote_currency} {quote_volume:.2f} "
-                f"< minimum {quote_currency} {min_quote_volume:.2f}"
-            ),
-            "spread_pct": round(spread_pct, 4),
-            "quote_volume": round(quote_volume, 2),
-            "bid": bid,
-            "ask": ask,
-        }
+    quote_volume = 0.0
+    if min_quote_volume > 0:
+        try:
+            candles = fetch_candles(
+                exchange=exchange,
+                symbol=symbol,
+                quote_currency=quote_currency,
+                granularity=granularity,
+                candle_count=max(20, candle_count),
+            )
+            quote_volume = sum(candle.close * candle.volume for candle in candles)
+        except Exception:
+            quote_volume = 0.0
+        if quote_volume < min_quote_volume:
+            return {
+                "ok": False,
+                "reason": (
+                    f"recent quote volume {quote_currency} {quote_volume:.2f} "
+                    f"< minimum {quote_currency} {min_quote_volume:.2f}"
+                ),
+                "spread_pct": round(spread_pct, 4),
+                "quote_volume": round(quote_volume, 2),
+                "bid": bid,
+                "ask": ask,
+            }
 
     return {
         "ok": True,
