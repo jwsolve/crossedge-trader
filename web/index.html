@@ -120,8 +120,7 @@
             border-radius: 999px;
             font-weight: 600;
         }
-        /* Legacy status pills moved to Dashboard Safety / Control Centre */
-.header-status {
+        .header-status {
             display: flex;
             align-items: center;
             gap: 6px;
@@ -237,31 +236,6 @@
             color: var(--text);
         }
 
-        .entitlement-locked { position:relative; }
-        .entitlement-lock-icon {
-            display:inline-flex; align-items:center; justify-content:center;
-            margin-left:6px; font-size:12px; line-height:1;
-            vertical-align:middle; cursor:help;
-        }
-
-        /* ─── User Administration ─── */
-        .admin-section { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); }
-        .admin-toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:14px; }
-        .admin-toolbar h2 { font-size:18px; margin:0; }
-        .admin-form { display:grid; grid-template-columns:repeat(5,minmax(150px,1fr)); gap:10px; padding:12px; background:var(--panel-hover); border:1px solid var(--line); border-radius:8px; margin-bottom:14px; }
-        .admin-form label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
-        .admin-form input,.admin-form select { border:1px solid var(--line); border-radius:5px; padding:7px 8px; background:var(--input-bg); color:var(--input-text); }
-        .admin-form .admin-form-actions { display:flex; align-items:end; gap:6px; }
-        .admin-btn { border:1px solid var(--line); background:var(--button-bg); color:var(--button-text); border-radius:6px; padding:7px 11px; cursor:pointer; }
-        .admin-btn:hover { background:var(--panel-hover); }
-        .admin-btn.danger { color:var(--bad); border-color:var(--bad); }
-        .admin-btn.primary { color:#fff; background:var(--accent); border-color:var(--accent); }
-        .admin-table input,.admin-table select { max-width:180px; border:1px solid var(--line); border-radius:4px; padding:5px 6px; background:var(--input-bg); color:var(--input-text); }
-        .admin-actions { display:flex; gap:5px; flex-wrap:wrap; }
-        .admin-owner { font-size:10px; font-weight:700; color:var(--accent); }
-        @media (max-width:900px) { .admin-form { grid-template-columns:1fr 1fr; } }
-        @media (max-width:600px) { .admin-form { grid-template-columns:1fr; } }
-
         /* ─── Tab Panes ─── */
         .tab-pane { display: none; }
         .tab-pane.active { display: block; }
@@ -269,7 +243,7 @@
         /* ─── Metrics ─── */
         .metrics {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
             gap: 10px;
             margin-bottom: 14px;
         }
@@ -298,8 +272,6 @@
         }
         .metric-card .value.good { color: var(--good); }
         .metric-card .value.bad { color: var(--bad); }
-        .metric-card .metric-note { margin-top: 3px; font-size: 10px; color: var(--muted); }
-        .metric-card .metric-compact { font-size: 17px; line-height: 1.25; text-transform: capitalize; }
 
         /* ─── Chart ─── */
         .chart-section {
@@ -614,56 +586,6 @@
             font-size: 13px;
             color: var(--muted);
             margin-left: auto;
-        }
-
-        .scanner-heartbeat { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:10px; margin-top:12px; padding:10px 12px; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
-        .scanner-heartbeat > div { min-width:0; }
-        .scanner-heartbeat .hb-label { display:block; font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:3px; }
-        .scanner-heartbeat strong { display:block; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        @media (max-width:900px){ .scanner-heartbeat{grid-template-columns:repeat(3,minmax(0,1fr));} }
-        @media (max-width:560px){ .scanner-heartbeat{grid-template-columns:repeat(2,minmax(0,1fr));} }
-
-        /* Dashboard Trading Control Centre actions */
-        .control-actions {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-top: 14px;
-            padding-top: 14px;
-            border-top: 1px solid var(--line);
-            flex-wrap: wrap;
-        }
-        .control-actions .big-btn {
-            padding: 9px 24px;
-            border-radius: 8px;
-            font-weight: 700;
-            font-size: 15px;
-            border: none;
-            cursor: pointer;
-            transition: opacity 0.15s, transform 0.05s;
-            color: #fff;
-        }
-        .control-actions .big-btn:hover { opacity: 0.9; }
-        .control-actions .big-btn:active { transform: translateY(1px); }
-        .control-actions .big-btn.start { background: var(--good); }
-        .control-actions .big-btn.stop { background: var(--bad); }
-        .control-actions .trading-status {
-            font-size: 13px;
-            color: var(--muted);
-            margin-left: auto;
-        }
-        @media (max-width: 768px) {
-            .control-actions { gap: 6px; }
-            .control-actions .big-btn {
-                flex: 1;
-                min-width: 100px;
-                min-height: 44px;
-                font-size: 14px;
-            }
-            .control-actions .trading-status {
-                flex: 1 0 100%;
-                margin-left: 0;
-            }
         }
 
         .settings-section {
@@ -1045,9 +967,7 @@
                 padding: 10px 12px;
             }
             .header-brand { margin-right: 0; justify-content: center; }
-
-
-        .header-status { order: 3; justify-content: center; flex-wrap: wrap; gap: 4px; }
+            .header-status { order: 3; justify-content: center; flex-wrap: wrap; gap: 4px; }
             .header-tabs { justify-content: center; margin-left: 0; order: 2; overflow-x: auto; }
             .header-tabs button { flex-shrink: 0; padding: 8px 16px; white-space: nowrap; }
             .header-actions { justify-content: center; order: 4; }
@@ -1141,17 +1061,13 @@
                 min-height: 36px;
             }
             #chartContainer {
-                height: 400px;
+                height: 320px;
                 touch-action: none;
             }
             .chart-section {
                 margin-bottom: 20px; /* extra spacing for mobile */
             }
         }
-        @media (min-width: 769px) and (max-width: 1100px) {
-            .metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-        }
-
         @media (max-width: 420px) {
             body { padding: 6px 8px 20px; }
             .metrics { grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -1162,7 +1078,7 @@
             .header-brand .badge { font-size: 10px; padding: 1px 8px; }
             .header-status .pill { font-size: 11px; padding: 4px 10px; min-height: 28px; }
             #chartContainer {
-                height: 400px;
+                height: 260px;
             }
             .chart-section {
                 margin-bottom: 20px;
@@ -1264,50 +1180,6 @@
         #streamingPill .dot.connecting { background: var(--warn); }
         #streamingPill .dot.off { background: var(--muted); }
         #streamingPill .dot.error { background: var(--bad); }
-
-        /* ─── Trading Control Centre ─── */
-        .control-centre { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); margin-bottom:14px; }
-        .control-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
-        .control-head h2 { font-size:18px; margin:0; }
-        .mode-badge { padding:5px 11px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid var(--line); }
-        .mode-badge.live { color:var(--bad); border-color:var(--bad); } .mode-badge.paper { color:var(--accent); border-color:var(--accent); }
-        .control-grid { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:10px; }
-        .control-tile { border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--panel-hover); }
-        .control-tile .k { color:var(--muted); font-size:11px; text-transform:uppercase; font-weight:700; }
-        .control-tile .v { font-size:17px; font-weight:700; margin-top:2px; }
-        .readiness { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
-        .ready-chip { border:1px solid var(--line); border-radius:999px; padding:5px 10px; font-size:12px; font-weight:650; }
-        .ready-chip.good { color:var(--good); border-color:var(--good); } .ready-chip.bad { color:var(--bad); border-color:var(--bad); } .ready-chip.warn { color:var(--warn); border-color:var(--warn); }
-        .d9-grid { display:grid; grid-template-columns:1.1fr .9fr; gap:14px; margin-bottom:14px; }
-        .d9-panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:14px; box-shadow:var(--shadow); }
-        .d9-panel h2 { font-size:16px; margin:0 0 10px; }
-        .cap-row,.decision-row { display:grid; grid-template-columns:1.2fr .7fr .7fr 1.6fr; gap:8px; padding:7px 4px; border-bottom:1px solid var(--line); align-items:center; font-size:12px; }
-        .cap-row:last-child,.decision-row:last-child { border-bottom:0; }
-        .ok-text { color:var(--good); font-weight:700; } .no-text { color:var(--bad); font-weight:700; } .muted-text { color:var(--muted); }
-        .safety-list { display:grid; gap:7px; } .safety-item { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid var(--line); padding-bottom:6px; }
-        .diag-home { margin:0 auto 14px; max-width:1440px; }
-        @media(max-width:900px){ .control-grid{grid-template-columns:1fr 1fr}.d9-grid{grid-template-columns:1fr} }
-        @media(max-width:560px){ .control-grid{grid-template-columns:1fr}.cap-row,.decision-row{grid-template-columns:1fr 1fr} }
-
-        /* ─── UX refinement: operational clarity ─── */
-        .now-status { margin:0 0 12px; padding:12px 14px; border:1px solid var(--line); border-radius:8px; background:var(--panel-hover); display:flex; gap:10px; align-items:flex-start; }
-        .now-status .now-dot { width:9px; height:9px; border-radius:50%; margin-top:5px; background:var(--muted); flex:0 0 auto; }
-        .now-status.running .now-dot { background:var(--good); }
-        .now-status.warning .now-dot { background:var(--warn); }
-        .now-status.error .now-dot { background:var(--bad); }
-        .now-status .now-main { font-weight:750; }
-        .now-status .now-sub { color:var(--muted); font-size:12px; margin-top:2px; }
-        body.live-trading-active .header { box-shadow: inset 0 -2px 0 var(--bad); }
-        .live-context { font-size:10px; font-weight:800; letter-spacing:.06em; border:1px solid var(--bad); color:var(--bad); border-radius:999px; padding:2px 6px; margin-left:6px; }
-        .position-badges { display:flex; gap:5px; align-items:center; flex-wrap:wrap; }
-        .position-badge { font-size:10px; font-weight:800; letter-spacing:.04em; border:1px solid var(--line); border-radius:999px; padding:2px 6px; }
-        .position-badge.long { color:var(--good); border-color:var(--good); }
-        .position-badge.short { color:var(--bad); border-color:var(--bad); }
-        .position-badge.live { color:var(--bad); border-color:var(--bad); }
-        .position-value { color:var(--muted); font-size:11px; font-weight:500; }
-        .decision-head { display:grid; grid-template-columns:1.2fr .7fr .7fr 1.6fr; gap:8px; padding:0 4px 6px; color:var(--muted); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--line); }
-        .activity-item { gap:14px; }
-        @media(max-width:560px){ .decision-head{display:none} .now-status{padding:10px} }
     </style>
 </head>
 <body>
@@ -1319,57 +1191,42 @@
                 <h1>Auxo</h1>
                 <span class="badge">v2.0</span>
             </div>
-<div class="header-tabs" id="mainTabs">
+
+            <!-- Status Pills -->
+            <div class="header-status" id="headerStatus">
+                <span class="pill" id="runPill"><span class="dot gray" id="runDot"></span><span id="runText">Stopped</span></span>
+                <span class="pill" id="tradingPill">Trading Disabled</span>
+                <span class="pill" id="armedPill">🔒 Locked</span>
+                <span class="pill" id="streamingPill">
+                    <span class="dot off" id="streamingDot"></span>
+                    <span id="streamingText">Streaming: Off</span>
+                </span>
+                <details class="health-details" id="healthDetails">
+                    <summary>🟢 Healthy</summary>
+                    <div class="popover" id="healthPopover">
+                        <div class="item"><span>News Guard</span><span class="check">✓</span></div>
+                        <div class="item"><span>Spread OK</span><span class="check">✓</span></div>
+                        <div class="item"><span>Volume OK</span><span class="check">✓</span></div>
+                        <div class="item"><span>Daily Loss OK</span><span class="check">✓</span></div>
+                        <div class="item"><span>API Connected</span><span class="check">✓</span></div>
+                        <div class="item"><span>Websocket</span><span class="check">✓</span></div>
+                    </div>
+                </details>
+                <span class="pair-display" id="pairDisplay">BTC-GBP</span>
+            </div>
+
+            <div class="header-tabs" id="mainTabs">
                 <button class="active" data-tab="dashboard">Dashboard</button>
                 <button data-tab="trading">Trading</button>
                 <button data-tab="analysis">Analysis</button>
-                <button data-tab="admin" id="adminTabBtn" style="display:none;">Users</button>
             </div>
             <div class="header-actions">
-                <select id="accountSelector" class="admin-btn" title="Trading account" style="max-width:220px;"></select>
                 <button class="theme-toggle" id="themeToggle" title="Toggle theme">🌓</button>
-                <button class="theme-toggle" id="logoutBtn" title="Log out" style="font-size:13px;">Logout</button>
             </div>
         </header>
 
         <!-- ─── DASHBOARD TAB ─── -->
         <div class="tab-pane active" id="tab-dashboard">
-
-            <!-- Trading Control Centre -->
-            <section class="control-centre" id="tradingControlCentre">
-                <div class="control-head"><h2>Trading Control Centre</h2><span class="mode-badge paper" id="d9ModeBadge">PAPER</span></div>
-                <div class="now-status" id="auxoNowStatus"><span class="now-dot"></span><div><div class="now-main" id="auxoNowMain">Checking bot status…</div><div class="now-sub" id="auxoNowSub">Waiting for the latest trading state.</div></div></div>
-                <div class="control-grid">
-                    <div class="control-tile"><div class="k">Equity</div><div class="v" id="d9Equity">—</div></div>
-                    <div class="control-tile"><div class="k">Available</div><div class="v" id="d9Available">—</div></div>
-                    <div class="control-tile"><div class="k">Today P/L</div><div class="v" id="d9DayPnl">—</div></div>
-                    <div class="control-tile"><div class="k">Open Trades</div><div class="v" id="d9OpenTrades">0</div></div>
-                </div>
-                <div class="readiness">
-                    <span class="ready-chip" id="d9LongReady">LONGS —</span>
-                    <span class="ready-chip" id="d9ShortReady">SHORTS —</span>
-                    <span class="ready-chip" id="d9ExchangeReady">EXCHANGE —</span>
-                    <span class="ready-chip" id="d9RiskProfile">RISK —</span>
-                </div>
-                <div class="control-actions" aria-label="Trading controls">
-                    <button class="big-btn start" id="startBtn">▶ Start Trading</button>
-                    <button class="big-btn stop" id="stopBtn">■ Stop Trading</button>
-                    <span class="trading-status" id="tradingStatus">Ready</span>
-                </div>
-                <div class="scanner-heartbeat" id="scannerHeartbeat" aria-live="polite">
-                    <div><span class="hb-label">Scanner</span><strong id="scannerState">Waiting…</strong></div>
-                    <div><span class="hb-label">Markets</span><strong id="scannerMarkets">—</strong></div>
-                    <div><span class="hb-label">Last scan</span><strong id="scannerLastScan">—</strong></div>
-                    <div><span class="hb-label">Last decision</span><strong id="scannerLastDecision">—</strong></div>
-                    <div><span class="hb-label">Scan time</span><strong id="scannerDuration">—</strong></div>
-                    <div><span class="hb-label">Ticks</span><strong id="scannerTicks">—</strong></div>
-                </div>
-            </section>
-            <div class="d9-grid">
-                <section class="d9-panel"><h2>Market Readiness</h2><div id="d9CapabilityMatrix"><span class="muted-text">Waiting for pair capability data…</span></div></section>
-                <section class="d9-panel"><h2>Safety Centre</h2><div class="safety-list" id="d9SafetyCentre"></div></section>
-            </div>
-            <section class="d9-panel" style="margin-bottom:14px"><h2>Why isn't Auxo trading?</h2><div class="decision-head"><span>Pair</span><span>Direction</span><span>Score</span><span>Decision</span></div><div id="d9DecisionFeed"><span class="muted-text">Waiting for scanner decisions…</span></div></section>
 
             <!-- Metrics -->
             <div class="metrics">
@@ -1397,34 +1254,11 @@
                     <div class="label">Open Positions</div>
                     <div class="value" id="position">0</div>
                 </div>
-                <div class="metric-card">
-                    <div class="label">Win Rate</div>
-                    <div class="value" id="dashboardWinRate">—</div>
-                    <div class="metric-note" id="dashboardWinRateNote">No closed trades</div>
-                </div>
-                <div class="metric-card">
-                    <div class="label">Profit Factor</div>
-                    <div class="value" id="dashboardProfitFactor">—</div>
-                    <div class="metric-note">Gross wins ÷ gross losses</div>
-                </div>
-                <div class="metric-card">
-                    <div class="label">Avg Win / Loss</div>
-                    <div class="value metric-compact"><span id="dashboardAvgWin">—</span> / <span id="dashboardAvgLoss">—</span></div>
-                </div>
-                <div class="metric-card">
-                    <div class="label">Closed Trades</div>
-                    <div class="value" id="dashboardClosedTrades">0</div>
-                </div>
-
             </div>
 
             <!-- Chart -->
             <section class="chart-section">
                 <div class="chart-toolbar">
-                    <div class="group" style="margin-right:auto;">
-                        <span class="muted">Market:</span> <strong id="dashboardRegime">—</strong>
-                        <span class="muted" style="margin-left:8px;">Strategy:</span> <strong id="dashboardStrategy">—</strong>
-                    </div>
                     <div class="group">
                         <select id="chartSymbolSelect"></select>
                         <select id="chartTimeframeSelect">
@@ -1460,6 +1294,10 @@
                                 <label><input type="checkbox" checked data-indicator="breakouts"> Breakouts</label>
                                 <label><input type="checkbox" checked data-indicator="macd"> MACD</label>
                                 <label><input type="checkbox" checked data-indicator="rsi"> RSI</label>
+                                <label><input type="checkbox" checked data-indicator="stoch9"> Stochastic 9/3</label>
+                                <label><input type="checkbox" checked data-indicator="stoch14"> Stochastic 14/3</label>
+                                <label><input type="checkbox" checked data-indicator="stoch40"> Stochastic 40/4</label>
+                                <label><input type="checkbox" checked data-indicator="stoch60"> Stochastic 60/10/1</label>
                                 <label><input type="checkbox" checked data-indicator="volume"> Volume Spikes</label>
                             </div>
                         </details>
@@ -1469,6 +1307,11 @@
                 </div>
                 <div id="chartContainer">
                     <div class="chart-error" id="chartError" style="display:none;">⚠️ Chart library failed to load – check your internet connection.</div>
+                    <div id="stochChartContainer" style="height:150px; margin-top:4px; border-top:1px solid var(--border,#dbe0e8); position:relative;">
+                        <div style="position:absolute;left:8px;top:4px;z-index:2;font-size:11px;font-weight:600;opacity:.7;pointer-events:none;">
+                            STOCHASTICS — 9/3 · 14/3 · 40/4 · 60/10/1
+                        </div>
+                    </div>
                 </div>
                 <div class="message-box" id="errorBox"></div>
             </section>
@@ -1483,7 +1326,7 @@
 
             <!-- Recent Activity -->
             <section class="recent-section">
-                <h2>Event Feed</h2>
+                <h2>🕒 Recent Activity</h2>
                 <div id="recentActivity">
                     <div class="activity-item"><span class="muted">No recent activity.</span></div>
                 </div>
@@ -1494,11 +1337,24 @@
         <div class="tab-pane" id="tab-trading">
 
             <div class="trading-controls">
-</div>
+                <button class="big-btn start" id="startBtn">▶ Start</button>
+                <button class="big-btn stop" id="stopBtn">■ Stop</button>
+                <details class="more-menu">
+                    <summary>⋮</summary>
+                    <div class="dropdown">
+                        <button id="syncOandaBalanceBtn">Sync OANDA Balance</button>
+                        <button id="oandaAuthCheckBtn">Check OANDA</button>
+                        <button id="resetBtn">Reset Paper</button>
+                        <button id="exportTradesBtn">Export Trades</button>
+                        <button id="importSettingsBtn">Import Settings</button>
+                    </div>
+                </details>
+                <span class="trading-status" id="tradingStatus">Ready</span>
+            </div>
 
             <div class="settings-section">
                 <div class="search-box">
-                    <input id="settingsSearch" placeholder="Search advanced settings…" />
+                    <input id="settingsSearch" placeholder="Search settings…" />
                 </div>
 
                 <!-- ─── STRATEGY PRESETS ─── -->
@@ -1554,15 +1410,7 @@
                                     <option value="self_learning">Self-Learning (AI)</option>
                                 </select>
                             </label>
-                            <label>Allow Short Selling 🔻 <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
-<label>Kraken Live Margin Shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled (paper only)</option><option value="true">Enabled</option></select></label>
-<label>Kraken Margin Leverage <input type="number" name="kraken_margin_leverage" min="2" max="5" step="1" value="2"></label>
-<label>Kraken Margin Quote Currency <select name="kraken_margin_quote_currency"><option value="USDT">USDT</option><option value="USD">USD</option><option value="GBP">GBP</option><option value="EUR">EUR</option></select></label>
-<label>Kraken Margin Read Only <select name="kraken_margin_read_only"><option value="true">Enabled — safest</option><option value="false">Disabled — live orders permitted</option></select></label>
-<label>Max Margin Exposure <input type="number" name="kraken_margin_max_exposure_quote" min="1" step="1" value="25"></label>
-<label>Max Open Shorts <input type="number" name="kraken_margin_max_open_shorts" min="1" max="10" value="1"></label>
-<label>Minimum Margin Level % <input type="number" name="kraken_margin_min_level_pct" min="100" step="10" value="250"></label>
-<label>Live Test Max Value <input type="number" name="kraken_margin_test_max_quote" min="1" value="10"></label>
+                            <label>Allow Short Selling <select name="allow_short_selling"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
                             <label>Short SMA <input name="short_window" type="number" value="5" step="1" /></label>
                             <label>Long SMA <input name="long_window" type="number" value="20" step="1" /></label>
                             <label>EWO buy EMA <input name="base_nb_candles_buy" type="number" value="14" step="1" /></label>
@@ -1734,9 +1582,8 @@
                             <label>Min R/R <input name="min_reward_risk" type="number" value="2" step="0.1" /></label>
                             <label>Support stop buffer % <input name="support_stop_buffer_pct" type="number" value="2" step="0.1" /></label>
                             <label>Resistance target buffer % <input name="resistance_target_buffer_pct" type="number" value="0.5" step="0.1" /></label>
-                            <label>Max live order (quote) <input name="max_live_order_gbp" type="number" value="5" step="0.01" /></label>
-                            <label>Max daily live spend (quote) <input name="max_daily_live_spend_quote" type="number" value="250" step="0.01" /></label>
-                            <label>Max daily loss (quote) <input name="max_daily_live_loss_gbp" type="number" value="25" step="0.01" /></label>
+                            <label>Max live order £ <input name="max_live_order_gbp" type="number" value="5" step="0.01" /></label>
+                            <label>Max daily loss £ <input name="max_daily_live_loss_gbp" type="number" value="2" step="0.01" /></label>
                             <label>Max live spread % <input name="max_live_spread_pct" type="number" value="0.35" step="0.01" /></label>
                             <label>Min live quote volume <input name="min_live_quote_volume" type="number" value="1000" step="1" /></label>
                             <label>Backtest slippage % <input name="backtest_slippage_pct" type="number" value="0.1" step="0.01" /></label>
@@ -2051,78 +1898,6 @@
             </div>
         </div>
 
-        <!-- ─── OWNER USER ADMINISTRATION TAB ─── -->
-        <div class="tab-pane" id="tab-admin">
-            <section class="admin-section">
-                <div class="admin-toolbar">
-                    <div>
-                        <h2>User Administration</h2>
-                        <div class="muted">Owner-only. New secondary users are paper-only.</div>
-                    </div>
-                    <button class="admin-btn" id="refreshUsersBtn" type="button">Refresh</button>
-                </div>
-                <form class="admin-form" id="createUserForm">
-                    <label>Display name<input id="adminNewName" required placeholder="Kraken Test" /></label>
-                    <label>Email<input id="adminNewEmail" type="email" required placeholder="user@example.com" /></label>
-                    <label>Password<input id="adminNewPassword" type="password" minlength="10" required placeholder="10+ characters" /></label>
-                    <label>Tier<select id="adminNewTier"><option value="starter">Starter</option><option value="pro">Pro</option><option value="elite">Elite</option></select></label>
-                    <label>Exchange<select id="adminNewExchange"><option value="coinbase">Coinbase</option><option value="kraken">Kraken</option></select></label>
-                    <div class="admin-form-actions"><button class="admin-btn primary" type="submit">Add user</button></div>
-                </form>
-                <div class="message-box" id="adminMessage"></div>
-                <div class="table-wrap">
-                    <table class="admin-table">
-                        <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Tier</th><th>Account</th><th>Exchange</th><th>Trades</th><th>Actions</th></tr></thead>
-                        <tbody id="adminUsersBody"><tr><td colspan="9" class="muted">Open the Users tab to load users.</td></tr></tbody>
-                    </table>
-                </div>
-
-                <h3 style="margin:22px 0 8px;">Trading Accounts</h3>
-                <div class="muted" style="margin-bottom:10px;">Add additional isolated paper accounts beneath any user. Live enablement remains protected by the existing server safety rules.</div>
-                <form class="admin-form" id="createAccountForm">
-                    <label>User ID<input id="adminAccountUserId" type="number" min="1" required placeholder="1" /></label>
-                    <label>Account label<input id="adminAccountLabel" required placeholder="Kraken Paper 2" /></label>
-                    <label>Exchange<select id="adminAccountExchange"><option value="kraken">Kraken</option><option value="coinbase">Coinbase</option></select></label>
-                    <div class="admin-form-actions"><button class="admin-btn primary" type="submit">Add account</button></div>
-                </form>
-                <div class="table-wrap">
-                    <table class="admin-table">
-                        <thead><tr><th>Account</th><th>User</th><th>Label</th><th>Exchange</th><th>Enabled</th><th>Trades</th><th>Actions</th></tr></thead>
-                        <tbody id="adminAccountsBody"></tbody>
-                    </table>
-                </div>
-
-                <div class="admin-toolbar" style="margin-top:24px;">
-                    <div><h3 style="margin:0;">Audit Trail</h3><div class="muted">Administrative and account-selection events.</div></div>
-                    <button class="admin-btn" id="refreshAuditBtn" type="button">Refresh audit</button>
-                </div>
-                <div class="table-wrap">
-                    <table class="admin-table">
-                        <thead><tr><th>Time</th><th>User</th><th>Account</th><th>Action</th><th>Detail</th></tr></thead>
-                        <tbody id="auditBody"></tbody>
-                    </table>
-                </div>
-            
-                <div class="admin-diagnostics">
-                    <h3 style="margin:18px 0 8px">Diagnostics</h3>
-                    <details class="panel diag-home" id="krakenMarginDiagnostics" data-admin-diagnostic="true" style="margin:18px 0 0">
-<summary style="cursor:pointer;font-weight:700;">Kraken Margin Diagnostics</summary>
-<div style="padding-top:10px;">
-<div class="message-box" style="display:block;margin:0 0 10px;">
-<strong>Diagnostic controls.</strong> Normal automated trading does not require these buttons.
-Live test actions can place or close real Kraken margin orders when live trading is armed.
-</div>
-<div class="group"><button id="kmValidate">Validate Margin Pair</button><button id="kmRead">Read-only Safety Check</button><button id="kmRecon">Reconcile Kraken Margin</button>
-<button id="kmClose" class="danger">Close Auxo-Owned Margin Position</button></div>
-<div class="group" style="margin-top:8px;"><label>Symbol <input id="kmSymbol" value="ADA" style="max-width:90px"></label>
-<label>Test amount <input id="kmAmount" type="number" value="5" min="1" style="max-width:90px"></label>
-<button id="kmTiny">Tiny Live SHORT Test</button></div>
-<pre id="kmOut" style="white-space:pre-wrap;max-height:220px;overflow:auto"></pre>
-</div></details>
-                </div>
-</section>
-        </div>
-
     </div>
 
     <script>
@@ -2141,14 +1916,13 @@ Live test actions can place or close real Kraken margin orders when live trading
             startingCash: $('startingCash'),
             unrealizedPnl: $('unrealizedPnl'),
             position: $('position'),
-            dashboardWinRate: $('dashboardWinRate'),
-            dashboardWinRateNote: $('dashboardWinRateNote'),
-            dashboardProfitFactor: $('dashboardProfitFactor'),
-            dashboardAvgWin: $('dashboardAvgWin'),
-            dashboardAvgLoss: $('dashboardAvgLoss'),
-            dashboardClosedTrades: $('dashboardClosedTrades'),
-            dashboardRegime: $('dashboardRegime'),
-            dashboardStrategy: $('dashboardStrategy'),
+            runPill: $('runPill'),
+            runDot: $('runDot'),
+            runText: $('runText'),
+            tradingPill: $('tradingPill'),
+            armedPill: $('armedPill'),
+            healthDetails: $('healthDetails'),
+            healthPopover: $('healthPopover'),
             pairDisplay: $('pairDisplay'),
             chartSymbolSelect: $('chartSymbolSelect'),
             chartTimeframeSelect: $('chartTimeframeSelect'),
@@ -2163,17 +1937,6 @@ Live test actions can place or close real Kraken margin orders when live trading
             recentActivity: $('recentActivity'),
             streamingDot: $('streamingDot'),
             streamingText: $('streamingText'),
-            logoutBtn: $('logoutBtn'),
-            accountSelector: $('accountSelector'),
-            adminTabBtn: $('adminTabBtn'),
-            adminAccountsBody: $('adminAccountsBody'),
-            auditBody: $('auditBody'),
-            createAccountForm: $('createAccountForm'),
-            refreshAuditBtn: $('refreshAuditBtn'),
-            adminUsersBody: $('adminUsersBody'),
-            adminMessage: $('adminMessage'),
-            createUserForm: $('createUserForm'),
-            refreshUsersBtn: $('refreshUsersBtn'),
             // Trading
             startBtn: $('startBtn'),
             stopBtn: $('stopBtn'),
@@ -2281,6 +2044,10 @@ Live test actions can place or close real Kraken margin orders when live trading
             breakouts: true,
             macd: true,
             rsi: true,
+            stoch9: true,
+            stoch14: true,
+            stoch40: true,
+            stoch60: true,
             volume: true,
         };
 
@@ -2300,20 +2067,30 @@ Live test actions can place or close real Kraken margin orders when live trading
             return getComputedStyle(document.body).getPropertyValue(name).trim();
         }
 
-        // Dynamic chart precision. Keep enough decimal places for tight stops/targets
-        // and low-priced assets without making BTC/ETH axes unnecessarily noisy.
         function getPriceFormat(price) {
             if (!price || price <= 0) return { precision: 2, minMove: 0.01 };
             const absPrice = Math.abs(price);
-            let precision;
-            if (absPrice >= 10000) precision = 2;       // BTC-style prices
-            else if (absPrice >= 1000) precision = 3;  // ETH-style prices
-            else if (absPrice >= 100) precision = 4;   // SOL-style prices
-            else if (absPrice >= 1) precision = 5;     // XRP/ATOM-style prices
-            else if (absPrice >= 0.01) precision = 6;  // DOGE-style prices
-            else if (absPrice >= 0.001) precision = 7;
-            else precision = 8;
-            return { precision, minMove: Math.pow(10, -precision) };
+            let precision, minMove;
+            if (absPrice < 0.0001) {
+                precision = 8;
+                minMove = 0.00000001;
+            } else if (absPrice < 0.001) {
+                precision = 6;
+                minMove = 0.000001;
+            } else if (absPrice < 0.01) {
+                precision = 5;
+                minMove = 0.00001;
+            } else if (absPrice < 1) {
+                precision = 4;
+                minMove = 0.0001;
+            } else if (absPrice < 100) {
+                precision = 2;
+                minMove = 0.01;
+            } else {
+                precision = 2;
+                minMove = 0.01;
+            }
+            return { precision, minMove };
         }
 
         const money = v => `${displayCurrency || 'GBP'} ${Number(v || 0).toFixed(2)}`;
@@ -2366,213 +2143,9 @@ Live test actions can place or close real Kraken margin orders when live trading
         // ---- API ----
         async function post(url, body = {}) {
             const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-            if (r.status === 401 && url !== '/api/auth/login') { window.location.href = 'login.html'; throw new Error('Session expired'); }
             return r.json();
         }
-        async function getJson(url) {
-            const r = await fetch(url);
-            if (r.status === 401) { window.location.href = 'login.html'; throw new Error('Session expired'); }
-            return r.json();
-        }
-
-        async function logoutAuxo() {
-            try { await post('/api/auth/logout'); } catch (e) { /* redirect regardless */ }
-            window.location.href = 'login.html';
-        }
-
-        let currentEntitlements = null;
-        let adminUsersCache = [];
-        const PREMIUM_SETTING_FEATURES = {
-            live_trading_enabled:'live_trading',
-            coinbase_maker_first_enabled:'maker_first',
-            kraken_maker_first_enabled:'maker_first',
-            risk_sizing_mode:'advanced_risk',
-            use_atr_exits:'advanced_risk',
-            trailing_stop_enabled:'advanced_risk',
-            partial_take_profit_enabled:'advanced_risk',
-            self_learning_enabled:'setup_learning',
-            regime_filter_enabled:'regime_detection',
-            regime_adaptation_enabled:'regime_detection',
-            auto_disable_weak_pairs:'auto_disable_weak_pairs',
-            strategy_creator_enabled:'strategy_evolution',
-            strategy_evolution_enabled:'strategy_evolution'
-        };
-        function applyEntitlementUI() {
-            if (!currentEntitlements) return;
-            const f=currentEntitlements.features||{};
-            if (els.tierBadge) {
-                els.tierBadge.style.display='';
-                els.tierBadge.textContent=String(currentEntitlements.tier||'starter').toUpperCase();
-            }
-            Object.entries(PREMIUM_SETTING_FEATURES).forEach(([name,feature])=>{
-                const input=els.settingsForm?.elements?.[name];
-                if (!input) return;
-                const locked=!Boolean(f[feature]);
-                input.disabled=locked;
-                const holder=input.closest('.setting-row, label, .form-group, .setting-item') || input.parentElement;
-                if (holder) {
-                    holder.style.opacity=locked?'0.55':'';
-                    holder.title=locked?`Locked on ${currentEntitlements.tier} tier`:'';
-                    holder.classList.toggle('entitlement-locked', locked);
-
-                    let lock=holder.querySelector(':scope > .entitlement-lock-icon');
-                    if (locked && !lock) {
-                        lock=document.createElement('span');
-                        lock.className='entitlement-lock-icon';
-                        lock.textContent='🔒';
-                        lock.setAttribute('aria-label', `Locked on ${currentEntitlements.tier} tier`);
-                        lock.title=`Locked on ${currentEntitlements.tier} tier`;
-                        holder.appendChild(lock);
-                    } else if (!locked && lock) {
-                        lock.remove();
-                    }
-                }
-            });
-            if (els.optimizerBtn) {
-                const locked=!Boolean(f.optimizer);
-                els.optimizerBtn.disabled=locked;
-                els.optimizerBtn.title=locked?'🔒 Optimizer requires Pro or Elite':'';
-                if (!els.optimizerBtn.dataset.baseLabel) els.optimizerBtn.dataset.baseLabel=els.optimizerBtn.textContent.replace(/^🔒\s*/, '');
-                els.optimizerBtn.textContent=locked ? `🔒 ${els.optimizerBtn.dataset.baseLabel}` : els.optimizerBtn.dataset.baseLabel;
-            }
-            const evolveBtn=document.getElementById('evolveStrategiesBtn');
-            if (evolveBtn) {
-                const locked=!Boolean(f.strategy_evolution);
-                evolveBtn.disabled=locked;
-                evolveBtn.title=locked?'🔒 Strategy evolution requires Elite':'';
-                if (!evolveBtn.dataset.baseLabel) evolveBtn.dataset.baseLabel=evolveBtn.textContent.replace(/^🔒\s*/, '');
-                evolveBtn.textContent=locked ? `🔒 ${evolveBtn.dataset.baseLabel}` : evolveBtn.dataset.baseLabel;
-            }
-        }
-
-        async function loadCurrentUser() {
-            let r = null;
-            try {
-                r = await getJson('/api/auth/me');
-                if (!r.authenticated) { window.location.href = 'login.html'; return; }
-            } catch (e) {
-                console.error('Unable to load /api/auth/me:', e);
-            }
-
-            // Account selection is independent from entitlement rendering. This
-            // prevents a UI entitlement error from blanking Coinbase/Kraken and
-            // hiding the owner Users link.
-            try {
-                const isOwner = Number(r?.user?.id || 0) === 1;
-                let accounts = Array.isArray(r?.accounts) ? r.accounts : [];
-                accounts = accounts.filter(a => {
-                    const v = a?.enabled;
-                    return v === undefined || v === null || v === true || v === 1 ||
-                        String(v).toLowerCase() === 'true' || String(v) === '1';
-                });
-
-                // Owner fallback: if /api/auth/me has an incomplete account list,
-                // use the admin account list to recover the Coinbase/Kraken options.
-                if (!accounts.length && isOwner) {
-                    try {
-                        const admin = await getJson('/api/admin/users');
-                        accounts = (admin.accounts || []).filter(a => {
-                            const v = a?.enabled;
-                            return Number(a.user_id) === 1 &&
-                                (v === undefined || v === null || v === true || v === 1 ||
-                                 String(v).toLowerCase() === 'true' || String(v) === '1');
-                        });
-                    } catch (e) {
-                        console.error('Unable to load admin account fallback:', e);
-                    }
-                }
-
-                if (els.accountSelector) {
-                    els.accountSelector.innerHTML = accounts.map(a => {
-                        const label = a.account_label || a.label || `Account #${a.id}`;
-                        return `<option value="${a.id}" ${Number(a.id)===Number(r?.default_account_id)?'selected':''}>${adminEscape(label)} · ${adminEscape(a.exchange || '')}</option>`;
-                    }).join('');
-                    els.accountSelector.style.display = '';
-                    els.accountSelector.disabled = accounts.length === 0;
-                    if (!accounts.length) {
-                        els.accountSelector.innerHTML = '<option value="">No trading accounts returned</option>';
-                    }
-                }
-
-                if (els.adminTabBtn) els.adminTabBtn.style.display = isOwner ? '' : 'none';
-            } catch (e) {
-                console.error('Account selector population failed:', e);
-                if (els.accountSelector) {
-                    els.accountSelector.style.display = '';
-                    els.accountSelector.disabled = true;
-                    els.accountSelector.innerHTML = '<option value="">Unable to load trading accounts</option>';
-                }
-            }
-
-            // Entitlements are deliberately last so they cannot break account
-            // selection or the owner Users link.
-            try {
-                if (r) {
-                    currentEntitlements = r.entitlements || null;
-                    applyEntitlementUI();
-                }
-            } catch (e) {
-                console.error('Entitlement UI failed:', e);
-            }
-        }
-
-        function adminEscape(v) {
-            return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-        }
-
-        async function loadAdminUsers() {
-            if (!els.adminUsersBody) return;
-            els.adminMessage.style.display = 'none';
-            try {
-                const r = await getJson('/api/admin/users');
-                if (!r.ok) throw new Error(r.error || 'Could not load users');
-                adminUsersCache = r.users || [];
-                els.adminUsersBody.innerHTML = (r.users || []).map(u => {
-                    const owner = Number(u.id) === 1;
-                    return `<tr data-user-id="${u.id}">
-                        <td>${u.id}${owner ? ' <span class="admin-owner">OWNER</span>' : ''}</td>
-                        <td><input class="adm-name" value="${adminEscape(u.display_name)}"></td>
-                        <td><input class="adm-email" type="email" value="${adminEscape(u.email)}"></td>
-                        <td><select class="adm-status" ${owner?'disabled':''}><option value="active" ${u.status==='active'?'selected':''}>Active</option><option value="disabled" ${u.status==='disabled'?'selected':''}>Disabled</option></select></td>
-                        <td><select class="adm-tier" ${owner?'disabled':''}><option value="starter" ${u.subscription_tier==='starter'?'selected':''}>Starter</option><option value="pro" ${u.subscription_tier==='pro'?'selected':''}>Pro</option><option value="elite" ${u.subscription_tier==='elite'?'selected':''}>Elite</option><option value="owner" ${owner?'selected':''}>Owner</option></select></td>
-                        <td>${adminEscape(u.account_label || '—')} (#${u.account_id ?? '—'})</td>
-                        <td>${adminEscape(u.exchange || '—')}</td>
-                        <td>${Number(u.trade_rows || 0)}</td>
-                        <td><div class="admin-actions">
-                            <button class="admin-btn adm-save" type="button">Save</button>
-                            <button class="admin-btn adm-password" type="button">Password</button>
-                            <button class="admin-btn adm-entitlements" type="button">Access</button>
-                            ${owner ? '' : '<button class="admin-btn danger adm-delete" type="button">Delete</button>'}
-                        </div></td>
-                    </tr>`;
-                }).join('') || '<tr><td colspan="9" class="muted">No users found.</td></tr>';
-
-                if (els.adminAccountsBody) {
-                    els.adminAccountsBody.innerHTML=(r.accounts||[]).map(a => `<tr data-account-id="${a.id}">
-                        <td>#${a.id}</td><td>#${a.user_id}</td>
-                        <td><input class="acct-label" value="${adminEscape(a.account_label)}"></td>
-                        <td>${adminEscape(a.exchange)}</td>
-                        <td><input class="acct-enabled" type="checkbox" ${Number(a.enabled)===1?'checked':''} ${Number(a.id)===1?'disabled':''}></td>
-                        <td>${Number(a.trade_rows||0)}</td>
-                        <td><div class="admin-actions"><button class="admin-btn acct-save" type="button">Save</button>${Number(a.id)===1?'':'<button class="admin-btn danger acct-delete" type="button">Delete</button>'}</div></td>
-                    </tr>`).join('');
-                }
-            } catch (e) {
-                els.adminMessage.style.display='block'; els.adminMessage.textContent=e.message;
-            }
-        }
-
-        async function loadAudit() {
-            if (!els.auditBody) return;
-            const r=await getJson('/api/admin/audit');
-            if (!r.ok) return;
-            els.auditBody.innerHTML=(r.entries||[]).map(x=>`<tr>
-                <td>${adminEscape(x.created_at)}</td>
-                <td>${adminEscape(x.display_name || x.email || x.user_id || '—')}</td>
-                <td>${adminEscape(x.account_label || (x.account_id ? '#'+x.account_id : '—'))}</td>
-                <td>${adminEscape(x.action)}</td><td><code>${adminEscape(x.detail || '')}</code></td>
-            </tr>`).join('') || '<tr><td colspan="5" class="muted">No audit events yet.</td></tr>';
-        }
+        async function getJson(url) { const r = await fetch(url); return r.json(); }
 
         // ---- theme ----
         function applyTheme(theme) {
@@ -2589,63 +2162,7 @@ Live test actions can place or close real Kraken margin orders when live trading
         });
 
         // ---- Update streaming status ----
-        function d9Money(v, quote) {
-            const n=Number(v||0); const q=String(quote||'GBP').toUpperCase();
-            const sym=q==='GBP'?'£':(q==='USD'?'$':(q==='EUR'?'€':q+' '));
-            return sym + n.toFixed(2);
-        }
-        function renderD9(data) {
-            const s=data.settings||{}, quote=s.quote_currency||s.kraken_margin_quote_currency||'GBP';
-            const live=!!s.live_trading_enabled, exchange=String(s.active_exchange||s.exchange||'').toUpperCase();
-            const mode=document.getElementById('d9ModeBadge'); if(mode){mode.textContent=live?'● LIVE TRADING':'PAPER TRADING';mode.className='mode-badge '+(live?'live':'paper');}
-            document.body.classList.toggle('live-trading-active', live);
-            const now=document.getElementById('auxoNowStatus'), nowMain=document.getElementById('auxoNowMain'), nowSub=document.getElementById('auxoNowSub');
-            const positions=(data.positions||[]), scans=(data.scan_rows||[]);
-            let nowText='Ready', nowDetail='', nowClass='';
-            if(data.last_error){ nowText='Attention required'; nowDetail=String(data.last_error); nowClass='error'; }
-            else if(!data.running){ nowText=live?'Live trading is stopped':'Paper trading is stopped'; nowDetail='Start Auxo when you are ready to scan for new opportunities.'; }
-            else if(positions.length){ nowText=`Managing ${positions.length} open position${positions.length===1?'':'s'}`; nowDetail=data.last_signal||'Stops, targets and exit conditions are being monitored.'; nowClass='running'; }
-            else if(scans.length){ nowText=`Scanning ${scans.length} market${scans.length===1?'':'s'}`; nowDetail=data.last_signal||'Waiting for a qualifying entry setup.'; nowClass='running'; }
-            else { nowText='Running — waiting for market data'; nowDetail=data.last_signal||'Auxo is active and waiting for the next scan.'; nowClass='warning'; }
-            if(now){now.className='now-status '+nowClass;} if(nowMain)nowMain.textContent=nowText; if(nowSub)nowSub.textContent=nowDetail;
-            const set=(id,val)=>{const e=document.getElementById(id);if(e)e.textContent=val;};
-            const sc=data.scanner||{};
-            const fmtScannerTime=(v)=>{ if(!v) return '—'; const d=new Date(v); return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}); };
-            const ageText=(v)=>{ if(!v) return '—'; const d=new Date(v); if(Number.isNaN(d.getTime())) return String(v); const sec=Math.max(0,Math.round((Date.now()-d.getTime())/1000)); return sec<2?'just now':`${sec}s ago`; };
-            const scannerHealthy=!!data.running && !!sc.last_tick_ok && !!sc.last_tick_completed_at;
-            set('scannerState', data.running ? (sc.last_tick_ok ? 'Running' : 'Error') : 'Stopped');
-            set('scannerMarkets', `${Number(sc.markets_scanned||0)}/${Number(sc.markets_requested||0)}`);
-            set('scannerLastScan', sc.last_scan_at ? `${fmtScannerTime(sc.last_scan_at)} (${ageText(sc.last_scan_at)})` : '—');
-            set('scannerLastDecision', sc.last_decision_at ? `${fmtScannerTime(sc.last_decision_at)} (${ageText(sc.last_decision_at)})` : '—');
-            set('scannerDuration', sc.scan_duration_ms != null ? `${Number(sc.scan_duration_ms)} ms` : '—');
-            set('scannerTicks', String(Number(sc.tick_count||0)));
-            const hb=document.getElementById('scannerHeartbeat'); if(hb) hb.classList.toggle('error', !scannerHealthy && !!data.running);
-            set('d9Equity',d9Money(data.equity,quote)); set('d9Available',d9Money(data.cash,quote)); set('d9DayPnl',d9Money(data.day_pnl,quote));
-            set('d9OpenTrades',String((data.positions||[]).length));
-            const chip=(id,text,cls)=>{const e=document.getElementById(id);if(e){e.textContent=text;e.className='ready-chip '+cls;}};
-            chip('d9LongReady','LONGS: '+(live?'READY':'PAPER'),'good');
-            const km=data.kraken_margin||{}; const shortEnabled=!!s.allow_short_selling;
-            let shortText='SHORTS: DISABLED', shortCls='bad';
-            if(shortEnabled && !live){shortText='SHORTS: PAPER READY';shortCls='good';}
-            else if(shortEnabled && exchange==='KRAKEN' && km.new_shorts_allowed){shortText='SHORTS: READY';shortCls='good';}
-            else if(shortEnabled && exchange==='KRAKEN'){shortText='SHORTS: '+(km.reason||km.message||'LOCKED');shortCls='warn';}
-            else if(shortEnabled){shortText='SHORTS: ENABLED';shortCls='good';}
-            chip('d9ShortReady',shortText,shortCls); chip('d9ExchangeReady',exchange+': '+(data.last_error?'CHECK':'READY'),data.last_error?'warn':'good');
-            const modeName=String(s.risk_sizing_mode||'fixed').toUpperCase(); chip('d9RiskProfile','RISK: '+modeName,'');
-
-            const caps=data.pair_capabilities||[]; const cap=document.getElementById('d9CapabilityMatrix');
-            if(cap){ cap.innerHTML=caps.length ? caps.map(r=>`<div class="cap-row"><strong>${r.pair||r.symbol}</strong><span class="${r.long_ready?'ok-text':'no-text'}">LONG ${r.long_ready?'✓':'—'}</span><span class="${r.short_ready?'ok-text':'no-text'}">SHORT ${r.short_ready?'✓':'🔒'}</span><span class="muted-text">${r.reason||((r.allowed_short_leverage||[]).length?'Margin '+r.allowed_short_leverage.join('x, ')+'x':'Ready')}</span></div>`).join('') : '<span class="muted-text">Capability matrix is shown for Kraken watchlist pairs.</span>'; }
-
-            const safe=document.getElementById('d9SafetyCentre'); if(safe){
-                const items=[['Bot',data.running?'Running':'Stopped',!data.last_error],['Live mode',live?'Armed':'Paper',true],['Kraken margin',km.status||'Off',km.status==='SAFE'||!s.kraken_margin_short_enabled],['Reconciliation',km.healthy?'Healthy':(km.reason||'Not ready'),km.healthy||!s.kraken_margin_short_enabled],['API / last error',data.last_error||'No error',!data.last_error]];
-                safe.innerHTML=items.map(x=>`<div class="safety-item"><span>${x[0]}</span><strong class="${x[2]?'ok-text':'no-text'}">${x[1]}</strong></div>`).join('');
-            }
-            const feed=document.getElementById('d9DecisionFeed'), rows=(data.scan_rows||[]).slice(0,12);
-            if(feed){feed.innerHTML=rows.length?rows.map(r=>{const reason=r.block_reason||r.reason||r.signal_reason||r.message||r.signal||r.action||'Scanning'; const score=r.score??r.setup_score??r.confidence; return `<div class="decision-row"><strong>${r.symbol||'—'}</strong><span>${r.signal||r.action||'WATCH'}</span><span>${score==null?'—':(Number(score).toFixed(1))}</span><span class="muted-text">${reason}</span></div>`;}).join(''):'<span class="muted-text">No scanner decisions yet.</span>';}
-        }
-
-        function updateStreamingUI(data) {            renderD9(data);
-
+        function updateStreamingUI(data) {
             if (!els.streamingDot || !els.streamingText) return;
 
             const wsStatus = data?.live_status?.websocket_status || 'disabled';
@@ -2833,6 +2350,201 @@ Live test actions can place or close real Kraken margin orders when live trading
         let indicatorMarkers = null;
         let volumeSeries = null;
 
+        // Visual-only Stochastic oscillator pane. These never feed the trading
+        // strategy or decision engine.
+        let stochChart = null;
+        let stochSeries = {};
+        let stochResizeObserver = null;
+
+        function stochasticSeries(candles, kPeriod, dPeriod, slowing = 1) {
+            const rows = [];
+            const rawK = [];
+
+            for (let i = 0; i < candles.length; i++) {
+                if (i + 1 < kPeriod) {
+                    rawK.push(null);
+                    continue;
+                }
+                const window = candles.slice(i + 1 - kPeriod, i + 1);
+                const highest = Math.max(...window.map(c => Number(c.high)));
+                const lowest = Math.min(...window.map(c => Number(c.low)));
+                const range = highest - lowest;
+                const k = range === 0 ? 50 : ((Number(candles[i].close) - lowest) / range) * 100;
+                rawK.push(k);
+            }
+
+            const smoothedK = rawK.map((_, i) => {
+                if (i + 1 < slowing) return null;
+                const vals = rawK.slice(i + 1 - slowing, i + 1).filter(v => v !== null);
+                return vals.length === slowing ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+            });
+
+            for (let i = 0; i < candles.length; i++) {
+                const k = smoothedK[i];
+                if (k === null || k === undefined) continue;
+
+                let d = null;
+                if (i + 1 >= dPeriod) {
+                    const vals = smoothedK.slice(i + 1 - dPeriod, i + 1).filter(v => v !== null);
+                    if (vals.length === dPeriod) {
+                        d = vals.reduce((a, b) => a + b, 0) / vals.length;
+                    }
+                }
+
+                rows.push({
+                    time: candles[i].time,
+                    k,
+                    d,
+                });
+            }
+            return rows;
+        }
+
+        function initStochChart() {
+            if (stochChart) {
+                try { stochChart.remove(); } catch (e) {}
+                stochChart = null;
+            }
+            stochSeries = {};
+
+            const container = document.getElementById('stochChartContainer');
+            if (!container || typeof LightweightCharts === 'undefined' ||
+                typeof LightweightCharts.createChart !== 'function') return null;
+
+            const isDark = document.body.classList.contains('dark');
+
+            try {
+                stochChart = LightweightCharts.createChart(container, {
+                    width: container.clientWidth,
+                    height: 150,
+                    layout: {
+                        background: { color: isDark ? '#15203a' : '#ffffff' },
+                        textColor: isDark ? '#e2e8f0' : '#1e293b',
+                    },
+                    grid: {
+                        vertLines: { color: isDark ? '#2d3a5a' : '#dbe0e8' },
+                        horzLines: { color: isDark ? '#2d3a5a' : '#dbe0e8' },
+                    },
+                    rightPriceScale: {
+                        borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                        scaleMargins: { top: 0.05, bottom: 0.05 },
+                    },
+                    timeScale: {
+                        timeVisible: true,
+                        secondsVisible: false,
+                        borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
+                    },
+                    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                });
+
+                stochResizeObserver = new ResizeObserver(() => {
+                    if (stochChart) {
+                        try { stochChart.resize(container.clientWidth, 150); } catch (e) {}
+                    }
+                });
+                stochResizeObserver.observe(container);
+
+                return stochChart;
+            } catch (e) {
+                console.warn('Unable to initialise Stochastic pane:', e);
+                stochChart = null;
+                return null;
+            }
+        }
+
+        function drawStochastics(candles) {
+            if (!candles || candles.length < 5) return;
+
+            if (!stochChart) initStochChart();
+            if (!stochChart) return;
+
+            Object.values(stochSeries).forEach(series => {
+                try { stochChart.removeSeries(series); } catch (e) {}
+            });
+            stochSeries = {};
+
+            const configs = [
+                { key: 'stoch9',  k: 9,  d: 3,  s: 1, label: 'Stoch 9/3', color: '#06b6d4' },
+                { key: 'stoch14', k: 14, d: 3,  s: 1, label: 'Stoch 14/3', color: '#f59e0b' },
+                { key: 'stoch40', k: 40, d: 4,  s: 1, label: 'Stoch 40/4', color: '#8b5cf6' },
+                { key: 'stoch60', k: 60, d: 10, s: 1, label: 'Stoch 60/10/1', color: '#ec4899' },
+            ];
+
+            const active = configs.filter(cfg => indicatorState[cfg.key] !== false);
+            if (!active.length) {
+                stochChart.applyOptions({ watermark: { visible: false } });
+                return;
+            }
+
+            const lines = [];
+            active.forEach(cfg => {
+                const rows = stochasticSeries(candles, cfg.k, cfg.d, cfg.s);
+                const kData = rows.map(r => ({ time: r.time, value: r.k }));
+                const dData = rows.filter(r => r.d !== null).map(r => ({ time: r.time, value: r.d }));
+
+                const kSeries = stochChart.addLineSeries({
+                    color: cfg.color,
+                    lineWidth: 1,
+                    title: `${cfg.label} %K`,
+                    priceLineVisible: false,
+                    lastValueVisible: true,
+                    crosshairMarkerVisible: true,
+                });
+                kSeries.setData(kData);
+                stochSeries[`${cfg.key}_k`] = kSeries;
+                lines.push(kSeries);
+
+                const dSeries = stochChart.addLineSeries({
+                    color: cfg.color,
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    title: `${cfg.label} %D`,
+                    priceLineVisible: false,
+                    lastValueVisible: false,
+                    crosshairMarkerVisible: false,
+                });
+                dSeries.setData(dData);
+                stochSeries[`${cfg.key}_d`] = dSeries;
+                lines.push(dSeries);
+            });
+
+            // Standard stochastic reference levels.
+            const times = candles.map(c => c.time);
+            if (times.length >= 2) {
+                ['20', '50', '80'].forEach(level => {
+                    const series = stochChart.addLineSeries({
+                        color: level === '50' ? 'rgba(148,163,184,0.45)' : 'rgba(148,163,184,0.65)',
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dashed,
+                        priceLineVisible: false,
+                        lastValueVisible: false,
+                        crosshairMarkerVisible: false,
+                    });
+                    series.setData([
+                        { time: times[0], value: Number(level) },
+                        { time: times[times.length - 1], value: Number(level) },
+                    ]);
+                    stochSeries[`level_${level}`] = series;
+                });
+            }
+
+            // Keep the oscillator's horizontal time range aligned with the price chart.
+            try {
+                const range = chart?.timeScale?.().getVisibleLogicalRange?.();
+                if (range && stochChart?.timeScale?.().setVisibleLogicalRange) {
+                    stochChart.timeScale().setVisibleLogicalRange(range);
+                }
+            } catch (e) {}
+        }
+
+        function syncStochTimeRange() {
+            if (!chart || !stochChart) return;
+            try {
+                const range = chart.timeScale().getVisibleLogicalRange();
+                if (range) stochChart.timeScale().setVisibleLogicalRange(range);
+            } catch (e) {}
+        }
+
         function initChart() {
             if (chart) {
                 chart.remove();
@@ -2842,6 +2554,8 @@ Live test actions can place or close real Kraken margin orders when live trading
                 indicatorMarkers = null;
                 volumeSeries = null;
             }
+
+            initStochChart();
 
             const container = els.chartContainer;
             if (!container) return null;
@@ -2879,10 +2593,6 @@ Live test actions can place or close real Kraken margin orders when live trading
                     },
                     rightPriceScale: {
                         borderColor: isDark ? '#2d3a5a' : '#dbe0e8',
-                        // Keep the visible price range close to the candles/levels so
-                        // small differences between entry, stop and target are legible.
-                        autoScale: true,
-                        scaleMargins: { top: 0.08, bottom: 0.08 },
                     },
                     watermark: { visible: false },
                 });
@@ -2898,6 +2608,10 @@ Live test actions can place or close real Kraken margin orders when live trading
                 }
 
                 chart = newChart;
+
+                try {
+                    chart.timeScale().subscribeVisibleLogicalRangeChange(() => syncStochTimeRange());
+                } catch (e) {}
 
                 const resizeObserver = new ResizeObserver(() => {
                     if (chart) {
@@ -3087,14 +2801,8 @@ Live test actions can place or close real Kraken margin orders when live trading
                 const val = Number(item.value);
                 if (isNaN(val) || val <= 0) return;
 
-                const levelPriceFormat = getPriceFormat(val);
                 const series = chart.addLineSeries({
                     color: item.color,
-                    priceFormat: {
-                        type: 'price',
-                        precision: levelPriceFormat.precision,
-                        minMove: levelPriceFormat.minMove,
-                    },
                     lineWidth: 1,
                     lineStyle: LightweightCharts.LineStyle.Dashed,
                     priceLineVisible: true,
@@ -3269,6 +2977,11 @@ Live test actions can place or close real Kraken margin orders when live trading
             }
 
             updateChartTimeRange(sourceCandles);
+
+            // Visual-only Stochastics. They deliberately do not alter signals,
+            // strategy selection, entries, exits, risk, or any live-trading logic.
+            drawStochastics(sourceCandles);
+            syncStochTimeRange();
         }
 
         function updateChartTimeRange(candles) {
@@ -3675,11 +3388,7 @@ Live test actions can place or close real Kraken margin orders when live trading
             Object.entries(preset).forEach(([key, value]) => {
                 const field = els.settingsForm.elements[key];
                 if (field) {
-                    if (field.type === 'checkbox') {
-                        field.checked = Boolean(value);
-                    } else {
-                        field.value = String(value);
-                    }
+                    field.value = String(value);
                 }
             });
 
@@ -3860,11 +3569,7 @@ Live test actions can place or close real Kraken margin orders when live trading
             Object.entries(settings).forEach(([k, v]) => {
                 const field = els.settingsForm.elements[k];
                 if (field) {
-                    if (field.type === 'checkbox') {
-                        field.checked = Boolean(v);
-                    } else {
-                        field.value = String(v);
-                    }
+                    field.value = String(v);
                 }
             });
             updateEMASettingsVisibility();
@@ -3872,86 +3577,10 @@ Live test actions can place or close real Kraken margin orders when live trading
             els.settingsStatus.textContent = 'Settings loaded.';
         }
 
-        function renderDashboardTradingStats(data) {
-            // Performance is authoritative from trades.db and LIVE trades only.
-            // The browser no longer reconstructs BUY/SELL pairs from data.trades.
-            const stats = data.live_trade_stats || {};
-            const closed = Number(stats.closed_trades || 0);
-            const wins = Number(stats.winning_trades || 0);
-            const losses = Number(stats.losing_trades || 0);
-            const winRate = stats.win_rate == null ? null : Number(stats.win_rate);
-            const pfRaw = stats.profit_factor;
-            const profitFactor = pfRaw === 'inf' ? Infinity : (pfRaw == null ? null : Number(pfRaw));
-            const avgWin = stats.average_win == null ? null : Number(stats.average_win);
-            const avgLoss = stats.average_loss == null ? null : Number(stats.average_loss);
-
-            els.dashboardClosedTrades.textContent = String(closed);
-            els.dashboardWinRate.textContent = winRate === null ? '—' : `${winRate.toFixed(1)}%`;
-            els.dashboardWinRate.className = 'value ' + (winRate === null ? '' : winRate >= 60 ? 'good' : winRate < 45 ? 'bad' : '');
-            els.dashboardWinRateNote.textContent = closed ? `${wins} wins / ${losses} losses · live only` : 'No closed live trades';
-            els.dashboardProfitFactor.textContent = profitFactor === null ? '—' : !Number.isFinite(profitFactor) ? '∞' : profitFactor.toFixed(2);
-            els.dashboardProfitFactor.className = 'value ' + (profitFactor === null ? '' : profitFactor >= 1.5 ? 'good' : profitFactor < 1 ? 'bad' : '');
-            els.dashboardAvgWin.textContent = avgWin === null ? '—' : money(avgWin);
-            els.dashboardAvgWin.className = 'value ' + (avgWin === null ? '' : 'good');
-            els.dashboardAvgLoss.textContent = avgLoss === null ? '—' : money(avgLoss);
-            els.dashboardAvgLoss.className = 'value ' + (avgLoss === null ? '' : 'bad');
-
-            const regime = data.regime || data.current_regime || {};
-            const regimeName = typeof regime === 'string' ? regime : (regime.regime || regime.name || regime.label || '—');
-            const confidence = typeof regime === 'object' ? Number(regime.confidence ?? regime.score) : NaN;
-            els.dashboardRegime.textContent = regimeName === '—' ? '—' : `${String(regimeName).replaceAll('_',' ')}${Number.isFinite(confidence) ? ` ${(confidence <= 1 ? confidence*100 : confidence).toFixed(0)}%` : ''}`;
-            const strategy = data.active_strategy || data.settings?.strategy || '—';
-            els.dashboardStrategy.textContent = `Strategy: ${String(strategy).replaceAll('_',' ')}`;
-        }
-
-        // ---- Chart symbol selector ----
-        function populateChartSymbolSelect(settings, data = {}) {
-            const select = els.chartSymbolSelect;
-            if (!select) return;
-
-            const raw = settings?.watchlist ?? data.watchlist ?? '';
-            const symbols = String(raw).split(/[,\n]+/)
-                .map(s => s.trim().toUpperCase())
-                .filter(Boolean);
-
-            const active = String(
-                data.active_symbol || settings?.symbol || selectedChartSymbol || ''
-            ).trim().toUpperCase();
-
-            if (active && !symbols.includes(active)) symbols.unshift(active);
-            if (!symbols.length) return;
-
-            const current = String(
-                selectedChartSymbol || select.value || active || symbols[0]
-            ).trim().toUpperCase();
-
-            const signature = symbols.join('|');
-            if (select.dataset.symbols === signature && select.options.length) {
-                if (symbols.includes(current)) select.value = current;
-                return;
-            }
-
-            // Build options with DOM APIs rather than injecting HTML. This avoids
-            // requiring an escapeHtml helper and keeps the selector safe.
-            select.replaceChildren();
-            for (const sym of symbols) {
-                const option = document.createElement('option');
-                option.value = sym;
-                option.textContent = sym;
-                select.appendChild(option);
-            }
-
-            select.dataset.symbols = signature;
-            selectedChartSymbol = symbols.includes(current) ? current : symbols[0];
-            select.value = selectedChartSymbol;
-            localStorage.setItem('cryptobot-chart-symbol', selectedChartSymbol);
-        }
-
         // ---- main render ----
         function render(data) {
             lastStatusData = data;
             const settings = data.settings || {};
-            populateChartSymbolSelect(settings, data);
             displayCurrency = settings.quote_currency || 'GBP';
             displayAssetClass = settings.asset_class || 'crypto';
             chartMode = settings.chart_mode || chartMode;
@@ -3969,7 +3598,51 @@ Live test actions can place or close real Kraken margin orders when live trading
             }
             const posCount = (data.positions || []).length;
             els.position.textContent = posCount;
-            renderDashboardTradingStats(data);
+
+            const running = !!data.running;
+            els.runDot.className = 'dot ' + (running ? 'green' : 'red');
+            els.runText.textContent = running ? 'Running' : 'Stopped';
+            els.runPill.className = 'pill ' + (running ? 'good' : '');
+
+            const liveEnabled = !!data.live_status?.enabled;
+            const armed = !!data.live_status?.armed;
+            els.tradingPill.textContent = liveEnabled ? 'Trading Enabled' : 'Trading Disabled';
+            els.tradingPill.className = 'pill ' + (liveEnabled ? 'good' : 'bad');
+            els.armedPill.textContent = armed ? '🔓 Armed' : '🔒 Locked';
+            els.armedPill.className = 'pill ' + (armed ? 'warn' : '');
+
+            els.pairDisplay.textContent = activeSymbol + (settings.asset_class === 'forex' ? ' forex' : '');
+            els.lastPrice.textContent = data.last_price ? priceText(data.last_price, activeSymbol) : '—';
+            els.signalText.textContent = data.last_signal || 'Waiting';
+
+            els.errorBox.style.display = data.last_error ? 'block' : 'none';
+            els.errorBox.textContent = data.last_error || '';
+
+            const symbols = data.chart_symbols || [];
+            if (!selectedChartSymbol || !symbols.includes(selectedChartSymbol)) selectedChartSymbol = activeSymbol;
+            els.chartSymbolSelect.innerHTML = symbols.map(s =>
+                `<option value="${s}" ${s === selectedChartSymbol ? 'selected' : ''}>${s}</option>`
+            ).join('');
+            els.chartSymbolSelect.disabled = symbols.length <= 1;
+
+            const ls = data.live_status || {};
+            const newsGuard = data.news_guard || {};
+            const healthItems = {
+                'News Guard': newsGuard.enabled ? '✓' : '✗',
+                'Spread OK': ls.spread_ok !== false ? '✓' : '✗',
+                'Volume OK': ls.volume_ok !== false ? '✓' : '✗',
+                'Daily Loss OK': ls.daily_loss_ok !== false ? '✓' : '✗',
+                'API Connected': ls.api_connected !== false ? '✓' : '✗',
+                'Websocket': ls.websocket_connected !== false ? '✓' : '✗',
+            };
+            const allHealthy = Object.values(healthItems).every(v => v === '✓');
+            const healthSummary = allHealthy ? '🟢 Healthy' : '🟡 Issues';
+            const healthSummaryEl = els.healthDetails.querySelector('summary');
+            if (healthSummaryEl) healthSummaryEl.textContent = healthSummary;
+
+            els.healthPopover.innerHTML = Object.entries(healthItems).map(([k, v]) =>
+                `<div class="item"><span>${k}</span><span class="${v==='✓'?'check':'cross'}">${v}</span></div>`
+            ).join('');
 
             renderPositions(data.positions || []);
             renderRecentActivity(data.journal || [], data.trades || []);
@@ -4038,8 +3711,6 @@ Live test actions can place or close real Kraken margin orders when live trading
                 const isShort = row.is_short || false;
                 const sideText = isShort ? 'SHORT' : 'LONG';
                 const sideClass = isShort ? 'bad' : 'good';
-                const isLive = !!(lastStatusData && lastStatusData.settings && lastStatusData.settings.live_trading_enabled);
-                const positionValue = current ? Math.abs(Number(qty||0) * Number(current||0)) : null;
 
                 let stopDisplay = '—';
                 let stopClass = '';
@@ -4093,9 +3764,10 @@ Live test actions can place or close real Kraken margin orders when live trading
 
                 return `<div class="trade-card">
                     <div class="header">
-                        <span><strong>${sym}</strong><div class="position-badges"><span class="position-badge ${isShort?'short':'long'}">${sideText}</span>${isLive?'<span class="position-badge live">LIVE</span>':''}<span class="position-value">${Number(qty).toFixed(4)}${positionValue!==null?' · '+money(positionValue):''}</span></div></span>
-                        <span class="pl ${cls}"><span style="display:block;font-size:9px;color:var(--muted);text-transform:uppercase">Unrealised P/L</span>${pnl !== null && pnl !== undefined ? money(pnl) : '-'}${pnlPct !== undefined && pnlPct !== null ? ` (${Number(pnlPct).toFixed(2)}%)` : ''}</span>
+                        <span><strong>${sym}</strong> <span class="muted" style="font-weight:400;font-size:12px;">${Number(qty).toFixed(4)}</span></span>
+                        <span class="pl ${cls}">${pnl !== null && pnl !== undefined ? money(pnl) : '-'}${pnlPct !== undefined && pnlPct !== null ? ` (${Number(pnlPct).toFixed(2)}%)` : ''}</span>
                     </div>
+                    <div class="detail"><span class="label">Side</span><span class="${sideClass}">${sideText}</span></div>
                     <div class="detail"><span class="label">Entry</span><span>${entry ? tradePriceText(entry, sym) : '-'}</span></div>
                     <div class="detail"><span class="label">Current</span><span><strong>${current ? tradePriceText(current, sym) : '-'}</strong></span></div>
                     <div class="detail"><span class="label">Stop Loss</span><span class="${stopClass}">${stopDisplay}</span></div>
@@ -4121,8 +3793,8 @@ Live test actions can place or close real Kraken margin orders when live trading
                     </div>
                     ` : ''}
                     <div class="actions">
-                        <button data-symbol="${sym}" data-mode="profit_only">Close If In Profit</button>
-                        <button class="danger" data-symbol="${sym}" data-mode="force">Close Position</button>
+                        <button data-symbol="${sym}" data-mode="profit_only">Take Profit</button>
+                        <button class="danger" data-symbol="${sym}" data-mode="force">Force Close</button>
                     </div>
                 </div>`;
             }).join('');
@@ -4134,7 +3806,7 @@ Live test actions can place or close real Kraken margin orders when live trading
                 .map(t => ({ time: t.time, text: `${t.side} ${num(t.quantity)} at ${priceText(t.price, t.symbol)}` }))
             ];
             all.sort((a, b) => new Date(b.time) - new Date(a.time));
-            const recent = all.slice(0, 10);
+            const recent = all.slice(0, 5);
             if (!recent.length) {
                 els.recentActivity.innerHTML = '<div class="activity-item"><span class="muted">No recent activity.</span></div>';
                 return;
@@ -4337,7 +4009,6 @@ Live test actions can place or close real Kraken margin orders when live trading
             dashboard: $('tab-dashboard'),
             trading: $('tab-trading'),
             analysis: $('tab-analysis'),
-            admin: $('tab-admin'),
         };
         mainTabs.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -4348,7 +4019,6 @@ Live test actions can place or close real Kraken margin orders when live trading
                 if (id === 'dashboard' && lastStatusData) {
                     // chart already there
                 }
-                if (id === 'admin') { loadAdminUsers(); loadAudit(); }
             });
         });
 
@@ -4375,116 +4045,6 @@ Live test actions can place or close real Kraken margin orders when live trading
             });
         });
 
-        // Authentication / owner user administration
-        if (els.logoutBtn) els.logoutBtn.addEventListener('click', logoutAuxo);
-        if (els.accountSelector) els.accountSelector.addEventListener('change', async () => {
-            const r=await post('/api/auth/select-account',{account_id:Number(els.accountSelector.value)});
-            if (r.ok) window.location.reload();
-            else alert(r.error || 'Could not switch account');
-        });
-        if (els.refreshAuditBtn) els.refreshAuditBtn.addEventListener('click', loadAudit);
-        if (els.createAccountForm) els.createAccountForm.addEventListener('submit', async e => {
-            e.preventDefault();
-            const r=await post('/api/admin/accounts/create',{
-                user_id:Number($('adminAccountUserId').value),
-                account_label:$('adminAccountLabel').value.trim(),
-                exchange:$('adminAccountExchange').value
-            });
-            els.adminMessage.style.display='block'; els.adminMessage.textContent=r.ok?'Trading account created.':(r.error||'Create failed');
-            if (r.ok) { els.createAccountForm.reset(); await loadAdminUsers(); await loadAudit(); await loadCurrentUser(); }
-        });
-        if (els.adminAccountsBody) els.adminAccountsBody.addEventListener('click', async e => {
-            const row=e.target.closest('tr[data-account-id]'); if (!row) return;
-            const accountId=Number(row.dataset.accountId);
-            try {
-                if (e.target.classList.contains('acct-save')) {
-                    const r=await post('/api/admin/accounts/update',{account_id:accountId,
-                        account_label:row.querySelector('.acct-label').value.trim(),
-                        enabled:row.querySelector('.acct-enabled').checked});
-                    if (!r.ok) throw new Error(r.error||'Account update failed');
-                } else if (e.target.classList.contains('acct-delete')) {
-                    if (!confirm('Delete this trading account? Historical trades are retained.')) return;
-                    const r=await post('/api/admin/accounts/delete',{account_id:accountId});
-                    if (!r.ok) throw new Error(r.error||'Account delete failed');
-                } else return;
-                await loadAdminUsers(); await loadAudit(); await loadCurrentUser();
-            } catch(err) { els.adminMessage.style.display='block'; els.adminMessage.textContent=err.message; }
-        });
-        if (els.refreshUsersBtn) els.refreshUsersBtn.addEventListener('click', loadAdminUsers);
-
-        if (els.createUserForm) els.createUserForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const payload = {
-                display_name: $('adminNewName').value.trim(),
-                email: $('adminNewEmail').value.trim(),
-                password: $('adminNewPassword').value,
-                exchange: $('adminNewExchange').value,
-                subscription_tier: $('adminNewTier').value,
-            };
-            const r = await post('/api/admin/users/create', payload);
-            els.adminMessage.style.display='block';
-            els.adminMessage.textContent = r.ok ? 'User created.' : (r.error || 'Create failed');
-            if (r.ok) { els.createUserForm.reset(); $('adminNewExchange').value='kraken'; await loadAdminUsers(); }
-        });
-
-        if (els.adminUsersBody) els.adminUsersBody.addEventListener('click', async (e) => {
-            const row=e.target.closest('tr[data-user-id]'); if (!row) return;
-            const userId=Number(row.dataset.userId);
-            try {
-                if (e.target.classList.contains('adm-save')) {
-                    const r=await post('/api/admin/users/update',{
-                        user_id:userId,
-                        display_name:row.querySelector('.adm-name').value.trim(),
-                        email:row.querySelector('.adm-email').value.trim(),
-                        status:row.querySelector('.adm-status').value
-                    });
-                    if (!r.ok) throw new Error(r.error || 'Update failed');
-
-                    // Persist the tier selected in the row too.
-                    const selectedTier=row.querySelector('.adm-tier')?.value || 'starter';
-                    const cachedUser=(adminUsersCache || []).find(u => Number(u.id)===userId);
-                    const existingOverrides=cachedUser?.entitlement_overrides || {};
-                    const tierResult=await post('/api/admin/users/entitlements',{
-                        user_id:userId,
-                        subscription_tier:selectedTier,
-                        overrides:existingOverrides
-                    });
-                    if (!tierResult.ok) throw new Error(tierResult.error || 'Tier update failed');
-                    els.adminMessage.style.display='block'; els.adminMessage.textContent='User updated.';
-                    await loadAdminUsers();
-                }
-                if (e.target.classList.contains('adm-entitlements')) {
-                    const tier=row.querySelector('.adm-tier')?.value || 'starter';
-                    const raw=prompt('Optional entitlement overrides as JSON. Example: {"max_accounts":5,"auto_disable_weak_pairs":true}\\nUse {} for no overrides.', '{}');
-                    if (raw===null) return;
-                    let overrides={};
-                    try { overrides=JSON.parse(raw||'{}'); } catch (_) { throw new Error('Overrides must be valid JSON'); }
-                    const r=await post('/api/admin/users/entitlements',{user_id:userId,subscription_tier:tier,overrides});
-                    if (!r.ok) throw new Error(r.error||'Entitlement update failed');
-                    els.adminMessage.style.display='block'; els.adminMessage.textContent=`Access updated to ${tier}.`;
-                    await loadAdminUsers(); await loadAudit();
-                }
-                if (e.target.classList.contains('adm-password')) {
-                    const password=prompt('Enter a new password (minimum 10 characters):');
-                    if (password === null) return;
-                    const r=await post('/api/admin/users/password',{user_id:userId,password});
-                    if (!r.ok) throw new Error(r.error || 'Password update failed');
-                    els.adminMessage.style.display='block'; els.adminMessage.textContent='Password updated; existing sessions for that user were logged out.';
-                }
-                if (e.target.classList.contains('adm-delete')) {
-                    if (!confirm('Delete this user login/account? Historical trades will be retained.')) return;
-                    const r=await post('/api/admin/users/delete',{user_id:userId});
-                    if (!r.ok) throw new Error(r.error || 'Delete failed');
-                    els.adminMessage.style.display='block'; els.adminMessage.textContent='User deleted. Historical trades retained.';
-                    await loadAdminUsers();
-                }
-            } catch (err) {
-                els.adminMessage.style.display='block'; els.adminMessage.textContent=err.message;
-            }
-        });
-
-        loadCurrentUser();
-
         // Start / Stop
         els.startBtn.addEventListener('click', async () => {
             const r = await post('/api/start');
@@ -4494,49 +4054,32 @@ Live test actions can place or close real Kraken margin orders when live trading
         });
         els.stopBtn.addEventListener('click', async () => { await post('/api/stop');
             refresh(); });
-        // Optional controls removed from the Trading three-dot submenu.
-        // Keep their handlers only when those controls are actually present.
-        if (els.resetBtn) {
-            els.resetBtn.addEventListener('click', async () => {
-                if (!confirm('Reset paper balance and trades?')) return;
-                await post('/api/reset');
-                refresh();
-            });
-        }
+        els.resetBtn.addEventListener('click', async () => {
+            if (!confirm('Reset paper balance and trades?')) return;
+            await post('/api/reset');
+            refresh();
+        });
 
-        // OANDA actions are optional on the crypto/Kraken dashboard.
-        if (els.syncOandaBalanceBtn) {
-            els.syncOandaBalanceBtn.addEventListener('click', async () => {
-                els.syncOandaBalanceBtn.disabled = true;
-                els.tradingStatus.textContent = 'Syncing OANDA…';
-                try {
-                    const r = await post('/api/sync-oanda-balance');
-                    if (!r.ok) throw new Error(r.error || 'Sync failed');
-                    await refresh();
-                    els.tradingStatus.textContent = `Synced OANDA: ${money(r.available_cash)}`;
-                } catch (e) {
-                    els.tradingStatus.textContent = e.message;
-                } finally {
-                    els.syncOandaBalanceBtn.disabled = false;
-                }
-            });
-        }
-
-        if (els.oandaAuthCheckBtn) {
-            els.oandaAuthCheckBtn.addEventListener('click', async () => {
-                els.oandaAuthCheckBtn.disabled = true;
-                els.tradingStatus.textContent = 'Checking OANDA…';
-                try {
-                    const r = await post('/api/oanda-auth-check');
-                    if (!r.ok) throw new Error(r.error || 'Auth check failed');
-                    els.tradingStatus.textContent = `OANDA OK: ${r.account_id || ''} ${money(r.balance)}`;
-                } catch (e) {
-                    els.tradingStatus.textContent = e.message;
-                } finally {
-                    els.oandaAuthCheckBtn.disabled = false;
-                }
-            });
-        }
+        // OANDA actions
+        els.syncOandaBalanceBtn.addEventListener('click', async () => {
+            els.syncOandaBalanceBtn.disabled = true;
+            els.tradingStatus.textContent = 'Syncing OANDA…';
+            try {
+                const r = await post('/api/sync-oanda-balance');
+                if (!r.ok) throw new Error(r.error || 'Sync failed');
+                await refresh();
+                els.tradingStatus.textContent = `Synced OANDA: ${money(r.available_cash)}`;
+            } catch (e) { els.tradingStatus.textContent = e.message; } finally { els.syncOandaBalanceBtn.disabled = false; }
+        });
+        els.oandaAuthCheckBtn.addEventListener('click', async () => {
+            els.oandaAuthCheckBtn.disabled = true;
+            els.tradingStatus.textContent = 'Checking OANDA…';
+            try {
+                const r = await post('/api/oanda-auth-check');
+                if (!r.ok) throw new Error(r.error || 'Auth check failed');
+                els.tradingStatus.textContent = `OANDA OK: ${r.account_id || ''} ${money(r.balance)}`;
+            } catch (e) { els.tradingStatus.textContent = e.message; } finally { els.oandaAuthCheckBtn.disabled = false; }
+        });
 
         // ─── Settings form submission ───
         els.settingsForm.addEventListener('submit', async (e) => {
@@ -4925,7 +4468,6 @@ Live test actions can place or close real Kraken margin orders when live trading
                 render(data);
                 if (!settingsLoaded) {
                     loadSettings(data);
-                    applyEntitlementUI();
                 }
                 updateStreamingUI(data);
             } catch (e) { /* ignore */ }
@@ -4946,12 +4488,5 @@ Live test actions can place or close real Kraken margin orders when live trading
             }
         });
     </script>
-<script>
-async function kmCall(path,method='GET',body=null){const o=document.getElementById('kmOut');try{const x={method,headers:{}};if(body){x.headers['Content-Type']='application/json';x.body=JSON.stringify(body)}const r=await fetch(path,x),d=await r.json();o.textContent=JSON.stringify(d,null,2)}catch(e){o.textContent=String(e)}}
-document.getElementById('kmValidate')?.addEventListener('click',()=>kmCall('/api/kraken-margin/validate'));
-document.getElementById('kmRead')?.addEventListener('click',()=>kmCall('/api/kraken-margin/read-only-check'));
-document.getElementById('kmRecon')?.addEventListener('click',()=>kmCall('/api/kraken-margin/reconcile','POST',{}));
-document.getElementById('kmClose')?.addEventListener('click',()=>confirm('BUY TO COVER ALL KRAKEN SHORTS?')&&kmCall('/api/kraken-margin/emergency-close','POST',{all_positions:true}));
-document.getElementById('kmTiny')?.addEventListener('click',()=>{const symbol=document.getElementById('kmSymbol').value,quote_amount=Number(document.getElementById('kmAmount').value);if(confirm('REAL MONEY SHORT TEST?'))kmCall('/api/kraken-margin/tiny-live-short','POST',{symbol,quote_amount})});
-</script></body>
+</body>
 </html>
