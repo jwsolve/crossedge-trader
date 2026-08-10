@@ -208,11 +208,15 @@ class KrakenConnector:
             raise RuntimeError("Kraken client not available.")
         kraken_symbol = self._map_symbol(symbol)
         pair = f"{kraken_symbol}{self.quote}"
+        price = self.get_price(symbol)
+        if price <= 0:
+            raise RuntimeError(f"Kraken price unavailable for {symbol}/{self.quote}")
+        volume = float(quote_size) / price
         order = self.client.query_private("AddOrder", {
             "pair": pair,
             "type": "buy",
             "ordertype": "market",
-            "quote": str(quote_size),
+            "volume": str(volume),
         })
         return order
 

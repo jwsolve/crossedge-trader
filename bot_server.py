@@ -4754,6 +4754,7 @@ class PaperBot:
             "kelly_fraction", "atr_period", "atr_multiplier", "max_hold_hours",
             "rsi_oversold", "rsi_overbought", "ma_exit_period",
             "min_regime_confidence", "kraken_paper_maker_fee", "kraken_paper_taker_fee", "kraken_margin_leverage", "kraken_margin_max_exposure_quote", "kraken_margin_dust_quote", "kraken_margin_max_open_shorts", "kraken_margin_min_level_pct", "kraken_margin_test_max_quote",
+            "kraken_maker_offset_pct", "coinbase_maker_offset_pct",
         }
         bool_fields = {
             "live_trading_enabled", "use_sr_filter", "use_dynamic_sr_exits",
@@ -4768,6 +4769,8 @@ class PaperBot:
             "telegram_alert_on_drawdown", "allow_short_selling", "kraken_margin_short_enabled", "kraken_margin_read_only", "self_learning_enabled",
             "strategy_creator_enabled", "strategy_evolution_enabled", "strategy_auto_select",
             "regime_adaptation_enabled", "strategy_switching_enabled",
+            "kraken_maker_first_enabled", "kraken_maker_market_fallback",
+            "coinbase_maker_first_enabled", "coinbase_maker_market_fallback",
         }
         text_fields = {
             "asset_class", "exchange", "active_exchange", "symbol", "quote_currency", "kraken_margin_quote_currency", "strategy",
@@ -8185,14 +8188,21 @@ class PaperBot:
                                   "mismatches":post.get("mismatches",[]),
                                   "owned_positions":post.get("owned_positions",[])}}
 
-    def kraken_emergency_close(self,symbol:str|None=None,all_positions:bool=False)->dict[str,Any]:
-        """D8.6.10 ownership-aware BUY-to-cover. Default path closes only Auxo-owned Kraken SHORT quantity."""
+    def kraken_emergency_close(self,symbol:str|None=None,all_positions:bool=False,max_cover_quantity:float|None=None)->dict[str,Any]:
+        """D8.6.10 ownership-aware BUY-to-cover. Default path closes only Auxo-owned Kraken SHORT quantity.
+
+        max_cover_quantity caps the total covered base quantity (partial exits).
+        When a partial cover is confirmed, the remaining owned quantity is kept
+        open so a later full close only covers the residual.
+        """
         if not kraken_live_is_armed():
             raise RuntimeError("Kraken live-order interlock is not armed")
         wanted=str(symbol or "").upper()
         snap=kraken_margin_snapshot(quote_asset=str(self.state.settings.get("kraken_margin_quote_currency") or self.state.settings.get("quote_currency") or "USDT").upper())
         owned=getattr(self.state,"kraken_margin_owned",{}) or {}
         closed=[]; errors=[]; skipped=[]
+        budget=None if max_cover_quantity is None else max(0.0,float(max_cover_quantity))
+        covered_total=0.0
 
         # Build currently-open Kraken SELL exposure by pair.
         open_by_pair={}
@@ -8220,8 +8230,12 @@ class PaperBot:
         # Never close more than Kraken currently reports open for that pair.
         reserved={}
         for oid,rec,pair,owned_qty in candidates:
+            if budget is not None and covered_total>=budget:
+                break
             available=max(0.0,open_by_pair.get(pair,0.0)-reserved.get(pair,0.0))
             cover_qty=min(owned_qty,available)
+            if budget is not None:
+                cover_qty=min(cover_qty,budget-covered_total)
             if cover_qty<=0:
                 skipped.append({"order_id":oid,"pair":pair,"reason":"No matching open Kraken SHORT exposure"})
                 continue
@@ -8238,6 +8252,7 @@ class PaperBot:
                 rec["closing_ts"]=time.time()
                 rec["requested_cover_quantity"]=cover_qty
                 reserved[pair]=reserved.get(pair,0.0)+cover_qty
+                covered_total+=cover_qty
                 closed.append({"owned_order_id":oid,"pair":pair,"quantity":cover_qty,
                                "cover_order_ids":cover_ids})
                 self.save_state()
@@ -8245,6 +8260,7 @@ class PaperBot:
                 errors.append({"owned_order_id":oid,"pair":pair,"error":str(exc)})
 
         # AddOrder acceptance is not execution. Query Kraken for final CLOSED fills.
+        confirmed_by_oid={}
         confirmed_fills=[]
         for item in closed:
             for cover_id in item.get("cover_order_ids") or []:
@@ -8252,6 +8268,7 @@ class PaperBot:
                     q=kraken_reconcile_order(str(cover_id))
                     if q.get("exchange_confirmed_complete"):
                         confirmed_fills.append(q)
+                        confirmed_by_oid[item["owned_order_id"]]=confirmed_by_oid.get(item["owned_order_id"],0.0)+float(q.get("filled_size") or 0)
                 except Exception as exc:
                     errors.append({"cover_order_id":str(cover_id),"error":f"fill confirmation failed: {exc}"})
 
@@ -8272,6 +8289,18 @@ class PaperBot:
             if remaining<=non_owned_residual+tolerance:
                 rec["status"]="closed"; rec["closed_ts"]=time.time()
                 rec["remaining_kraken_residual"]=remaining
+            else:
+                # Partial cover: reduce owned quantity by the confirmed fills. The
+                # residual stays owned and available for a later full close.
+                confirmed=max(0.0,confirmed_by_oid.get(oid,0.0))
+                new_qty=max(0.0,owned_qty-confirmed)
+                rec["quantity"]=new_qty
+                rec["remaining_kraken_residual"]=remaining
+                if confirmed>0:
+                    if new_qty<=0:
+                        rec["status"]="closed"; rec["closed_ts"]=time.time()
+                    else:
+                        rec["status"]="open"
         self.save_state()
 
         # Reconcile once more so normal dust handling can classify any old residual.
@@ -8279,6 +8308,7 @@ class PaperBot:
         final=self.reconcile_kraken_margin(force=True)
         return {"ok":bool(closed) and not errors,"stage":"kraken_close",
                 "closed":closed,"confirmed_fills":confirmed_fills,"errors":errors,"skipped":skipped,
+                "partial":budget is not None,"covered_total":covered_total,
                 "reconciliation":{"healthy":final.get("healthy"),"status":final.get("status"),
                                   "mismatches":final.get("mismatches",[]),
                                   "ignored_dust":final.get("ignored_dust",[])}}
@@ -8649,7 +8679,7 @@ class PaperBot:
 
         if len(positions) >= max_coinbase_positions:
             with self.lock:
-                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: max coinbase trades reached"
+                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: max open positions reached ({max_coinbase_positions})"
                 self.journal(symbol, "BLOCK", self.state.last_signal, price, {"quote_size": quote_size})
             return
 
@@ -8702,10 +8732,15 @@ class PaperBot:
             return
 
         gbp_available = self.live_available_balance(effective_quote)
-        if gbp_available < quote_size:
+        required_collateral = quote_size
+        if is_short and active_exchange == "kraken":
+            # Margin shorts only pledge collateral, not the full notional.
+            lev = float(settings.get("kraken_margin_leverage", 2))
+            required_collateral = quote_size / lev if lev > 0 else quote_size
+        if gbp_available < required_collateral:
             with self.lock:
-                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: only {settings['quote_currency']} {gbp_available:.2f} available"
-                self.journal(symbol, "BLOCK", self.state.last_signal, price, {"available": gbp_available, "quote_size": quote_size})
+                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: only {effective_quote} {gbp_available:.2f} available (need {required_collateral:.2f})"
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {"available": gbp_available, "quote_size": quote_size, "required_collateral": required_collateral})
             return
 
         product_id = f"{symbol}-{settings['quote_currency']}"
@@ -8731,22 +8766,33 @@ class PaperBot:
         margin_leverage=float(settings.get("kraken_margin_leverage",2)) if is_short else None
 
         try:
+            # Maker-first entry needs a live same-side top of book. If the guard
+            # could not provide one (exchange hiccup), fall back to a taker market
+            # order when configured rather than aborting the entry entirely.
+            maker_fallback = ((active_exchange=="coinbase" and settings.get("coinbase_maker_market_fallback",True)) or
+                              (active_exchange=="kraken" and settings.get("kraken_maker_market_fallback",True)))
+            if order_type == "maker":
+                bid = float(guard.get("bid") or 0.0)
+                ask = float(guard.get("ask") or 0.0)
+                if bid <= 0 or ask <= 0:
+                    if maker_fallback:
+                        order_type = "market"
+                        logger.info("Maker-first %s entry had no valid bid/ask; falling back to market", active_exchange)
+                    else:
+                        raise RuntimeError(f"Maker-first entry requires a valid {active_exchange} bid/ask")
             if order_type in {"limit", "bracket", "native_stop_scaffold", "maker"}:
+                price_quote = effective_quote if active_exchange=="kraken" else str(settings["quote_currency"])
                 if order_type == "maker":
                     # Rest at (or slightly behind) the same-side top of book.
                     # BUY <= bid and SELL >= ask prevents an intentional cross.
-                    bid = float(guard.get("bid") or 0.0)
-                    ask = float(guard.get("ask") or 0.0)
-                    if bid <= 0 or ask <= 0:
-                        raise RuntimeError("Maker-first entry requires a valid Coinbase bid/ask")
                     raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
-                    limit_price = self.live_round_price(raw_maker_price,symbol,str(settings["quote_currency"]))
+                    limit_price = self.live_round_price(raw_maker_price,symbol,price_quote)
                 else:
                     best_price, _, _ = self.price_aggregator.get_best_price(symbol, side=side)
                     if side == "BUY":
-                        limit_price = self.live_round_price(best_price*(1+limit_offset),symbol,str(settings["quote_currency"]))
+                        limit_price = self.live_round_price(best_price*(1+limit_offset),symbol,price_quote)
                     else:
-                        limit_price = self.live_round_price(best_price*(1-limit_offset),symbol,str(settings["quote_currency"]))
+                        limit_price = self.live_round_price(best_price*(1-limit_offset),symbol,price_quote)
 
                 ok, volume, recommended = self.price_aggregator.check_liquidity(symbol, side, quote_size)
                 if not ok:
@@ -8864,7 +8910,14 @@ class PaperBot:
 
         active_exchange=self.live_exchange()
         if active_exchange=="kraken" and is_short:
-            result=self.kraken_emergency_close(symbol=symbol,all_positions=False)
+            # Partial exits cover only the requested quantity; full exits cover
+            # the entire Auxo-owned short. quantity_override is negative when the
+            # caller derived it from self.state.coin (a short), so take abs().
+            max_cover=(abs(float(quantity_override))
+                       if quantity_override is not None and float(quantity_override)!=0
+                       else None)
+            result=self.kraken_emergency_close(symbol=symbol,all_positions=False,
+                                               max_cover_quantity=max_cover)
             if not result.get("ok"):
                 with self.lock:
                     self.state.last_signal=f"LIVE SHORT EXIT failed: {result}"
@@ -8939,13 +8992,24 @@ class PaperBot:
             (active_exchange=="coinbase" and settings.get("coinbase_maker_first_enabled",True)) or
             (active_exchange=="kraken" and settings.get("kraken_maker_first_enabled",True)))
 
+        # A maker exit needs a live same-side top of book. If the guard cannot
+        # provide one (exchange hiccup), fall back to a taker market order when
+        # configured rather than aborting the exit entirely.
+        exit_maker_fallback = ((active_exchange=="coinbase" and settings.get("coinbase_maker_market_fallback",True)) or
+                               (active_exchange=="kraken" and settings.get("kraken_maker_market_fallback",True)))
         if maker_first_exit:
             g=live_market_guard(active_exchange,symbol,str(settings["quote_currency"]),
                 int(settings.get("live_granularity",3600)),int(settings.get("live_candle_count",300)),
                 float(settings["max_live_spread_pct"]),0.0)
             bid=float(g.get("bid") or 0); ask=float(g.get("ask") or 0)
             if bid <= 0 or ask <= 0:
-                raise RuntimeError("Maker-first exit requires a valid Coinbase bid/ask")
+                if exit_maker_fallback:
+                    logger.info("Maker-first %s exit had no valid bid/ask; falling back to market", active_exchange)
+                    maker_first_exit = False
+                else:
+                    raise RuntimeError(f"Maker-first exit requires a valid {active_exchange} bid/ask")
+
+        if maker_first_exit:
             maker_offset = max(0.0,float(settings.get("kraken_maker_offset_pct" if active_exchange=="kraken" else "coinbase_maker_offset_pct",0.0)))/100.0
             raw_limit = ask * (1.0 + maker_offset) if exit_side == "SELL" else bid * (1.0 - maker_offset)
             limit_price = self.live_round_price(raw_limit,symbol,str(settings["quote_currency"]))
@@ -9261,6 +9325,9 @@ class PaperBot:
             self.replace_order(order)
 
     def replace_order(self, order: ManagedOrder) -> None:
+        if self.live_exchange() == "kraken":
+            self._replace_kraken_order(order)
+            return
         try:
             replacement_order_type = order.order_type
             replacement_price = order.price
@@ -9328,6 +9395,102 @@ class PaperBot:
         except Exception as exc:
             self.audit("ORDER_REPLACE_FAILED", order_id=order.order_id, error=str(exc))
             logger.warning(f"Order replace failed: {exc}")
+
+    def _replace_kraken_order(self, order: ManagedOrder) -> None:
+        """Kraken-aware order replacement.
+
+        Prevented the previous Coinbase-only replace_order from leaking a real
+        Coinbase order onto a Kraken-managed position when a Kraken limit/maker
+        order expired. Replaces using kraken_order() so the pair, rounding,
+        post-only flag and margin leverage all stay Kraken-correct.
+        """
+        settings = dict(self.state.settings)
+        product = str(order.product_id or "")
+        parts = product.split("-", 1)
+        symbol = (parts[0] if parts and parts[0] else order.symbol or "").upper()
+        quote = (parts[1] if len(parts) > 1 else settings.get("quote_currency") or "USDT").upper()
+        is_short = bool((order.details or {}).get("is_short", False))
+        leverage = float(settings.get("kraken_margin_leverage", 2)) if is_short else None
+
+        def volume() -> float:
+            if order.base_size and float(order.base_size) > 0:
+                return float(order.base_size)
+            if not order.quote_size or float(order.quote_size) <= 0:
+                raise RuntimeError("No size available to replace Kraken order")
+            ticker = fetch_kraken_ticker(symbol, quote)
+            px = float(ticker.get("ask" if order.side == "BUY" else "bid") or 0.0)
+            if px <= 0:
+                raise RuntimeError("Cannot derive Kraken replacement volume without a price")
+            return float(order.quote_size) / px
+
+        replacement_order_type = order.order_type
+        replacement_price = order.price
+
+        if order.order_type == "maker" and order.base_size:
+            retry_limit = int(settings.get("order_retry_limit", 1))
+            if order.retry_count < retry_limit:
+                ticker = fetch_kraken_ticker(symbol, quote)
+                bid = float(ticker.get("bid") or 0.0)
+                ask = float(ticker.get("ask") or 0.0)
+                if bid <= 0 or ask <= 0:
+                    raise RuntimeError("Kraken bid/ask unavailable for maker replacement")
+                offset = max(0.0, float(settings.get("kraken_maker_offset_pct", 0.0))) / 100.0
+                raw_price = bid * (1.0 - offset) if order.side == "BUY" else ask * (1.0 + offset)
+                replacement_price = self.live_round_price(raw_price, symbol, quote)
+                replacement = kraken_order(symbol, quote, order.side, "limit", volume(), replacement_price, post_only=True, leverage=leverage)
+            elif bool(settings.get("kraken_maker_market_fallback", True)):
+                replacement_order_type = "market"
+                replacement = kraken_order(symbol, quote, order.side, "market", volume(), leverage=leverage)
+            else:
+                return
+        elif order.order_type == "limit" and order.price and order.base_size:
+            replacement = kraken_order(symbol, quote, order.side, "limit", volume(), order.price, leverage=leverage)
+        elif order.side == "BUY" and order.quote_size:
+            replacement_order_type = "market"
+            replacement = kraken_order(symbol, quote, order.side, "market", volume(), leverage=leverage)
+        elif order.base_size:
+            replacement_order_type = "market"
+            replacement = kraken_order(symbol, quote, order.side, "market", volume(), leverage=leverage)
+        else:
+            return
+
+        replacement_id = str(replacement["order_id"])
+        new_order = self.track_order(
+            replacement_id,
+            order.symbol,
+            order.product_id,
+            order.side,
+            order.role,
+            replacement_order_type,
+            price=replacement_price,
+            base_size=order.base_size,
+            quote_size=order.quote_size,
+            reason=order.reason,
+            details=order.details,
+        )
+        new_order.retry_count = order.retry_count + 1
+
+        # A replaced SHORT entry has a new exchange order id. Migrate the margin
+        # ownership record so a confirmed replacement fill is recognised as owned;
+        # otherwise apply_reconciled_order() would not find it in kraken_margin_owned.
+        if is_short and order.role == "ENTRY":
+            owned = getattr(self.state, "kraken_margin_owned", {}) or {}
+            old = owned.get(str(order.order_id))
+            if old is not None:
+                new_rec = dict(old)
+                new_rec.update({
+                    "order_id": replacement_id,
+                    "status": "pending",
+                    "created_ts": time.time(),
+                    "replaced_from": str(order.order_id),
+                })
+                owned[replacement_id] = new_rec
+                old["status"] = "cancelled_replaced"
+                old["cancelled_ts"] = time.time()
+                self.save_state()
+
+        self.audit("ORDER_REPLACED", old_order_id=order.order_id, new_order_id=replacement_id)
+        logger.info(f"Kraken order replaced: {order.order_id} → {replacement_id}")
 
     def submit_native_stop_for_position(self, entry_order: ManagedOrder, entry_price: float) -> None:
         if self.live_exchange() != "coinbase":
@@ -10169,7 +10332,9 @@ def kraken_private(path: str, params: dict[str, Any] | None=None) -> dict[str, A
 _KRAKEN_PAIRS={}
 def kraken_pair_info(symbol:str, quote:str)->dict[str,Any]:
     key=f"{symbol.upper()}/{quote.upper()}"
-    if key in _KRAKEN_PAIRS:return _KRAKEN_PAIRS[key]
+    cached=_KRAKEN_PAIRS.get(key)
+    if cached and time.time()-float(cached[0])<3600:
+        return cached[1]
     base={"BTC":"XBT","DOGE":"XDG"}.get(symbol.upper(),symbol.upper())
     data=fetch_json("https://api.kraken.com/0/public/AssetPairs")
     wanted={f"{base}{quote.upper()}",f"{base}/{quote.upper()}",f"{symbol.upper()}{quote.upper()}",f"{symbol.upper()}/{quote.upper()}"}
@@ -10177,7 +10342,7 @@ def kraken_pair_info(symbol:str, quote:str)->dict[str,Any]:
         if k.upper() in wanted or str(v.get("altname","")).upper() in wanted or str(v.get("wsname","")).upper() in wanted:
             x={"pair":v.get("altname") or k,"price_decimals":int(v.get("pair_decimals",8)),
                "lot_decimals":int(v.get("lot_decimals",8)),"ordermin":float(v.get("ordermin") or 0)}
-            _KRAKEN_PAIRS[key]=x;return x
+            _KRAKEN_PAIRS[key]=(time.time(),x);return x
     raise RuntimeError(f"Kraken pair unavailable: {key}")
 
 
@@ -10212,6 +10377,30 @@ def kraken_margin_pair_diagnostics(symbol:str,quote:str)->dict[str,Any]:
         "margin_stop":meta.get("margin_stop"),
         "public_api_errors":errors,
         "short_margin_advertised":bool(meta.get("leverage_sell") or []),
+    }
+
+def fetch_kraken_ticker(symbol: str, quote: str) -> dict[str, Any]:
+    """Return the live Kraken bid/ask for a pair.
+
+    Uses the pair's resolved altname so symbol/quote aliases (BTC/XBT, DOGE/XDG)
+    resolve exactly like every other Kraken order path in Auxo.
+    """
+    symbol=str(symbol or "").upper(); quote=str(quote or "").upper()
+    info=kraken_pair_info(symbol,quote)
+    pair=info.get("pair") or f"{symbol}{quote}"
+    data=fetch_json("https://api.kraken.com/0/public/Ticker?"+urllib.parse.urlencode({"pair":pair}))
+    if data.get("error"):
+        raise RuntimeError("; ".join(data["error"]))
+    result=data.get("result") or {}
+    key=next(iter(result),None)
+    row=result.get(key) or {}
+    bids=row.get("b") or []; asks=row.get("a") or []
+    last=row.get("c") or [0]
+    return {
+        "bid":float(bids[0]) if bids else 0.0,
+        "ask":float(asks[0]) if asks else 0.0,
+        "last":float(last[0]) if last else 0.0,
+        "pair":pair,
     }
 
 # ─── D9 Trading Control Centre: public per-pair margin capability cache ───
@@ -13311,8 +13500,62 @@ def live_market_guard(
     max_spread_pct: float,
     min_quote_volume: float,
 ) -> dict[str, Any]:
-    if exchange.lower() != "coinbase":
-        return {"ok": True, "reason": "Guard only enforced for Coinbase live trading"}
+    exchange_l = exchange.lower()
+    if exchange_l not in {"coinbase", "kraken"}:
+        return {"ok": True, "reason": "Guard only enforced for Coinbase/Kraken live trading"}
+
+    if exchange_l == "kraken":
+        try:
+            ticker = fetch_kraken_ticker(symbol, quote_currency)
+        except Exception as exc:
+            return {"ok": False, "reason": f"Kraken ticker unavailable: {exc}"}
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return {"ok": False, "reason": "invalid Kraken bid/ask"}
+        midpoint = (bid + ask) / 2
+        spread_pct = ((ask - bid) / midpoint) * 100 if midpoint else 100.0
+        if max_spread_pct > 0 and spread_pct > max_spread_pct:
+            return {
+                "ok": False,
+                "reason": f"spread {spread_pct:.3f}% > limit {max_spread_pct:.3f}%",
+                "spread_pct": round(spread_pct, 4),
+                "bid": bid,
+                "ask": ask,
+            }
+        quote_volume = 0.0
+        if min_quote_volume > 0:
+            try:
+                candles = fetch_candles(
+                    exchange="kraken",
+                    symbol=symbol,
+                    quote_currency=quote_currency,
+                    granularity=granularity,
+                    candle_count=min(50, max(20, candle_count)),
+                )
+                quote_volume = sum(candle.close * candle.volume for candle in candles)
+            except Exception:
+                quote_volume = 0.0
+            if quote_volume < min_quote_volume:
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"recent quote volume {quote_currency} {quote_volume:.2f} "
+                        f"< minimum {quote_currency} {min_quote_volume:.2f}"
+                    ),
+                    "spread_pct": round(spread_pct, 4),
+                    "quote_volume": round(quote_volume, 2),
+                    "bid": bid,
+                    "ask": ask,
+                }
+        return {
+            "ok": True,
+            "reason": "market liquid enough",
+            "spread_pct": round(spread_pct, 4),
+            "quote_volume": round(quote_volume, 2),
+            "bid": bid,
+            "ask": ask,
+        }
 
     ticker = fetch_coinbase_ticker(symbol, quote_currency)
     bid = float(ticker.get("bid") or 0.0)

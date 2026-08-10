@@ -1394,6 +1394,17 @@
                             <label>OANDA demo orders <select name="oanda_demo_trading_enabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
                             <label>Max OANDA open trades <input name="max_oanda_open_trades" type="number" value="3" step="1" min="1" max="20" /></label>
 			    <label>Max Coinbase open trades <input name="max_coinbase_open_trades" type="number" value="3" step="1" min="1" max="20" /></label>
+                            <label>Kraken margin shorts <select name="kraken_margin_short_enabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
+                            <label>Kraken margin read-only <select name="kraken_margin_read_only"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+                            <label>Kraken margin leverage <input name="kraken_margin_leverage" type="number" value="2" step="1" min="1" max="5" /></label>
+                            <label>Kraken margin quote currency <input name="kraken_margin_quote_currency" value="USDT" /></label>
+                            <label>Kraken margin max exposure (quote) <input name="kraken_margin_max_exposure_quote" type="number" value="25" step="1" min="1" /></label>
+                            <label>Kraken margin dust threshold (quote) <input name="kraken_margin_dust_quote" type="number" value="0.10" step="0.01" min="0" /></label>
+                            <label>Kraken margin max open shorts <input name="kraken_margin_max_open_shorts" type="number" value="1" step="1" min="1" max="10" /></label>
+                            <label>Kraken margin min level % <input name="kraken_margin_min_level_pct" type="number" value="250" step="10" min="100" /></label>
+                            <label>Kraken maker-first <select name="kraken_maker_first_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+                            <label>Kraken maker offset % <input name="kraken_maker_offset_pct" type="number" value="0.00" step="0.01" min="0" /></label>
+                            <label>Kraken maker -> market fallback <select name="kraken_maker_market_fallback"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
                         </div>
                     </details>
 
