@@ -1459,11 +1459,12 @@
                             <label>Low offset <input name="low_offset" type="number" value="0.975" step="0.001" /></label>
                             <label>High offset <input name="high_offset" type="number" value="0.991" step="0.001" /></label>
                             <label>EWO high <input name="ewo_high" type="number" value="2.327" step="0.001" /></label>
-                            <label>EWO low <input name="ewo_low" type="number" value="-20.988" step="0.001" /></label>
+                            <label>EWO low <input name="ewo_low" type="number" value="-8.0" step="0.001" /></label>
                             <label>RSI buy <input name="rsi_buy" type="number" value="69" step="1" /></label>
                             <label>Opening Range minutes <input name="opening_range_minutes" type="number" value="15" step="1" min="1" /></label>
                             <label>Opening Range ATR period <input name="opening_range_atr_period" type="number" value="14" step="1" min="2" /></label>
                             <label>Manipulation threshold % <input name="opening_range_manipulation_threshold" type="number" value="0.20" step="0.01" min="0.01" max="1.0" /></label>
+                            <label>Blow-off ATR threshold <input name="opening_range_blowoff_atr_threshold" type="number" value="1.60" step="0.05" min="1.05" /></label>
                             <label>Stop loss ATR multiplier <input name="opening_range_stop_loss_atr_multiplier" type="number" value="1.5" step="0.1" min="0.1" /></label>
                             <label>Take profit ATR multiplier <input name="opening_range_take_profit_atr_multiplier" type="number" value="2.5" step="0.1" min="0.1" /></label>
 
@@ -3462,6 +3463,7 @@
                 opening_range_minutes: 15,
                 opening_range_atr_period: 14,
                 opening_range_manipulation_threshold: 0.20,
+                opening_range_blowoff_atr_threshold: 1.60,
                 opening_range_stop_loss_atr_multiplier: 1.5,
                 opening_range_take_profit_atr_multiplier: 2.5,
                 stop_loss_pct: 2.0,
@@ -3641,7 +3643,7 @@
                 high_offset_2: 0.997,
                 ewo_high: 2.327,
                 ewo_high_2: -2.327,
-                ewo_low: -20.988,
+                ewo_low: -8.0,
                 rsi_buy: 69,
                 stop_loss_pct: 2.0,
                 take_profit_pct: 3.0,

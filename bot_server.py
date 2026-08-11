@@ -296,7 +296,7 @@ DEFAULT_SETTINGS = {
     "high_offset_2": 0.997,
     "ewo_high": 2.327,
     "ewo_high_2": -2.327,
-    "ewo_low": -20.988,
+    "ewo_low": -8.0,
     "rsi_buy": 69,
     "max_position_pct": 0.25,
     "position_sizing_mode": "balance_fraction",
@@ -342,7 +342,7 @@ DEFAULT_SETTINGS = {
     "backtest_slippage_pct": 0.10,
     "sr_zone_tolerance_pct": 0.6,
     "sr_min_touches": 2,
-    "auto_disable_weak_pairs": True,
+    "auto_disable_weak_pairs": False,
     "weak_pair_min_trades": 6,
     "weak_pair_expectancy_limit_pct": -0.3,
     "weak_pair_win_rate_limit_pct": 35.0,
@@ -368,6 +368,7 @@ DEFAULT_SETTINGS = {
     "opening_range_minutes": 15,
     "opening_range_atr_period": 14,
     "opening_range_manipulation_threshold": 0.20,
+    "opening_range_blowoff_atr_threshold": 1.60,
     "opening_range_stop_loss_atr_multiplier": 1.5,
     "opening_range_take_profit_atr_multiplier": 2.5,
     "oanda_account_type": "standard",
@@ -376,7 +377,7 @@ DEFAULT_SETTINGS = {
     "kraken_margin_short_enabled": False,
     "kraken_margin_leverage": 2.0,
     "kraken_margin_quote_currency": "USDT",
-    "kraken_margin_read_only": True,
+    "kraken_margin_read_only": False,
     "kraken_margin_max_exposure_quote": 25.0,
     "kraken_margin_dust_quote": 0.10,
     "kraken_margin_max_open_shorts": 1.0,
@@ -2009,8 +2010,16 @@ class PaperBot:
         except:
             return 0.00000001
 
-    def coinbase_round_price(self, price: float, product_id: str) -> float:
-        """Round price to the nearest multiple of quote_increment."""
+    def coinbase_round_price(self, price: float, product_id: str, side: str | None = None) -> float:
+        """Round price to a multiple of quote_increment.
+
+        Rounding must never push a limit price across the market (a post-only
+        order that would cross is rejected by Coinbase):
+          * BUY limits round DOWN (stay at/below the intended price), and
+          * SELL limits round UP (stay at/above the intended price).
+        A floor on a SELL maker price can pull it to/under the ask and cause
+        POST_ONLY rejection, which also means the resting maker SELL never fills.
+        """
         details = self.get_product_details(product_id)
         quote_increment = details.get('quote_increment', '0.01')
         try:
@@ -2018,7 +2027,9 @@ class PaperBot:
         except:
             increment = 0.01
         if increment > 0:
-            return math.floor(price / increment) * increment
+            if str(side or "").upper() == "SELL":
+                return math.ceil((price - increment * 1e-9) / increment) * increment
+            return math.floor((price + increment * 1e-9) / increment) * increment
         return price
 
     def coinbase_round_size(self, size: float, product_id: str) -> float:
@@ -4746,7 +4757,8 @@ class PaperBot:
             "order_expiry_seconds", "order_retry_limit", "max_oanda_open_trades","max_coinbase_open_trades",
             "news_guard_before_minutes", "news_guard_after_minutes",
             "opening_range_minutes", "opening_range_atr_period",
-            "opening_range_manipulation_threshold", "opening_range_stop_loss_atr_multiplier",
+            "opening_range_manipulation_threshold", "opening_range_blowoff_atr_threshold",
+            "opening_range_stop_loss_atr_multiplier",
             "opening_range_take_profit_atr_multiplier", "max_drawdown_pct",
             "telegram_drawdown_alert_pct", "ema_short", "ema_long",
             "signal_confidence_threshold", "min_signals_required", "learning_history_size",
@@ -4912,6 +4924,7 @@ class PaperBot:
             self.state.settings["opening_range_minutes"] = max(1, int(self.state.settings["opening_range_minutes"]))
             self.state.settings["opening_range_atr_period"] = max(2, int(self.state.settings["opening_range_atr_period"]))
             self.state.settings["opening_range_manipulation_threshold"] = max(0.01, min(1.0, float(self.state.settings["opening_range_manipulation_threshold"])))
+            self.state.settings["opening_range_blowoff_atr_threshold"] = max(1.05, min(10.0, float(self.state.settings.get("opening_range_blowoff_atr_threshold", 1.60))))
             self.state.settings["opening_range_stop_loss_atr_multiplier"] = max(0.1, float(self.state.settings["opening_range_stop_loss_atr_multiplier"]))
             self.state.settings["opening_range_take_profit_atr_multiplier"] = max(0.1, float(self.state.settings["opening_range_take_profit_atr_multiplier"]))
             self.state.settings["max_drawdown_pct"] = max(1.0, float(self.state.settings.get("max_drawdown_pct", 20.0)))
@@ -6639,9 +6652,9 @@ class PaperBot:
             atr = candle_range
 
         manipulation_threshold = float(self.state.settings.get("opening_range_manipulation_threshold", 0.20))
-        blowoff_threshold = float(self.state.settings.get("opening_range_blowoff_atr_threshold", 1.40))
+        blowoff_threshold = float(self.state.settings.get("opening_range_blowoff_atr_threshold", 1.60))
         if blowoff_threshold <= manipulation_threshold:
-            blowoff_threshold = max(1.40, manipulation_threshold + 0.10)
+            blowoff_threshold = max(1.60, manipulation_threshold + 0.10)
         range_ratio = candle_range / atr if atr > 0 else 0
         manipulation = range_ratio < manipulation_threshold
         blowoff = range_ratio >= blowoff_threshold
@@ -8564,8 +8577,8 @@ class PaperBot:
     def live_available_balance(self,currency:str)->float:
         return kraken_available_balance(currency) if self.live_exchange()=="kraken" else coinbase_available_balance(currency)
 
-    def live_round_price(self,v,symbol,quote):
-        return kraken_round_price(v,symbol,quote) if self.live_exchange()=="kraken" else self.coinbase_round_price(v,f"{symbol}-{quote}")
+    def live_round_price(self,v,symbol,quote,side=None):
+        return kraken_round_price(v,symbol,quote) if self.live_exchange()=="kraken" else self.coinbase_round_price(v,f"{symbol}-{quote}", side)
 
     def live_round_size(self,v,symbol,quote):
         return kraken_round_size(v,symbol,quote) if self.live_exchange()=="kraken" else self.coinbase_round_size(v,f"{symbol}-{quote}")
@@ -8646,7 +8659,11 @@ class PaperBot:
             margin_safety=self.kraken_margin_safety(symbol)
             if not margin_safety.get("new_shorts_allowed"):
                 raise RuntimeError("Kraken margin safety lock: "+str(margin_safety.get("reason") or margin_safety.get("message") or "reconciliation failed"))
-            fresh=self.reconcile_kraken_margin(force=True)
+            # The safety gate above already validated a reconciliation snapshot
+            # (cached <=30s). Re-checking with force=True here would issue a second
+            # private API reconciliation per short, doubling quota usage and
+            # tripping the 60s rate-limit backoff that locks ALL new shorts.
+            fresh=self.reconcile_kraken_margin(force=False)
             if not fresh.get("healthy"):
                 raise RuntimeError("Kraken margin fresh pre-trade reconciliation failed: "+str(fresh.get("status")))
             pair_diag=kraken_margin_pair_diagnostics(symbol,effective_quote)
@@ -8727,18 +8744,23 @@ class PaperBot:
             return
 
         # Two independent live-entry guards:
-        # 1) spend cap limits gross capital committed today;
+        # 1) spend cap limits gross capital committed today (filled spend PLUS
+        #    the quote value of resting/unfilled ENTRY orders, since the exchange
+        #    holds that cash until the order fills, expires or is cancelled);
         # 2) loss cap limits today's realised + current unrealised P/L.
         # Neither guard is used by SELL/STOP/emergency-exit paths.
-        if live_daily_spend + quote_size > max_daily_spend:
+        committed_pending = sum(float(o.quote_size or 0.0) for o in pending_entries)
+        if live_daily_spend + committed_pending + quote_size > max_daily_spend:
             with self.lock:
                 self.state.last_signal = (
                     f"LIVE {'SHORT' if is_short else 'BUY'} blocked: daily live spend cap reached "
-                    f"({live_daily_spend:.2f} + {quote_size:.2f} > {max_daily_spend:.2f} {settings['quote_currency']})"
+                    f"({live_daily_spend:.2f} filled + {committed_pending:.2f} pending + "
+                    f"{quote_size:.2f} > {max_daily_spend:.2f} {settings['quote_currency']})"
                 )
                 self.journal(symbol, "BLOCK", self.state.last_signal, price, {
                     "quote_size": quote_size,
                     "daily_spend": live_daily_spend,
+                    "committed_pending": committed_pending,
                     "max_daily_spend": max_daily_spend,
                 })
             return
@@ -8829,7 +8851,7 @@ class PaperBot:
                     # Rest at (or slightly behind) the same-side top of book.
                     # BUY <= bid and SELL >= ask prevents an intentional cross.
                     raw_maker_price = bid * (1.0 - maker_offset) if side == "BUY" else ask * (1.0 + maker_offset)
-                    limit_price = self.live_round_price(raw_maker_price,symbol,price_quote)
+                    limit_price = self.live_round_price(raw_maker_price,symbol,price_quote, side)
                 else:
                     best_price, _, _ = self.price_aggregator.get_best_price(symbol, side=side)
                     if side == "BUY":
@@ -8846,6 +8868,15 @@ class PaperBot:
 
                 base_size = quote_size / limit_price if limit_price > 0 else 0.0
                 base_size = self.live_round_size(base_size,symbol,effective_quote if active_exchange=="kraken" else str(settings["quote_currency"]))
+                if active_exchange=="coinbase" and base_size < self.coinbase_min_order_size(product_id):
+                    with self.lock:
+                        self.state.last_signal = (
+                            f"LIVE {'SHORT' if is_short else 'BUY'} blocked: Coinbase order "
+                            f"{base_size:.8f} {symbol} below minimum {self.coinbase_min_order_size(product_id):.8f}"
+                        )
+                        self.journal(symbol, "BLOCK", self.state.last_signal, price,
+                                     {"base_size": base_size, "min_size": self.coinbase_min_order_size(product_id)})
+                    return
                 order = (kraken_order(symbol,effective_quote,side,"limit",base_size,limit_price,order_type=="maker",leverage=margin_leverage)
                          if active_exchange=="kraken" else coinbase_limit_order(product_id,side,base_size,limit_price,post_only=(order_type=="maker")))
 
@@ -8864,6 +8895,15 @@ class PaperBot:
                         best_price, _, _ = self.price_aggregator.get_best_price(symbol, side="SELL")
                         base_size = quote_size / best_price if best_price > 0 else 0.0
                         base_size = self.live_round_size(base_size,symbol,effective_quote if active_exchange=="kraken" else str(settings["quote_currency"]))
+                        if active_exchange=="coinbase" and base_size < self.coinbase_min_order_size(product_id):
+                            with self.lock:
+                                self.state.last_signal = (
+                                    f"LIVE SELL blocked: Coinbase order {base_size:.8f} {symbol} "
+                                    f"below minimum {self.coinbase_min_order_size(product_id):.8f}"
+                                )
+                                self.journal(symbol, "BLOCK", self.state.last_signal, price,
+                                             {"base_size": base_size, "min_size": self.coinbase_min_order_size(product_id)})
+                            return
                         order = coinbase_market_order(
                             product_id=product_id,
                             side=side,
@@ -9205,15 +9245,27 @@ class PaperBot:
             if time.time() >= order.expires_at:
                 self.expire_order(order)
 
-    def apply_reconciled_order(self, order: ManagedOrder, fill: dict[str, Any]) -> bool:
+    def apply_reconciled_order(self, order: ManagedOrder, fill: dict[str, Any], force: bool = False) -> bool:
         order.updated_at = now_iso()
         order.status = fill.get("status", "UNKNOWN")
         if fill["filled_size"] <= 0 or order.local_applied:
             return False
-        if self.live_exchange()=="kraken" and not bool(fill.get("exchange_confirmed_complete")):
-            self.audit("KRAKEN_ORDER_NOT_FINAL",order_id=order.order_id,status=order.status,
-                       filled_size=fill.get("filled_size"),requested_size=fill.get("requested_size"))
-            return False
+        if self.live_exchange()=="kraken" and not force:
+            # A non-CLOSED Kraken fill is normally final only once the whole
+            # order is closed, cancelled or fully executed. Block merely
+            # PARTIAL fills on still-active orders (more volume can still
+            # fill), but never strand a fill that can no longer grow:
+            #   * terminal status (CLOSED/CANCELLED/EXPIRED) with fills, or
+            #   * an order whose entire requested size has executed even if
+            #     Kraken has not yet flipped the status to CLOSED.
+            requested = float(fill.get("requested_size") or 0.0)
+            status = str(order.status or "").upper()
+            terminal = status in {"CLOSED", "CANCELLED", "CANCELED", "EXPIRED"}
+            fully_filled = requested > 0 and float(fill.get("filled_size") or 0.0) >= requested
+            if not terminal and not fully_filled:
+                self.audit("KRAKEN_ORDER_NOT_FINAL",order_id=order.order_id,status=order.status,
+                           filled_size=fill.get("filled_size"),requested_size=fill.get("requested_size"))
+                return False
 
         filled_price = fill["average_price"] or order.price or self.state.last_price or 0.0
         is_short = order.details.get("is_short", False)
@@ -9348,6 +9400,14 @@ class PaperBot:
     def expire_order(self, order: ManagedOrder) -> None:
         try:
             cancel_response = self.live_cancel(order.order_id)
+            if not order.local_applied:
+                try:
+                    final_fill = self.live_reconcile(order.order_id)
+                    self.apply_reconciled_order(order, final_fill, force=True)
+                except Exception as exc:
+                    self.audit("ORDER_EXPIRE_RECONCILE_FAILED", order_id=order.order_id, error=str(exc))
+            if order.local_applied:
+                return
             order.status = "EXPIRED"
             order.updated_at = now_iso()
             if self.state.active_stop_order_id == order.order_id:
