@@ -8695,6 +8695,37 @@ class PaperBot:
                 self.journal(symbol, "BLOCK", self.state.last_signal, price, {"quote_size": quote_size})
             return
 
+        # Resting/unfilled ENTRY orders count against the position cap and the
+        # daily spend cap. Otherwise maker-first entries that never fill would
+        # accumulate open orders and drain the exchange balance until live_buy
+        # reports an artificial funding problem.
+        pending_entries = [
+            o for o in self.state.open_orders
+            if o.role == "ENTRY"
+            and o.status not in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}
+        ]
+        if len(positions) + len(pending_entries) >= max_coinbase_positions:
+            with self.lock:
+                self.state.last_signal = (
+                    f"LIVE {'SHORT' if is_short else 'BUY'} blocked: max open positions/pending entries "
+                    f"reached ({len(positions)}+{len(pending_entries)}/{max_coinbase_positions})"
+                )
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {
+                    "quote_size": quote_size,
+                    "positions": len(positions),
+                    "pending_entries": len(pending_entries),
+                })
+            return
+
+        side = "SELL" if is_short else "BUY"
+        if any(o.symbol == symbol and o.side == side for o in pending_entries):
+            with self.lock:
+                self.state.last_signal = f"LIVE {'SHORT' if is_short else 'BUY'} blocked: entry order already pending for {symbol}"
+                self.journal(symbol, "BLOCK", self.state.last_signal, price, {
+                    "pending": [o.order_id for o in pending_entries if o.symbol == symbol and o.side == side]
+                })
+            return
+
         # Two independent live-entry guards:
         # 1) spend cap limits gross capital committed today;
         # 2) loss cap limits today's realised + current unrealised P/L.
