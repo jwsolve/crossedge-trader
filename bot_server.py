@@ -9224,6 +9224,27 @@ class PaperBot:
     def managed_order(self, order_id: str) -> ManagedOrder | None:
         return next((item for item in self.state.open_orders if item.order_id == order_id), None)
 
+    @staticmethod
+    def _order_is_gone_error(exc: Exception) -> bool:
+        """True when an exchange error means the order no longer exists.
+
+        A stale local order whose exchange-side order has already been
+        cancelled/expired/closed (e.g. after a bot restart or an exchange-side
+        cancel) must be released locally rather than parked in RECONCILE_ERROR
+        or CANCEL_FAILED forever, where it would occupy a pending-entry slot.
+        """
+        err = str(exc or "").lower()
+        tokens = (
+            "not found", "not_found", "404",
+            "unknown order", "unknownorder",
+            "no such order", "does not exist", "doesn't exist",
+            "already cancelled", "already canceled", "already closed",
+            "order is closed", "orderclosed", "invalid order",
+            "egeneral:unknown order", "eorder:unknownorder",
+            "not open", "not_open", "unable to cancel",
+        )
+        return any(token in err for token in tokens)
+
     def manage_open_orders(self) -> None:
         for order in list(self.state.open_orders):
             if order.status in {"FILLED", "CANCELLED", "FAILED", "EXPIRED"}:
@@ -9236,6 +9257,12 @@ class PaperBot:
                 order.status = "RECONCILE_ERROR"
                 self.audit("ORDER_RECONCILE_ERROR", order_id=order.order_id, error=str(exc))
                 logger.warning(f"Order reconcile error: {exc}")
+                # Do NOT park a failing order in RECONCILE_ERROR forever: it would
+                # keep occupying a pending-entry slot indefinitely. Expire it once
+                # the exchange no longer knows the order, or once its deadline has
+                # passed (transient API blips are tolerated until expires_at).
+                if self._order_is_gone_error(exc) or time.time() >= order.expires_at:
+                    self.expire_order(order)
                 continue
 
             self.apply_reconciled_order(order, fill)
@@ -9414,6 +9441,15 @@ class PaperBot:
                 self.state.active_stop_order_id = None
             self.audit("ORDER_EXPIRED_CANCELLED", order=asdict(order), cancel_response=cancel_response)
         except Exception as exc:
+            if self._order_is_gone_error(exc):
+                # The exchange already cancelled/closed/expired this order.
+                # Release the local slot instead of parking it in CANCEL_FAILED.
+                order.status = "EXPIRED"
+                order.updated_at = now_iso()
+                if self.state.active_stop_order_id == order.order_id:
+                    self.state.active_stop_order_id = None
+                self.audit("ORDER_EXPIRED_ALREADY_GONE", order=asdict(order), error=str(exc))
+                return
             order.status = "CANCEL_FAILED"
             order.updated_at = now_iso()
             self.audit("ORDER_EXPIRE_CANCEL_FAILED", order=asdict(order), error=str(exc))
