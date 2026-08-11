@@ -2567,6 +2567,8 @@ class PaperBot:
                         "exit_mode": item.get("exit_mode"),
                         "is_short": bool(item.get("is_short", False)),
                         "entry_time": float(item.get("entry_time", time.time())),
+                        "lowest_price": float(item.get("lowest_price", item.get("entry_price", 0.0))),
+                        "learning_context": item.get("learning_context") or {},
                     }
                     for symbol, item in raw.get("positions", {}).items()
                     if isinstance(item, dict) and abs(float(item.get("quantity", 0.0))) > 0
@@ -4803,7 +4805,12 @@ class PaperBot:
                     if key in ["strategy_creator_enabled", "strategy_evolution_enabled", "strategy_auto_select"]:
                         self.state.settings[key] = value in (True, "true", "on", "1", "yes")
                     else:
-                        self.state.settings[key] = float(value)
+                        try:
+                            self.state.settings[key] = float(value)
+                        except (TypeError, ValueError):
+                            self.state.last_error = f"Invalid numeric value for {key}: {value!r} rejected"
+                            self.journal("SYSTEM", "WARN", self.state.last_error, 0.0)
+                            continue
                 elif key in text_fields:
                     self.state.settings[key] = str(value).strip().upper()
                 elif key in sensitive_fields:
@@ -6327,6 +6334,7 @@ class PaperBot:
         trader = self.self_learning_trader
         best_signal = None
         best_score = -999
+        exit_signals = []
 
         for symbol in watchlist:
             candles = candles_by_symbol.get(symbol)
@@ -6349,15 +6357,24 @@ class PaperBot:
                             'analysis': analysis,
                         }
                 elif direction == 'SELL' and has_position:
-                    if score > best_score:
-                        best_score = score
-                        best_signal = {
-                            'symbol': symbol,
-                            'direction': 'SELL',
-                            'score': score,
-                            'signal_types': signal_types,
-                            'analysis': analysis,
-                        }
+                    exit_signals.append({
+                        'symbol': symbol,
+                        'direction': 'SELL',
+                        'score': score,
+                        'signal_types': signal_types,
+                        'analysis': analysis,
+                    })
+
+        # Reversal (SELL) signals on held positions are EXITS. They must be
+        # answered before new exposure is opened elsewhere: mixing negative-scored
+        # SELL candidates with positive-scored BUY candidates in one max() would
+        # let any BUY on any watchlist symbol suppress closing a losing position.
+        if exit_signals:
+            best_exit = max(exit_signals, key=lambda item: item['score'])
+            return (
+                f"SELL {best_exit['symbol']} self-learning score {best_exit['score']:.3f} "
+                f"| signals: {', '.join(best_exit['signal_types'][:3])}"
+            )
 
         if best_signal:
             if best_signal['direction'] == 'BUY':
@@ -6534,7 +6551,7 @@ class PaperBot:
 
                     if current_price >= stop_price:
                         return {
-                            "signal": "BUY",
+                            "signal": "SELL",
                             "reason": f"Short stop loss hit at {stop_price:.6f}",
                             "entry": entry_price,
                             "stop": stop_price,
@@ -6544,7 +6561,7 @@ class PaperBot:
                         }
                     if current_price <= target_price:
                         return {
-                            "signal": "BUY",
+                            "signal": "SELL",
                             "reason": f"Short take profit hit at {target_price:.6f}",
                             "entry": entry_price,
                             "stop": stop_price,
@@ -6639,10 +6656,13 @@ class PaperBot:
                 break
 
         if not first_candle:
-            if candles:
-                first_candle = candles[-1]
-            else:
-                return {"bias": None, "range": None, "atr": None, "manipulation": False, "blowoff": False}
+            # No candle for today yet (e.g. futures rollover/market closed hours
+            # before UTC midnight). Returning a neutral opening-range state
+            # prevents fabricating a bias from yesterday's candle.
+            return {
+                "bias": None, "range": None, "atr": None, "manipulation": False,
+                "blowoff": False, "opening_time": None,
+            }
 
         is_green = first_candle.close > first_candle.open
         candle_range = first_candle.high - first_candle.low
@@ -6972,7 +6992,7 @@ class PaperBot:
                 settings['take_profit_pct'] = original_tp
 
         with self.lock:
-            if spend > self.state.cash:
+            if spend > self.state.cash and spend_override is None:
                 spend = self.state.cash
 
             if spend < float(settings.get("min_order_value", 1.0)):
@@ -7164,7 +7184,8 @@ class PaperBot:
                         position["quantity"] = remaining
                         self.state.positions[symbol] = position
             else:
-                self.state.coin -= sold_quantity
+                if self.state.active_symbol == symbol:
+                    self.state.coin -= sold_quantity
                 if symbol in self.state.positions:
                     remaining = position_quantity - sold_quantity
                     if remaining <= 0:
@@ -7349,7 +7370,15 @@ class PaperBot:
 
         sold_fraction = min(1.0, sold_quantity / record.entry_quantity)
         cost_basis = record.entry_cost * sold_fraction
-        pnl = cash_received - cost_basis
+        is_short = any("short" in str(s).lower() for s in record.signal_types) or "SHORT" in str(reason).upper()
+        if is_short:
+            # A short is OPENED by selling (cash received) and CLOSED by buying
+            # back (cash paid out). Profit is entry proceeds minus cover payout,
+            # i.e. (entry_price - exit_price) * qty - fee. `cash_received` here is
+            # gross less the cover fee, so the full outflow is cash_received + 2*fee.
+            pnl = cost_basis - (cash_received + 2.0 * fee_paid)
+        else:
+            pnl = cash_received - cost_basis
         record.closed_quantity += sold_quantity
         record.realized_pnl += pnl
         record.exit_fees += fee_paid
@@ -7360,7 +7389,6 @@ class PaperBot:
         if position_closed:
             record.status = "CLOSED"
             if record.entry_price and record.exit_price and record.entry_price > 0:
-                is_short = any("short" in str(s).lower() for s in record.signal_types) or "SHORT" in str(reason).upper()
                 if is_short:
                     record.pnl_pct = pct(record.entry_price - record.exit_price, record.entry_price)
                 else:
@@ -8191,7 +8219,8 @@ class PaperBot:
             "quantity":owned_qty,"verified_filled_quantity":filled,
             "kraken_position_id":pos.get("position_id"),"status":"adopted",
             "adopted_ts":time.time(),"source":"verified_queryorders_recovery",
-            "kraken_order_status":status,"leverage":leverage_text
+            "kraken_order_status":status,"leverage":leverage_text,
+            "created_ts":float(row.get("starttm") or time.time())
         }
         self.save_state()
         try:
@@ -9316,7 +9345,9 @@ class PaperBot:
                 if self.live_exchange()=="kraken":
                     try:
                         q=str(self.state.settings.get("quote_currency") or "USDT")
-                        self.state.cash=kraken_available_balance(q)
+                        actual_bal=kraken_available_balance(q)
+                        with self.lock:
+                            self.state.cash=actual_bal
                     except Exception:
                         pass
                 self.save_state()
@@ -9324,17 +9355,19 @@ class PaperBot:
 
         if order.role == "ENTRY":
             if is_short and self.live_exchange()=="kraken":
-                rec=(getattr(self.state,"kraken_margin_owned",{}) or {}).get(order.order_id)
-                if rec is not None:
-                    rec["quantity"]=float(fill["filled_size"])
-                    rec["verified_filled_quantity"]=float(fill["filled_size"])
-                    rec["status"]="adopted"; rec["adopted_ts"]=time.time()
-                    rec["fill_price"]=float(filled_price)
-                    self.save_state()
+                with self.lock:
+                    rec=(getattr(self.state,"kraken_margin_owned",{}) or {}).get(order.order_id)
+                    if rec is not None:
+                        rec["quantity"]=float(fill["filled_size"])
+                        rec["verified_filled_quantity"]=float(fill["filled_size"])
+                        rec["status"]="adopted"; rec["adopted_ts"]=time.time()
+                        rec["fill_price"]=float(filled_price)
+                self.save_state()
             filled_value = float(fill["filled_value"] or 0.0)
             entry_fee = float(fill["total_fee"] or 0.0)
             filled_quote = (filled_value or order.quote_size or 0.0) + entry_fee
-            self.state.live_daily_spend += min(order.quote_size or filled_quote, filled_quote)
+            with self.lock:
+                self.state.live_daily_spend += min(order.quote_size or filled_quote, filled_quote)
 
             # Recalculate exits from the CONFIRMED Coinbase fill, not the earlier
             # signal/submission price. This removes entry slippage from the TP/SL
@@ -9393,6 +9426,23 @@ class PaperBot:
         order.local_applied = True
         order.status = "FILLED"
         order.updated_at = now_iso()
+
+        # A partially-filled GTC limit order remains OPEN on Coinbase with the
+        # remainder still resting. Local accounting books only the executed
+        # portion; if the remainder is left on the exchange it would keep filling
+        # into a position that is no longer tracked locally and would never be
+        # expired/cancelled (stale-pending drift). Cancel the remainder so the
+        # exchange result exactly matches what was booked locally.
+        if (
+            self.live_exchange() == "coinbase"
+            and str(fill.get("status") or "").upper() in {"OPEN", "PARTIALLY_FILLED"}
+        ):
+            try:
+                coinbase_cancel_orders([order.order_id])
+                self.audit("COINBASE_REMAINDER_CANCELED", order_id=order.order_id,
+                           status=fill.get("status"), filled_size=fill.get("filled_size"))
+            except Exception as exc:
+                self.audit("COINBASE_REMAINDER_CANCEL_FAILED", order_id=order.order_id, error=str(exc))
         self.audit("ORDER_FILLED_APPLIED", order=asdict(order), fill=fill)
 
         # paper_buy()/paper_sell() are also used to apply confirmed LIVE fills so
@@ -9417,7 +9467,9 @@ class PaperBot:
             # paper_* arithmetic is retained for trade history/P&L only.
             try:
                 quote=str(self.state.settings.get("quote_currency") or "USDT")
-                self.state.cash=kraken_available_balance(quote)
+                actual_bal=kraken_available_balance(quote)
+                with self.lock:
+                    self.state.cash=actual_bal
                 self.save_state()
             except Exception as exc:
                 self.journal(order.symbol,"WARN",f"Kraken post-fill balance sync failed: {exc}",filled_price)
