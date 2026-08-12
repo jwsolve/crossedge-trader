@@ -163,6 +163,9 @@ class SignalHistory:
     total_pnl: float = 0.0
     win_rate: float = 0.0
     avg_pnl: float = 0.0
+    total_r: float = 0.0
+    total_win_r: float = 0.0
+    total_loss_r: float = 0.0
     # R-multiple tracking: total_r is the sum of R-multiples across all
     # trades; total_win_r / total_loss_r split wins and losses. Used to
     # weight signals by expectancy instead of win rate alone.
@@ -435,6 +438,17 @@ class BotDatabase:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            cursor..execute("PRAGMA table_info(signal_history)")
+                sig_cols = [col[1] for col in cursor.fetchall()]
+                for col,col_type in [
+                    ('total_r', 'REAL_DEFAULT 0'),
+                    ('total_win_r', 'REAL_DEFAULT 0'),
+                    ('total_loss_r', 'REAL_DEFAULT 0'),
+                    ]:
+                    if col not in sig_cols:
+                        cursor.execute(f'ALTER TABLE signal_history ADD COLUMN {col} {col_type}')
+                        logger.info(f'Added {col} column to signal_history table')
 
             # Migration for DBs created before R-multiple tracking existed
             cursor.execute("PRAGMA table_info(signal_history)")
