@@ -5552,12 +5552,21 @@ class PaperBot:
                     # A short's notional is exposure/collateral, not an asset liability
                     # to subtract from the quote balance. Use Kraken TradeBalance.e
                     # (exchange equity) whenever verified margin exposure is open.
-                    kraken_data = getattr(self, "_kraken_spot_balance_snapshot", {}) or {}
+                    # Refresh the snapshot from the exchange before display: a snapshot
+                    # captured at startup (e.g. while a margin short was open) is stale
+                    # the moment the position closes.
+                    quote_cur = str(self.state.settings.get("quote_currency") or "USDT").upper()
+                    kraken_data = self.refresh_kraken_balance_snapshot(quote_cur)
                     cash = float(
                         kraken_data.get("available_cash", self.state.cash)
                         if kraken_data.get("ok") else self.state.cash
                     )
-                    self.state.cash = cash
+                    # Re-anchor state.cash only from a FRESH exchange read. A cached
+                    # snapshot (startup-era, possibly taken while a position was open)
+                    # must never overwrite newer post-fill state — that stale write was
+                    # the "cash hops higher than the real balance after selling" bug.
+                    if kraken_data.get("ok") and not kraken_data.get("cache_used"):
+                        self.state.cash = cash
 
                     margin_snapshot = {}
                     has_margin_short = any(
@@ -9415,6 +9424,70 @@ class PaperBot:
             if time.time() >= order.expires_at:
                 self.expire_order(order)
 
+    def refresh_kraken_balance_snapshot(self, quote: str | None = None, force: bool = False) -> dict[str, Any]:
+        """Refresh the live Kraken cash/equity snapshot consumed by /api/status.
+
+        Cash comes from the Balance endpoint (the same source state.cash is
+        re-anchored from after fills); equity/margin come from TradeBalance, the
+        authoritative source for margin accounts. Cached for 10s so status
+        polling does not burn the private-API rate budget. Never raises: on any
+        failure it returns the previous snapshot, falling back to a balance-only
+        view when TradeBalance is unavailable.
+
+        The bug this fixes: the snapshot was previously captured only at startup
+        and never refreshed, so after a margin short closed, /api/status kept
+        showing (and writing back into state.cash) the startup-era balance,
+        which could be far higher than the real balance — the "cash hops higher
+        than I have after selling" symptom.
+        """
+        now = time.time()
+        cached = getattr(self, "_kraken_spot_balance_snapshot", {}) or {}
+        if not force and cached.get("ok") and now - float(cached.get("_ts") or 0.0) < 10.0:
+            return {
+                **cached,
+                "cache_used": True,
+                "cache_age_seconds": round(now - float(cached.get("_ts") or 0.0), 2),
+            }
+        quote = str(quote or self.state.settings.get("quote_currency") or "USDT").upper()
+        try:
+            actual_cash = float(kraken_available_balance(quote))
+        except Exception as exc:
+            logger.warning("Kraken balance refresh failed: %s", exc)
+            if cached.get("ok"):
+                return {**cached, "cache_used": False, "refresh_error": str(exc)}
+            return {
+                "ok": False, "reconciled": False, "error": str(exc),
+                "available_cash": float(self.state.cash or 0.0),
+                "equity": float(self.state.cash or 0.0),
+                "quote_currency": quote, "_ts": now, "cache_used": False,
+            }
+        tb_asset = {"USD":"ZUSD","GBP":"ZGBP","EUR":"ZEUR","BTC":"XXBT","XBT":"XXBT","DOGE":"XXDG","XDG":"XXDG"}.get(quote, quote)
+        tb = {}
+        try:
+            tb = kraken_private("/0/private/TradeBalance", {"asset": tb_asset}).get("result") or {}
+            if not isinstance(tb, dict):
+                tb = {}
+        except Exception as exc:
+            logger.warning("Kraken TradeBalance refresh failed: %s", exc)
+        snap = {
+            "ok": True,
+            "reconciled": True,
+            "quote_currency": quote,
+            "available_cash": actual_cash,
+            "equity": float(tb.get("e") or actual_cash),
+            "margin_equity": float(tb.get("e") or actual_cash),
+            "margin_free": float(tb.get("mf") or 0.0),
+            "margin_used": float(tb.get("m") or 0.0),
+            "margin_unrealized_pnl": float(tb.get("n") or 0.0),
+            "valuation_mode": "kraken_trade_balance" if tb else "kraken_balance",
+            "error": None,
+            "time": now_iso(),
+            "_ts": now,
+            "cache_used": False,
+        }
+        self._kraken_spot_balance_snapshot = snap
+        return snap
+
     def apply_reconciled_order(self, order: ManagedOrder, fill: dict[str, Any], force: bool = False) -> bool:
         order.updated_at = now_iso()
         order.status = fill.get("status", "UNKNOWN")
@@ -9585,6 +9658,9 @@ class PaperBot:
                 with self.lock:
                     self.state.cash=actual_bal
                 self.save_state()
+                # Keep the /api/status snapshot in lockstep with post-fill cash so
+                # the dashboard never falls back to a stale startup-era balance.
+                self.refresh_kraken_balance_snapshot(quote, force=True)
             except Exception as exc:
                 self.journal(order.symbol,"WARN",f"Kraken post-fill balance sync failed: {exc}",filled_price)
 
@@ -14280,6 +14356,27 @@ class BotRequestHandler(SimpleHTTPRequestHandler):
             if int(self.current_user_id) != 1:
                 self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
             self.send_json({"ok":True,"entries":db.audit_entries(250)}); return
+
+        if self.path.startswith("/api/admin/log"):
+            if int(self.current_user_id) != 1:
+                self.send_json({"ok":False,"error":"Owner access required"},HTTPStatus.FORBIDDEN); return
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                lines = max(1, min(5000, int(query.get("lines", ["500"])[0])))
+            except (TypeError, ValueError):
+                lines = 500
+            # Fixed path only: never accept a path from the client.
+            log_path = BASE_DIR / "auxo.log"
+            try:
+                if not log_path.exists():
+                    self.send_json({"ok": True, "lines": [], "path": str(log_path), "count": 0})
+                    return
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+                self.send_json({"ok": True, "lines": tail, "path": str(log_path), "count": len(tail)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"Log read failed: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
 
         if self.path == "/api/admin/users":
             if int(self.current_user_id) != 1:

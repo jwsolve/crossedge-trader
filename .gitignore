@@ -22,3 +22,5 @@ auth/password.py
 auth/
 
 auth_setup.py
+
+*.patch
