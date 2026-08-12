@@ -1525,6 +1525,7 @@
                             <label>Block medium impact <select name="news_guard_block_medium"><option value="false">No</option><option value="true">Yes</option></select></label>
                             <label>Block low impact <select name="news_guard_block_low"><option value="false">No</option><option value="true">Yes</option></select></label>
                             <label>Regime filter <select name="regime_filter_enabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
+                            <label>Auto switch strategy <select name="strategy_switching_enabled"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
                             <label>Allow trending <select name="allow_trending_regime"><option value="true">Yes</option><option value="false">No</option></select></label>
                             <label>Allow ranging <select name="allow_ranging_regime"><option value="true">Yes</option><option value="false">No</option></select></label>
                             <label>Allow volatile <select name="allow_volatile_regime"><option value="false">No</option><option value="true">Yes</option></select></label>
@@ -2279,6 +2280,7 @@
             self_learning_enabled:'setup_learning',
             regime_filter_enabled:'regime_detection',
             regime_adaptation_enabled:'regime_detection',
+            strategy_switching_enabled:'regime_detection',
             auto_disable_weak_pairs:'auto_disable_weak_pairs',
             strategy_creator_enabled:'strategy_evolution',
             strategy_evolution_enabled:'strategy_evolution'

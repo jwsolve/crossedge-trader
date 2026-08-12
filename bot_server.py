@@ -458,6 +458,37 @@ FOREX_BASE_RATES = {
 }
 
 # ─── BOT STATE ──────────────────────────────────────────────────────
+
+
+def regime_override_decision(settings: dict, regime: Optional[str], confidence: float) -> Optional[str]:
+    """Pure decision for the regime-to-strategy override (Priority 4 block).
+
+    Returns the strategy the regime map wants, or None when nothing should
+    override. Honours BOTH gates:
+      - regime_force_strategy: master of the whole Priority-4 block (also
+        carries the dead-market trade block, which is not this function's job)
+      - strategy_switching_enabled: the master switch for ALL auto switching.
+        When off, no regime-driven strategy change may happen at all.
+    """
+    if not regime:
+        return None
+    if not settings.get("regime_force_strategy", True):
+        return None
+    if not settings.get("strategy_switching_enabled", True):
+        return None
+    if confidence < settings.get("min_regime_confidence", 0.5):
+        return None
+    strategy_map = {
+        "trending": settings.get("regime_trend_strategy", "ema_golden_cross"),
+        "trending_up": settings.get("regime_trend_strategy", "ema_golden_cross"),
+        "trending_down": settings.get("regime_trend_strategy", "ema_golden_cross"),
+        "ranging": settings.get("regime_ranging_strategy", "opening_range"),
+        "breakout": settings.get("regime_breakout_strategy", "opening_range"),
+        "volatile": settings.get("regime_volatile_strategy", "sma_cross"),
+    }
+    return strategy_map.get(regime)
+
+
 @dataclass
 class BotState:
     running: bool = False
@@ -6157,16 +6188,9 @@ class PaperBot:
                         self.save_state()
                         return
 
-                    # Map regime to strategy
-                    strategy_map = {
-                        "trending": settings.get("regime_trend_strategy", "ema_golden_cross"),
-                        "trending_up": settings.get("regime_trend_strategy", "ema_golden_cross"),
-                        "trending_down": settings.get("regime_trend_strategy", "ema_golden_cross"),
-                        "ranging": settings.get("regime_ranging_strategy", "opening_range"),
-                        "breakout": settings.get("regime_breakout_strategy", "opening_range"),
-                        "volatile": settings.get("regime_volatile_strategy", "sma_cross"),
-                    }
-                    recommended = strategy_map.get(regime)
+                    # Map regime to strategy. Gated by strategy_switching_enabled,
+                    # the master switch for ALL auto strategy switching.
+                    recommended = regime_override_decision(settings, regime, self.state.current_regime.confidence)
                     if recommended and recommended != settings.get("strategy"):
                         # Override the strategy in settings for this tick
                         self.state.settings["strategy"] = recommended
