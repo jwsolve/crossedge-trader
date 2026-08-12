@@ -563,6 +563,8 @@ class SelfLearningTrader:
         self.last_train_time = 0
         self.model_path = BASE_DIR / "xgboost_model.pkl"
         self.features_path = BASE_DIR / "xgboost_features.pkl"
+        self.model_meta_path = BASE_DIR / "xgboost_model_meta.json"
+        self.champion_meta = self._load_model_meta()
         self.load_xgboost_model()
 
     def load_signal_history(self):
@@ -575,6 +577,9 @@ class SelfLearningTrader:
                 total_pnl=history_data.get('total_pnl', 0.0),
                 win_rate=history_data.get('win_rate', 0.0),
                 avg_pnl=history_data.get('avg_pnl', 0.0),
+                total_r=history_data.get('total_r', 0.0),
+                total_win_r=history_data.get('total_win_r', 0.0),
+                total_loss_r=history_data.get('total_loss_r', 0.0),
                 last_updated=history_data.get('last_updated', now_iso()),
             )
         logger.info(f"Loaded {len(self.signal_history)} signal types from database")
@@ -587,6 +592,9 @@ class SelfLearningTrader:
                 'total_pnl': history.total_pnl,
                 'win_rate': history.win_rate,
                 'avg_pnl': history.avg_pnl,
+                'total_r': history.total_r,
+                'total_win_r': history.total_win_r,
+                'total_loss_r': history.total_loss_r,
                 'weight': self.get_signal_weight(signal_type),
                 'last_updated': history.last_updated,
             })
@@ -602,7 +610,7 @@ class SelfLearningTrader:
         self.bot.state.last_learning_update = now_iso()
         self.bot.save_state()
 
-    def record_signal_outcome(self, signal_types: list[str], pnl: float, success: bool):
+    def record_signal_outcome(self, signal_types: list[str], pnl: float, success: bool, r_multiple: float | None = None):
         for signal_type in signal_types:
             if signal_type not in self.signal_history:
                 self.signal_history[signal_type] = SignalHistory(signal_type=signal_type)
@@ -614,6 +622,12 @@ class SelfLearningTrader:
             if success:
                 history.successful_trades += 1
             history.win_rate = (history.successful_trades / history.total_signals) * 100 if history.total_signals > 0 else 0
+            if r_multiple is not None:
+                history.total_r += r_multiple
+                if success:
+                    history.total_win_r += r_multiple
+                else:
+                    history.total_loss_r += abs(r_multiple)
             history.last_updated = now_iso()
 
         self.learning_iterations += 1
@@ -625,8 +639,32 @@ class SelfLearningTrader:
         MIN_SAMPLES = 10
 
         if history and history.total_signals >= MIN_SAMPLES:
-            # Bayesian smoothing: Beta(alpha, beta) prior
-            # Use a weak prior (alpha=2, beta=2) that pulls win rate toward 0.5
+            # ─── EXPECTANCY-BASED WEIGHTING ──────────────────────────────
+            # The old mapping scored win rate alone. That rewarded frequent
+            # small wins and starved asymmetric payoffs: a signal that wins
+            # 45% of the time at 2.5R target vs 1R stop is PROFITABLE but
+            # got weighted ~0.4, while a 70% winner with tiny wins got
+            # boosted. Weights now follow R-multiple expectancy:
+            #   expectancy_R = (win_rate * avg_win_R) - (loss_rate * avg_loss_R)
+            # Fallback to the legacy win-rate mapping for rows recorded
+            # before R tracking existed (no R data yet).
+            has_r_data = (history.total_win_r > 0 or history.total_loss_r > 0)
+            if has_r_data:
+                wins = history.successful_trades
+                losses = history.total_signals - wins
+                win_rate = wins / history.total_signals
+                loss_rate = 1.0 - win_rate
+                avg_win_r = history.total_win_r / wins if wins > 0 else 0.0
+                avg_loss_r = history.total_loss_r / losses if losses > 0 else 0.0
+                expectancy_r = (win_rate * avg_win_r) - (loss_rate * avg_loss_r)
+                # Shrink toward neutral for small samples (prior of 20 trades)
+                shrink = history.total_signals / (history.total_signals + 20.0)
+                expectancy_r *= shrink
+                # Map expectancy to weight: 0R → 0.5, +1R → 2.0, -1R → ~0.1 (clamped)
+                weight = 0.5 + 1.5 * expectancy_r
+                return max(0.1, min(2.5, weight))
+
+            # Legacy Bayesian win-rate mapping (pre-R data)
             alpha = 2.0
             beta = 2.0
             wins = history.successful_trades
@@ -782,15 +820,14 @@ class SelfLearningTrader:
                         continue
                     y.append(1 if target_hit_first else 0)
                 else:
-                    # Fallback to old target (price direction) if TP/SL missing
+                    # Fallback to old target (price direction) if TP/SL missing.
+                    # Only for CLOSED trades: a still-open trade has no exit_price,
+                    # and labeling it from the current price mutates the label
+                    # every 6h retrain as price moves. Skip those instead.
                     if hasattr(trade, 'exit_price') and trade.exit_price is not None:
                         target = 1 if trade.exit_price > trade.entry_price else 0
                     else:
-                        current_price = self.bot.state.last_price
-                        if current_price and trade.entry_price:
-                            target = 1 if current_price > trade.entry_price else 0
-                        else:
-                            continue
+                        continue
                     y.append(target)
 
                 X.append(feature_vec)
@@ -812,7 +849,8 @@ class SelfLearningTrader:
             logger.warning("Not enough data for train/test after split.")
             return
 
-        model = xgb.XGBClassifier(
+        # ─── TRAIN THE CHALLENGER ────────────────────────────────────
+        challenger = xgb.XGBClassifier(
             n_estimators=100,
             max_depth=4,
             learning_rate=0.1,
@@ -822,16 +860,76 @@ class SelfLearningTrader:
             eval_metric='logloss',
             random_state=42,
         )
-        model.fit(X_train, y_train)
+        challenger.fit(X_train, y_train)
 
-        train_acc = accuracy_score(y_train, model.predict(X_train))
-        test_acc = accuracy_score(y_test, model.predict(X_test))
-        logger.info(f"XGBoost trained (walk‑forward): train acc {train_acc:.2f}, test acc {test_acc:.2f}")
+        train_acc = accuracy_score(y_train, challenger.predict(X_train))
+        chall_test_acc = accuracy_score(y_test, challenger.predict(X_test))
 
-        self.xgb_model = model
-        self.xgb_features = self._get_feature_names()
-        self.save_xgboost_model()
+        # ─── CHAMPION / CHALLENGER GATE ──────────────────────────────
+        # Never deploy unconditionally. The challenger must clear two bars:
+        #   1. Beat the deployed champion on THIS SAME holdout by a margin.
+        #   2. Clear an absolute accuracy floor (baseline is 0.5, coin flip).
+        # Scoring both models on the identical test slice keeps the comparison
+        # apples-to-apples even though the champion trained on older data.
+        PROMOTE_MARGIN = 0.02   # challenger must beat champion by >= 2 pts acc
+        MIN_PROMOTE_ACC = 0.55  # and clear an absolute floor
+
+        champion = self.xgb_model
+        champion_test_acc = None
+        if champion is not None:
+            try:
+                champion_test_acc = accuracy_score(y_test, champion.predict(X_test))
+            except Exception as e:
+                logger.warning(f"Champion failed to score holdout: {e}")
+
+        promoted = False
+        if champion is not None and champion_test_acc is not None:
+            if chall_test_acc >= champion_test_acc + PROMOTE_MARGIN and chall_test_acc >= MIN_PROMOTE_ACC:
+                promoted = True
+                reason = (f"challenger {chall_test_acc:.3f} > champion {champion_test_acc:.3f} "
+                          f"(+{PROMOTE_MARGIN:.2f} margin, floor {MIN_PROMOTE_ACC:.2f})")
+            else:
+                reason = (f"challenger {chall_test_acc:.3f} vs champion {champion_test_acc:.3f} "
+                          f"(need +{PROMOTE_MARGIN:.2f} and >= {MIN_PROMOTE_ACC:.2f})")
+        elif champion is None:
+            if chall_test_acc >= MIN_PROMOTE_ACC:
+                promoted = True
+                reason = f"first model, holdout {chall_test_acc:.3f} >= floor {MIN_PROMOTE_ACC:.2f}"
+            else:
+                reason = f"first model, holdout {chall_test_acc:.3f} < floor {MIN_PROMOTE_ACC:.2f}, refusing deploy"
+
+        if promoted:
+            self.xgb_model = challenger
+            self.xgb_features = self._get_feature_names()
+            self.save_xgboost_model()
+            self._save_model_meta({
+                'promoted_at': now_iso(),
+                'train_acc': round(train_acc, 4),
+                'holdout_acc': round(chall_test_acc, 4),
+                'n_trades': len(X),
+                'n_features': len(self.xgb_features),
+                'reason': reason,
+            })
+            logger.info(f"XGBoost PROMOTED: {reason}")
+        else:
+            logger.info(f"XGBoost challenger REJECTED: {reason}")
+
+        # Cooldown regardless, so a rejected challenger doesn't retrain every cycle
         self.last_train_time = time.time()
+
+    def _load_model_meta(self) -> dict | None:
+        if self.model_meta_path.exists():
+            try:
+                return json.loads(self.model_meta_path.read_text())
+            except Exception as e:
+                logger.warning(f"Failed to load model meta: {e}")
+        return None
+
+    def _save_model_meta(self, meta: dict) -> None:
+        try:
+            self.model_meta_path.write_text(json.dumps(meta, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to save model meta: {e}")
 
     def predict_xgboost(self, candles: list[dict]) -> float:
         if self.xgb_model is None or len(candles) < 50:
@@ -1023,9 +1121,9 @@ class SelfLearningTrader:
         }
 
     def should_enter_trade(self, analysis: dict[str, Any], settings: dict) -> tuple[bool, str, float, list[str]]:
-        if not settings.get('self_learning_enabled', True):
-            return False, 'Self-learning disabled', 0, []
-
+        # NOTE: self_learning_enabled entry gating lives in decide_self_learning.
+        # This method serves BOTH entry and reversal-exit signal paths; a toggle
+        # check here would silence exits on held positions too.
         if analysis['signal_count'] == 0:
             return False, 'No signals detected', 0, []
 
@@ -6160,8 +6258,13 @@ class PaperBot:
                         self.paper_sell(symbol, float(exit_price), decision, sell_quantity)
 
             # ─── XGBoost training ──────────────────────────────────────
+            # Retraining is the "learning" part of self-learning: paused when
+            # the toggle is off. Outcome recording still runs (passive rows feed
+            # the next training once re-enabled).
             if hasattr(self, 'self_learning_trader'):
-                if len(self.state.trades) % 50 == 0 and len(self.state.trades) > 0:
+                if (settings.get('self_learning_enabled', True)
+                        and len(self.state.trades) % 50 == 0
+                        and len(self.state.trades) > 0):
                     self.self_learning_trader.train_xgboost()
 
             self.state.scanner_last_scan_at = datetime.now(timezone.utc).isoformat()
@@ -6288,8 +6391,10 @@ class PaperBot:
             day_start_equity = self.state.day_start_equity
             peak_equity = self.state.peak_equity
 
-        if not settings.get('self_learning_enabled', True):
-            return "HOLD self-learning disabled"
+        # self_learning_enabled gates ML ENTRIES and retraining, never exits.
+        # When the ML is paused, held positions must still be closable by
+        # reversal signals; only new exposure is blocked.
+        learning_enabled = settings.get('self_learning_enabled', True)
 
         if time.time() - last_action_time < float(settings["cooldown_seconds"]):
             return "Cooldown active"
@@ -6346,7 +6451,7 @@ class PaperBot:
             should_trade, direction, score, signal_types = trader.should_enter_trade(analysis, settings)
 
             if should_trade:
-                if direction == 'BUY' and not has_position:
+                if direction == 'BUY' and not has_position and learning_enabled:
                     if score > best_score:
                         best_score = score
                         best_signal = {
@@ -6382,6 +6487,8 @@ class PaperBot:
             else:
                 return f"SELL {best_signal['symbol']} self-learning score {best_signal['score']:.3f} | signals: {', '.join(best_signal['signal_types'][:3])}"
 
+        if not learning_enabled:
+            return "HOLD self-learning disabled (entries off, exits armed)"
         return "HOLD no self-learning signals"
 
     # ─── Opening Range Decision ─────────────────────────────────────
@@ -7279,10 +7386,17 @@ class PaperBot:
                 )
                 if setup_record and setup_record.signal_types:
                     success = pnl > 0
+                    # R-multiple = realized PnL / risked amount (|entry - stop| * size)
+                    r_multiple = None
+                    entry = trade.entry_price
+                    stop = trade.stop_loss_price
+                    if entry and stop and abs(entry - stop) > 0 and sold_quantity and sold_quantity > 0:
+                        r_multiple = net_pnl / (abs(entry - stop) * sold_quantity)
                     self.self_learning_trader.record_signal_outcome(
                         setup_record.signal_types,
                         pnl,
-                        success
+                        success,
+                        r_multiple,
                     )
 
             self.journal(symbol, side, reason, price, {"quantity": sold_quantity, "pnl": pnl})

@@ -163,6 +163,12 @@ class SignalHistory:
     total_pnl: float = 0.0
     win_rate: float = 0.0
     avg_pnl: float = 0.0
+    # R-multiple tracking: total_r is the sum of R-multiples across all
+    # trades; total_win_r / total_loss_r split wins and losses. Used to
+    # weight signals by expectancy instead of win rate alone.
+    total_r: float = 0.0
+    total_win_r: float = 0.0
+    total_loss_r: float = 0.0
     last_updated: str = ""
 
 
@@ -421,11 +427,26 @@ class BotDatabase:
                     total_pnl REAL DEFAULT 0,
                     win_rate REAL DEFAULT 0,
                     avg_pnl REAL DEFAULT 0,
+                    total_r REAL DEFAULT 0,
+                    total_win_r REAL DEFAULT 0,
+                    total_loss_r REAL DEFAULT 0,
                     weight REAL DEFAULT 0.5,
                     last_updated TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            # Migration for DBs created before R-multiple tracking existed
+            cursor.execute("PRAGMA table_info(signal_history)")
+            sig_cols = [col[1] for col in cursor.fetchall()]
+            for col, col_type in [
+                ('total_r', 'REAL DEFAULT 0'),
+                ('total_win_r', 'REAL DEFAULT 0'),
+                ('total_loss_r', 'REAL DEFAULT 0'),
+            ]:
+                if col not in sig_cols:
+                    cursor.execute(f'ALTER TABLE signal_history ADD COLUMN {col} {col_type}')
+                    logger.info(f"Added {col} column to signal_history table")
 
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS symbol_performance (
@@ -1220,8 +1241,9 @@ class BotDatabase:
             cursor.execute('''
                 INSERT OR REPLACE INTO signal_history (
                     signal_type, total_signals, successful_trades, total_pnl,
-                    win_rate, avg_pnl, weight, last_updated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    win_rate, avg_pnl, total_r, total_win_r, total_loss_r,
+                    weight, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 signal_type,
                 history_data.get('total_signals', 0),
@@ -1229,6 +1251,9 @@ class BotDatabase:
                 history_data.get('total_pnl', 0.0),
                 history_data.get('win_rate', 0.0),
                 history_data.get('avg_pnl', 0.0),
+                history_data.get('total_r', 0.0),
+                history_data.get('total_win_r', 0.0),
+                history_data.get('total_loss_r', 0.0),
                 history_data.get('weight', 0.5),
                 history_data.get('last_updated', now_iso()),
             ))
