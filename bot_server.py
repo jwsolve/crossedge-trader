@@ -3140,7 +3140,41 @@ class PaperBot:
 
         if genuine_spot:
             detail = ", ".join(f"{sym}={qty:.12g}" for sym, qty in genuine_spot)
-            raise RuntimeError(f"Kraken spot exposure still exists ({detail}); refusing flat cash reconciliation")
+            quote = str(settings.get("quote_currency") or "USDT").upper()
+            actual_cash = float(kraken_available_balance(quote))
+            if actual_cash < 0 or not math.isfinite(actual_cash):
+                raise RuntimeError(f"Invalid Kraken {quote} balance returned: {actual_cash}")
+            with self.lock:
+                previous_cash = float(self.state.cash or 0.0)
+                self.state.cash = actual_cash
+                self._kraken_spot_balance_snapshot = {
+                    "ok": True,
+                    "quote_currency": quote,
+                    "available_cash": actual_cash,
+                    "equity": float(self.equity(self.state.last_price)),
+                    "reconciled": True,
+                    "valuation_note": f"genuine open spot position preserved: {detail}",
+                    "error": None,
+                    "time": now_iso(),
+                    "_ts": time.time(),
+                }
+                self.state.last_error = None
+                self.state.last_signal = (
+                    f"Kraken startup preserved genuine open spot position(s) ({detail}); "
+                    f"quote cash {previous_cash:.8f} -> {actual_cash:.8f}"
+                )
+                self.journal("", "RECONCILE", self.state.last_signal, self.state.last_price, {
+                    "exchange": "kraken", "quote": quote,
+                    "preserved_spot": detail,
+                    "previous_local_cash": previous_cash,
+                    "exchange_cash": actual_cash,
+                })
+                self.save_state()
+            logger.warning(
+                "Kraken startup preserved genuine open spot position(s): %s "
+                "(quote %s cash %.8f -> %.8f)", detail, quote, previous_cash, actual_cash,
+            )
+            return True
 
         if local_positions or abs(current_coin) > 1e-12 or active_symbol or open_owned:
             with self.lock:
