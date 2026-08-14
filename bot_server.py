@@ -6977,7 +6977,7 @@ class PaperBot:
             exit_mode = str(position.get("exit_mode") or self.state.exit_mode or "stored")
 
             if stop_price is None or target_price is None:
-                calculated_stop, calculated_target, calculated_mode = exit_prices(
+                calculated_stop, calculated_target, calculated_mode = self.exit_prices(
                     entry_price=entry_price,
                     candles=candles,
                     settings=settings,

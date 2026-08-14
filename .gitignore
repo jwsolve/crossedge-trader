@@ -24,3 +24,5 @@ auth/
 auth_setup.py
 
 *.patch
+
+Split Files/
